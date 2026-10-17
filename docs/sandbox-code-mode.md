@@ -293,7 +293,7 @@ it is exactly `false`.
 | `SANDBOX_MEMORY_MB` | `128` | V8 heap of one run. |
 | `SANDBOX_TIMEOUT_MS` | `10000` | Wall clock for the whole run, including time spent waiting on connectors. |
 | `SANDBOX_MAX_OUTPUT_BYTES` | `32768` | Size of the JSON the script returns. |
-| `SANDBOX_MAX_CONNECTOR_CALLS` | `50` | `tools.*` calls in one run. |
+| `SANDBOX_MAX_CONNECTOR_CALLS` | `500` | `tools.*` calls in one run. |
 | `SANDBOX_MAX_CONNECTOR_BYTES` | `67108864` | Total size of the connector results pulled into one run. |
 | `SANDBOX_MAX_CONCURRENT` | `4` | Runs in flight at once per organization; more fail with `BUSY`. |
 | `SANDBOX_CONNECTOR_TIMEOUT_MS` | `15000` | One connector call. It is also bounded by what is left of the run. |

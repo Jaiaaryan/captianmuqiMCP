@@ -233,7 +233,7 @@ describe('SandboxService', () => {
     it('enforces the connector call limit', async () => {
       const exec = makeExecuteTool();
       const res = await run(
-        `for (let i = 0; i < 60; i++) await tools.erp_products_list({});`,
+        `for (let i = 0; i < ${SANDBOX_LIMITS.maxConnectorCalls + 10}; i++) await tools.erp_products_list({});`,
         {},
         exec,
       );

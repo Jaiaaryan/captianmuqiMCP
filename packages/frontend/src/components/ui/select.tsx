@@ -1,5 +1,6 @@
 'use client';
 
+import type { ReactNode } from 'react';
 import * as Select from '@radix-ui/react-select';
 import { cn } from '@/lib/utils';
 
@@ -28,6 +29,14 @@ interface AppSelectProps {
   /** Labelled sections (Radix Select groups). */
   groups?: AppSelectGroup[];
   className?: string;
+  /** Replaces the default list styling (border, background, spacing). */
+  contentClassName?: string;
+  /** Replaces the default item styling. */
+  itemClassName?: string;
+  /** Replaces the default chevron. */
+  chevron?: ReactNode;
+  /** data-testid of the trigger. */
+  testId?: string;
   disabled?: boolean;
   /** The trigger is a button, not a <select>, so it needs an explicit name. */
   'aria-label'?: string;
@@ -57,6 +66,10 @@ export function AppSelect({
   options = [],
   groups,
   className,
+  contentClassName,
+  itemClassName,
+  chevron,
+  testId,
   disabled,
   'aria-label': ariaLabel,
   'aria-labelledby': ariaLabelledBy,

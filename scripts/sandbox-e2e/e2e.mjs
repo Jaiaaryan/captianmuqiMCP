@@ -350,7 +350,7 @@ const LIMITS = [
   ['typed-array bomb', 'const a = new Uint8Array(1<<30); a.fill(1); return a.length', {}, 'MEMORY_LIMIT'],
   ['string bomb', 'return "x".repeat(1<<29).length', {}, 'MEMORY_LIMIT'],
   ['oversize result', 'return (await tools.shop_list_orders({}))', {}, 'OUTPUT_TOO_LARGE'],
-  ['call-count limit', 'for (let i=0;i<60;i++) await tools.shop_list_orders({ limit: 1 }); return 1', { timeoutMs: 30000 }, 'CONNECTOR_CALL_LIMIT'],
+  ['call-count limit', 'for (let i=0;i<600;i++) await tools.shop_list_orders({ limit: 1 }); return 1', { timeoutMs: 30000 }, 'CONNECTOR_CALL_LIMIT'],
   ['syntax error', 'return {', {}, 'SYNTAX_ERROR'],
   ['runtime error', 'null.x', {}, 'RUNTIME_ERROR'],
   ['unknown tool', 'return await tools.other_customer_orders({})', {}, 'TOOL_NOT_ALLOWED'],

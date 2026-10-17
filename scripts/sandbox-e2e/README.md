@@ -16,7 +16,8 @@ customers), `roles`, `secrets`, `audit`, `big` (up to 44 MB). Each check records
 **Use a throwaway database.** The seed creates users, an organization and connectors.
 
 ```bash
-# 1. a database and the backend (see AGENTS.md), with two extra settings for this test:
+# 1. a database and the backend (see AGENTS.md), with three extra settings for this test:
+#    ALLOW_OPEN_REGISTRATION=true    the seed registers four users; registration closes after the first
 #    SSRF_ALLOW_LOCALHOST=true       lets the connectors call the local mock upstreams
 #    SANDBOX_CONNECTOR_TIMEOUT_MS=2000   so the "connector never answers" checks are quick
 cd packages/backend && npm run build && node dist/src/main.js
