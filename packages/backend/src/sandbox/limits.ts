@@ -34,7 +34,7 @@ export const SANDBOX_LIMITS = {
   timeoutMs: envNumber('SANDBOX_TIMEOUT_MS', 10_000),
   /** Largest JSON result that may leave the sandbox (what the model sees). */
   maxOutputBytes: envNumber('SANDBOX_MAX_OUTPUT_BYTES', 32 * 1024),
-  maxConnectorCalls: envNumber('SANDBOX_MAX_CONNECTOR_CALLS', 50),
+  maxConnectorCalls: envNumber('SANDBOX_MAX_CONNECTOR_CALLS', 500),
   /** One connector call; also bounded by what is left of the whole run. */
   connectorTimeoutMs: envNumber('SANDBOX_CONNECTOR_TIMEOUT_MS', 15_000),
   /** One connector response, checked before it is copied into the isolate. */
