@@ -77,6 +77,13 @@ import {
   planServerResources,
 } from './mcp-resources';
 import { jsonSchemaToZodShape, stripEnvVarParams } from './tool-schema.util';
+import { SandboxService } from '../sandbox/sandbox.service';
+import { SandboxScriptsService } from '../sandbox/sandbox-scripts.service';
+import {
+  SANDBOX_RUN_TOOL,
+  buildSandboxToolEntries,
+} from '../sandbox/sandbox-tools';
+import type { SandboxTool } from '../sandbox/types';
 import { readFileSync } from 'node:fs';
 import { dirname, join } from 'node:path';
 
@@ -177,6 +184,13 @@ interface ToolSetParams {
   /** Optional text appended as a trailing content block to every successful
    *  tool result (used by the public demo to say where the answer came from). */
   resultFooter?: string;
+  /**
+   * Organization that owns the MCP server. Setting it is what offers the
+   * sandbox (code mode) tools, so only the authenticated per-server surface
+   * sets it: the anonymous demo server and any future surface leave it unset
+   * and never get a code-execution tool by omission.
+   */
+  sandboxOrganizationId?: string;
 }
 
 interface InvocationContext {
@@ -234,6 +248,9 @@ export class McpEndpointController {
     private readonly grants: McpConnectionGrantService,
     private readonly kgSkills: KgSkillService,
     @Optional() private readonly sharedSetup?: SharedSetupRegistry,
+    // Optional so specs that construct the controller by hand keep compiling.
+    @Optional() private readonly sandbox?: SandboxService,
+    @Optional() private readonly sandboxScripts?: SandboxScriptsService,
   ) {}
 
   // Streamable-HTTP response framing. Default: SSE-framed responses
@@ -1109,6 +1126,7 @@ export class McpEndpointController {
       captureIntent,
       kgEnabled,
       invocationContext,
+      sandboxOrganizationId: mcpServerConfig.organizationId,
     };
 
     // Register this server's tool surface onto the per-request McpServer.
@@ -1451,6 +1469,7 @@ export class McpEndpointController {
         captureIntent,
         kgEnabled,
         invocationContext,
+        sandboxOrganizationId: serverOrganizationId,
       });
       const signature = this.aggregateSig(entries);
       if (signature === session.signature) return; // nothing changed here
@@ -1500,6 +1519,8 @@ export class McpEndpointController {
     } = params;
     const entries: ToolEntry[] = [];
     const registeredNames = new Set<string>();
+    // Tools that survive every filter below: exactly what a sandbox script may call.
+    const sandboxVisible: SandboxTool[] = [];
 
     for (const tool of serverTools) {
       // A connector that is not set up yet would only produce errors.
@@ -1525,6 +1546,13 @@ export class McpEndpointController {
         tool.parameters,
         tool.connectorConfig.envVars,
       );
+      sandboxVisible.push({
+        name: tool.name,
+        connectorId: tool.connectorId,
+        description: tool.description,
+        parameters: schema,
+        outputSchema: tool.outputSchema,
+      });
       const zodShape = this.jsonSchemaToZodShape(schema);
       if (captureIntent) {
         zodShape._intent = z
@@ -1625,6 +1653,38 @@ export class McpEndpointController {
           ) as unknown as ToolHandle;
         },
       });
+    }
+
+    // Code mode: let the agent run a script next to the data instead of pulling
+    // every row through the model. Only where the caller supplied the owning
+    // organization (the authenticated per-server surface), never on the demo.
+    if (
+      this.sandbox &&
+      this.sandboxScripts &&
+      params.sandboxOrganizationId &&
+      process.env.SANDBOX_ENABLED !== 'false' &&
+      invocationContext.mcpServerId &&
+      !registeredNames.has(SANDBOX_RUN_TOOL)
+    ) {
+      const sandboxEntries = buildSandboxToolEntries(
+        {
+          sandbox: this.sandbox,
+          scripts: this.sandboxScripts,
+          executeTool: this.toolExecutor.executeTool.bind(this.toolExecutor),
+        },
+        {
+          storageOrganizationId: params.sandboxOrganizationId,
+          invocationContext,
+        },
+        sandboxVisible,
+      );
+      // A connector that happens to use one of these names keeps it: a duplicate
+      // registration would make the SDK throw and fail the whole request.
+      for (const entry of sandboxEntries) {
+        if (registeredNames.has(entry.name)) continue;
+        registeredNames.add(entry.name);
+        entries.push(entry);
+      }
     }
 
     // Inject the org-level Knowledge Graph helper tool. Lets the agent ask
