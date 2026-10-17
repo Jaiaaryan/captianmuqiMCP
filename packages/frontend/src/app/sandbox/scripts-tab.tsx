@@ -65,9 +65,16 @@ export function ScriptsTab({
     }
   }, [serverId, token]);
 
+  // The first load sets state when the request settles, not synchronously in the effect.
   useEffect(() => {
-    void load();
-  }, [load]);
+    sandbox
+      .scripts(serverId, token)
+      .then((rows) => {
+        setScripts(rows);
+        setLoadError(null);
+      })
+      .catch((err) => setLoadError(errorText(err)));
+  }, [serverId, token]);
 
   const resetOutput = () => {
     setRun(null);

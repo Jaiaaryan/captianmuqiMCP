@@ -15,26 +15,36 @@ export function RunsTab({ serverId, token, isAdmin }: { serverId: string; token:
   const [runs, setRuns] = useState<SandboxRunRecord[] | null>(null);
   const [names, setNames] = useState<Record<string, string>>({});
   const [error, setError] = useState<string | null>(null);
-  const [loading, setLoading] = useState(false);
+  const [loading, setLoading] = useState(true);
   const [open, setOpen] = useState<string | null>(null);
 
-  const load = useCallback(async () => {
-    setLoading(true);
-    try {
-      const [rows, scripts] = await Promise.all([sandbox.runs(serverId, token, 50), sandbox.scripts(serverId, token)]);
-      setRuns(rows);
-      setNames(Object.fromEntries(scripts.map((s) => [s.id, s.name])));
-      setError(null);
-    } catch (err) {
-      setError(errorText(err));
-    } finally {
-      setLoading(false);
-    }
-  }, [serverId, token]);
+  const fetchAll = useCallback(
+    () => Promise.all([sandbox.runs(serverId, token, 50), sandbox.scripts(serverId, token)]),
+    [serverId, token],
+  );
+
+  // State is set when the request settles, never synchronously inside the effect.
+  const show = useCallback(
+    (request: ReturnType<typeof fetchAll>) =>
+      request
+        .then(([rows, scripts]) => {
+          setRuns(rows);
+          setNames(Object.fromEntries(scripts.map((s) => [s.id, s.name])));
+          setError(null);
+        })
+        .catch((err) => setError(errorText(err)))
+        .finally(() => setLoading(false)),
+    [],
+  );
 
   useEffect(() => {
-    void load();
-  }, [load]);
+    void show(fetchAll());
+  }, [fetchAll, show]);
+
+  const refresh = () => {
+    setLoading(true);
+    void show(fetchAll());
+  };
 
   return (
     <Card className="overflow-hidden">
@@ -47,7 +57,7 @@ export function RunsTab({ serverId, token, isAdmin }: { serverId: string; token:
               : 'Your runs on this server, newest first. A run keeps a preview of what came back, so members only see their own.'}
           </div>
         </div>
-        <Button size="sm" variant="secondary" onClick={() => void load()} disabled={loading}>
+        <Button size="sm" variant="secondary" onClick={refresh} disabled={loading}>
           {loading ? 'Loading…' : 'Refresh'}
         </Button>
       </div>
