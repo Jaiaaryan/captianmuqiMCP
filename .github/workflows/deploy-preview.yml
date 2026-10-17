@@ -2,7 +2,7 @@ name: Preview
 
 on:
   push:
-    branches-ignore: [main]
+    branches-ignore: [main, claude/dazzling-volta-4s880q]
   delete:
   workflow_dispatch:
 

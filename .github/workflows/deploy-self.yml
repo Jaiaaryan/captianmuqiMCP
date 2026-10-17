@@ -2,7 +2,7 @@ name: Deploy (amcp.flowerchatting.com)
 
 on:
   push:
-    branches: [main]
+    branches: [claude/dazzling-volta-4s880q]
   workflow_dispatch:
 
 concurrency:
