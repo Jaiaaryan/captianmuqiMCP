@@ -22,7 +22,7 @@
         ]
       }
     },
-    "ms": 87
+    "ms": 80
   },
   {
     "group": "core",
@@ -30,11 +30,11 @@
     "pass": true,
     "detail": {
       "tools": [
-        "shop_list_orders",
         "shop_create_refund",
+        "shop_list_orders",
         "shop_echo",
-        "shop_hang",
         "shop_export_big",
+        "shop_hang",
         "shop_echo_env",
         "sandbox_run_script",
         "sandbox_create_script",
@@ -45,7 +45,7 @@
       "bytesReturned": 77,
       "bytesFromConnectors": 633206
     },
-    "ms": 138
+    "ms": 117
   },
   {
     "group": "core",
@@ -61,7 +61,7 @@
       "script": {
         "ok": true,
         "bytes": 77,
-        "ms": 32,
+        "ms": 23,
         "estTokens": 20,
         "connectorCalls": 1,
         "bytesFromConnectors": 633206
@@ -71,17 +71,17 @@
         "tokensPct": 99.99
       }
     },
-    "ms": 69
+    "ms": 54
   },
   {
     "group": "scripts",
     "name": "create, list (no code), read, run by id, edit, run again, delete (REST)",
     "pass": true,
     "detail": {
-      "scriptId": "cmvcji4t701pfx47d991dgswo",
+      "scriptId": "cmvcyqwwr001knq7dybaibmzz",
       "versionAfterEdits": 3
     },
-    "ms": 240
+    "ms": 195
   },
   {
     "group": "scripts",
@@ -93,7 +93,7 @@
         "mcp_script"
       ]
     },
-    "ms": 125
+    "ms": 129
   },
   {
     "group": "connectors",
@@ -105,7 +105,7 @@
         "Shop API (A, authenticated): shop_echo"
       ]
     },
-    "ms": 84
+    "ms": 62
   },
   {
     "group": "connectors",
@@ -118,7 +118,7 @@
         400
       ]
     },
-    "ms": 84
+    "ms": 63
   },
   {
     "group": "connectors",
@@ -128,7 +128,7 @@
       "before": "TOOL_NOT_ALLOWED",
       "after": "ok"
     },
-    "ms": 140
+    "ms": 123
   },
   {
     "group": "connectors",
@@ -149,7 +149,7 @@
         "uses_both": false
       }
     },
-    "ms": 144
+    "ms": 123
   },
   {
     "group": "connectors",
@@ -158,7 +158,7 @@
     "detail": {
       "uses": [
         {
-          "connectorId": "cmvcji5fi01vfx47dfwx5petk",
+          "connectorId": "cmvcyqxfk0027nq7d8g12x5t4",
           "connectorName": "Temporary CRM",
           "connectorExists": false,
           "tools": [
@@ -167,16 +167,16 @@
         }
       ]
     },
-    "ms": 122
+    "ms": 107
   },
   {
     "group": "connectors",
     "name": "scripts are the organization's: customer B sees none of A's, and may reuse a name",
     "pass": true,
     "detail": {
-      "bobScript": "cmvcji5j901wgx47dtk2cqiv1"
+      "bobScript": "cmvcyqxiw002dnq7djx533rpo"
     },
-    "ms": 35
+    "ms": 32
   },
   {
     "group": "read-only",
@@ -191,7 +191,7 @@
       },
       "upstreamRefundRequests": 0
     },
-    "ms": 321
+    "ms": 320
   },
   {
     "group": "read-only",
@@ -201,13 +201,13 @@
       "list": [
         "shop_list_orders",
         "shop_echo",
-        "shop_hang",
         "shop_export_big",
+        "shop_hang",
         "shop_echo_env"
       ],
       "has": false
     },
-    "ms": 19
+    "ms": 16
   },
   {
     "group": "read-only",
@@ -226,25 +226,25 @@
     "name": "benchmark refuses to call a write tool for real",
     "pass": true,
     "detail": null,
-    "ms": 12
+    "ms": 16
   },
   {
     "group": "read-only",
     "name": "outside the sandbox the same tool still works for an admin (the policy is about scripts)",
     "pass": true,
     "detail": null,
-    "ms": 27
+    "ms": 29
   },
   {
     "group": "isolation",
     "name": "the live isolation suite passes on the running server",
     "pass": true,
     "detail": {
-      "cases": 20,
-      "passed": 20,
-      "slowestMs": 1003
+      "cases": 21,
+      "passed": 21,
+      "slowestMs": 1002
     },
-    "ms": 3559
+    "ms": 3512
   },
   {
     "group": "isolation",
@@ -258,42 +258,42 @@
     "name": "escape attempt: XMLHttpRequest",
     "pass": true,
     "detail": "undefined",
-    "ms": 16
+    "ms": 17
   },
   {
     "group": "isolation",
     "name": "escape attempt: WebSocket",
     "pass": true,
     "detail": "undefined",
-    "ms": 23
+    "ms": 16
   },
   {
     "group": "isolation",
     "name": "escape attempt: EventSource",
     "pass": true,
     "detail": "undefined",
-    "ms": 17
+    "ms": 13
   },
   {
     "group": "isolation",
     "name": "escape attempt: require(\"fs\")",
     "pass": true,
     "detail": "blocked",
-    "ms": 16
+    "ms": 14
   },
   {
     "group": "isolation",
     "name": "escape attempt: process.env",
     "pass": true,
     "detail": "blocked",
-    "ms": 16
+    "ms": 22
   },
   {
     "group": "isolation",
     "name": "escape attempt: import(\"child_process\")",
     "pass": true,
     "detail": "blocked",
-    "ms": 13
+    "ms": 17
   },
   {
     "group": "isolation",
@@ -307,14 +307,14 @@
     "name": "escape attempt: constructor chain",
     "pass": true,
     "detail": "undefined",
-    "ms": 17
+    "ms": 15
   },
   {
     "group": "isolation",
     "name": "escape attempt: eval(process)",
     "pass": true,
     "detail": "blocked",
-    "ms": 14
+    "ms": 15
   },
   {
     "group": "isolation",
@@ -328,53 +328,53 @@
     "name": "escape attempt: Buffer / timers",
     "pass": true,
     "detail": "undefined,undefined,undefined,undefined,undefined",
-    "ms": 16
+    "ms": 13
   },
   {
     "group": "isolation",
     "name": "escape attempt: WebAssembly",
     "pass": true,
     "detail": "undefined",
-    "ms": 16
+    "ms": 12
   },
   {
     "group": "isolation",
     "name": "escape attempt: read /etc/passwd",
     "pass": true,
     "detail": "blocked",
-    "ms": 32
+    "ms": 35
   },
   {
     "group": "isolation",
     "name": "escape attempt: read env secrets",
     "pass": true,
     "detail": "undefined,undefined,undefined,undefined",
-    "ms": 16
+    "ms": 54
   },
   {
     "group": "isolation",
     "name": "escape attempt: reach the bridge",
     "pass": true,
     "detail": "undefined,undefined,undefined,undefined,undefined",
-    "ms": 15
+    "ms": 21
   },
   {
     "group": "isolation",
     "name": "a script that tries to write a host-side global does not affect the next run",
     "pass": true,
     "detail": null,
-    "ms": 30
+    "ms": 26
   },
   {
     "group": "limits",
     "name": "infinite loop -> TIMEOUT",
     "pass": true,
     "detail": {
-      "ms": 1031,
+      "ms": 1013,
       "error": "TIMEOUT",
       "bytesReturned": 0
     },
-    "ms": 1031
+    "ms": 1013
   },
   {
     "group": "limits",
@@ -392,66 +392,66 @@
     "name": "memory bomb (array) -> MEMORY_LIMIT",
     "pass": true,
     "detail": {
-      "ms": 251,
+      "ms": 254,
       "error": "MEMORY_LIMIT",
       "bytesReturned": 0
     },
-    "ms": 251
+    "ms": 254
   },
   {
     "group": "limits",
     "name": "typed-array bomb -> MEMORY_LIMIT",
     "pass": true,
     "detail": {
-      "ms": 26,
+      "ms": 25,
       "error": "MEMORY_LIMIT",
       "bytesReturned": 0
     },
-    "ms": 26
+    "ms": 25
   },
   {
     "group": "limits",
     "name": "string bomb -> MEMORY_LIMIT",
     "pass": true,
     "detail": {
-      "ms": 21,
+      "ms": 13,
       "error": "MEMORY_LIMIT",
       "bytesReturned": 0
     },
-    "ms": 21
+    "ms": 13
   },
   {
     "group": "limits",
     "name": "oversize result -> OUTPUT_TOO_LARGE",
     "pass": true,
     "detail": {
-      "ms": 45,
+      "ms": 39,
       "error": "OUTPUT_TOO_LARGE",
       "bytesReturned": 0
     },
-    "ms": 45
+    "ms": 39
   },
   {
     "group": "limits",
     "name": "call-count limit -> CONNECTOR_CALL_LIMIT",
     "pass": true,
     "detail": {
-      "ms": 256,
+      "ms": 2252,
       "error": "CONNECTOR_CALL_LIMIT",
       "bytesReturned": 0
     },
-    "ms": 256
+    "ms": 2252
   },
   {
     "group": "limits",
     "name": "syntax error -> SYNTAX_ERROR",
     "pass": true,
     "detail": {
-      "ms": 14,
+      "ms": 16,
       "error": "SYNTAX_ERROR",
       "bytesReturned": 0
     },
-    "ms": 14
+    "ms": 16
   },
   {
     "group": "limits",
@@ -469,11 +469,11 @@
     "name": "unknown tool -> TOOL_NOT_ALLOWED",
     "pass": true,
     "detail": {
-      "ms": 13,
+      "ms": 12,
       "error": "TOOL_NOT_ALLOWED",
       "bytesReturned": 0
     },
-    "ms": 13
+    "ms": 12
   },
   {
     "group": "limits",
@@ -488,10 +488,10 @@
     "pass": true,
     "detail": {
       "status": "up",
-      "usedMb": 179,
+      "usedMb": 174,
       "limitMb": 8240,
-      "percent": 2.2,
-      "rssMb": 491
+      "percent": 2.1,
+      "rssMb": 458
     },
     "ms": 6
   },
@@ -503,45 +503,45 @@
       "busy": 3,
       "timeouts": 4
     },
-    "ms": 2070
+    "ms": 2069
   },
   {
     "group": "deadlines",
     "name": "a connector that never answers: the call is abandoned at its own deadline (2 s here)",
     "pass": true,
     "detail": {
-      "ms": 2019,
+      "ms": 2016,
       "message": "Tool 'shop_hang' did not answer within 2000 ms. (line 1)"
     },
-    "ms": 2019
+    "ms": 2016
   },
   {
     "group": "deadlines",
     "name": "the whole-run deadline wins when it is shorter than the call deadline",
     "pass": true,
     "detail": {
-      "ms": 1514
+      "ms": 1519
     },
-    "ms": 1514
+    "ms": 1520
   },
   {
     "group": "deadlines",
     "name": "the script can catch a connector timeout and still answer",
     "pass": true,
     "detail": null,
-    "ms": 2017
+    "ms": 2021
   },
   {
     "group": "deadlines",
     "name": "cancelling the HTTP request stops the run (recorded as CANCELLED)",
     "pass": true,
     "detail": {
-      "recordedAfterMs": 717,
+      "recordedAfterMs": 713,
       "meta": {
-        "ms": 596
+        "ms": 589
       }
     },
-    "ms": 717
+    "ms": 713
   },
   {
     "group": "tenant",
@@ -564,7 +564,7 @@
         "customer-B-4"
       ]
     },
-    "ms": 25
+    "ms": 20
   },
   {
     "group": "tenant",
@@ -573,7 +573,7 @@
     "detail": {
       "rows": 5
     },
-    "ms": 27
+    "ms": 20
   },
   {
     "group": "tenant",
@@ -583,7 +583,7 @@
       "upstreamAHitsCausedByB": 0,
       "outcome": "ran"
     },
-    "ms": 29
+    "ms": 19
   },
   {
     "group": "tenant",
@@ -598,7 +598,7 @@
       "shop_export_big": "TOOL_NOT_ALLOWED",
       "shop_hang": "TOOL_NOT_ALLOWED"
     },
-    "ms": 16
+    "ms": 23
   },
   {
     "group": "tenant",
@@ -612,7 +612,7 @@
       "benchmark": 404,
       "isolation": 404
     },
-    "ms": 42
+    "ms": 39
   },
   {
     "group": "tenant",
@@ -623,7 +623,7 @@
       "patch": 404,
       "delete": 404
     },
-    "ms": 22
+    "ms": 16
   },
   {
     "group": "tenant",
@@ -632,33 +632,33 @@
     "detail": {
       "status": 403
     },
-    "ms": 16
+    "ms": 11
   },
   {
     "group": "tenant",
     "name": "A cannot use B’s server either (404)",
     "pass": true,
     "detail": null,
-    "ms": 12
+    "ms": 10
   },
   {
     "group": "tenant",
     "name": "run history of A and B are separate",
     "pass": true,
     "detail": {
-      "runsA": 200,
-      "runsB": 16
+      "runsA": 52,
+      "runsB": 4
     },
-    "ms": 23
+    "ms": 16
   },
   {
     "group": "tenant",
     "name": "in the database every sandbox row carries the right organization",
     "pass": true,
     "detail": {
-      "runsOfB": "16"
+      "runsOfB": "4"
     },
-    "ms": 118
+    "ms": 93
   },
   {
     "group": "roles",
@@ -671,14 +671,14 @@
       "echo": "TOOL_NOT_ALLOWED",
       "orders": 3
     },
-    "ms": 27
+    "ms": 33
   },
   {
     "group": "roles",
     "name": "the editor’s direct MCP tool list is narrowed the same way (sandbox == direct)",
     "pass": true,
     "detail": null,
-    "ms": 26
+    "ms": 19
   },
   {
     "group": "roles",
@@ -698,7 +698,7 @@
       "editorOnAdmins": 403,
       "adminOnEditors": 403
     },
-    "ms": 23
+    "ms": 20
   },
   {
     "group": "roles",
@@ -708,7 +708,7 @@
       "editorOnAdmins": 403,
       "adminOnEditors": 204
     },
-    "ms": 12
+    "ms": 10
   },
   {
     "group": "roles",
@@ -724,17 +724,17 @@
       "patch": 403,
       "delete": 403
     },
-    "ms": 39
+    "ms": 32
   },
   {
     "group": "roles",
     "name": "run history: a member sees only their own runs, an admin sees all",
     "pass": true,
     "detail": {
-      "editorSees": 8,
-      "adminSees": 200
+      "editorSees": 2,
+      "adminSees": 54
     },
-    "ms": 17
+    "ms": 15
   },
   {
     "group": "secrets",
@@ -743,7 +743,7 @@
     "detail": {
       "authorizationSeenByScript": "Bearer [REDACTED]"
     },
-    "ms": 44
+    "ms": 36
   },
   {
     "group": "secrets",
@@ -754,7 +754,7 @@
       "sandboxLeaks": true,
       "note": "executor redacts environment variables only (DynamicMcpTools.connectorSecretValues)"
     },
-    "ms": 42
+    "ms": 37
   },
   {
     "group": "secrets",
@@ -766,44 +766,44 @@
         "auditRows": "0"
       },
       "literalAuthConfigCredential_knownGap": {
-        "sandboxRuns": "5",
-        "auditRows": "12"
+        "sandboxRuns": "1",
+        "auditRows": "4"
       }
     },
-    "ms": 182
+    "ms": 133
   },
   {
     "group": "secrets",
     "name": "tools.describe shows the public shape only",
     "pass": true,
     "detail": null,
-    "ms": 21
+    "ms": 18
   },
   {
     "group": "audit",
     "name": "REST run: the stored run and each connector call share the run id",
     "pass": true,
     "detail": {
-      "runId": "811af326-1913-4944-9fb8-c4537a99b6cc",
+      "runId": "82a7881f-dcd8-4963-ab4b-12263f93ce92",
       "auditRows": 2
     },
-    "ms": 688
+    "ms": 618
   },
   {
     "group": "audit",
     "name": "MCP run: the same link",
     "pass": true,
     "detail": {
-      "runId": "9d174609-afd7-480f-8d87-7e746c621280"
+      "runId": "e04ff82f-1ca5-4e6c-b004-9e433f284570"
     },
-    "ms": 635
+    "ms": 591
   },
   {
     "group": "audit",
     "name": "an ordinary (non-sandbox) tool call carries no run id",
     "pass": true,
     "detail": null,
-    "ms": 468
+    "ms": 456
   },
   {
     "group": "audit",
@@ -811,20 +811,20 @@
     "pass": true,
     "detail": {
       "sample": {
-        "id": "9d174609-afd7-480f-8d87-7e746c621280",
+        "id": "e04ff82f-1ca5-4e6c-b004-9e433f284570",
         "ok": true,
-        "ms": 13,
+        "ms": 9,
         "toolsCalled": [
           "shop_list_orders"
         ]
       },
       "counts": {
-        "ok": 129,
-        "TIMEOUT": 21,
-        "CANCELLED": 3
+        "ok": 35,
+        "TIMEOUT": 7,
+        "CANCELLED": 1
       }
     },
-    "ms": 12
+    "ms": 10
   },
   {
     "group": "big",
@@ -832,9 +832,9 @@
     "pass": true,
     "detail": {
       "mb": 8,
-      "ms": 390,
-      "hostRssMbBefore": 489,
-      "hostRssMbAfter": 561,
+      "ms": 328,
+      "hostRssMbBefore": 457,
+      "hostRssMbAfter": 525,
       "ok": true,
       "result": {
         "rows": 48490,
@@ -843,7 +843,7 @@
       "bytesFromConnectors": 8571621,
       "bytesReturned": 32
     },
-    "ms": 397
+    "ms": 334
   },
   {
     "group": "big",
@@ -851,9 +851,9 @@
     "pass": true,
     "detail": {
       "mb": 16,
-      "ms": 652,
-      "hostRssMbBefore": 561,
-      "hostRssMbAfter": 662,
+      "ms": 669,
+      "hostRssMbBefore": 525,
+      "hostRssMbAfter": 619,
       "ok": true,
       "result": {
         "rows": 96979,
@@ -862,7 +862,7 @@
       "bytesFromConnectors": 17154174,
       "bytesReturned": 32
     },
-    "ms": 659
+    "ms": 675
   },
   {
     "group": "big",
@@ -870,9 +870,9 @@
     "pass": true,
     "detail": {
       "mb": 32,
-      "ms": 1458,
-      "hostRssMbBefore": 662,
-      "hostRssMbAfter": 852,
+      "ms": 1348,
+      "hostRssMbBefore": 619,
+      "hostRssMbAfter": 789,
       "ok": true,
       "result": {
         "rows": 193957,
@@ -881,7 +881,7 @@
       "bytesFromConnectors": 34413237,
       "bytesReturned": 34
     },
-    "ms": 1465
+    "ms": 1355
   },
   {
     "group": "big",
@@ -889,9 +889,9 @@
     "pass": true,
     "detail": {
       "mb": 44,
-      "ms": 1883,
-      "hostRssMbBefore": 852,
-      "hostRssMbAfter": 1031,
+      "ms": 1784,
+      "hostRssMbBefore": 789,
+      "hostRssMbAfter": 985,
       "ok": true,
       "result": {
         "rows": 266690,
@@ -900,7 +900,7 @@
       "bytesFromConnectors": 47359711,
       "bytesReturned": 34
     },
-    "ms": 1889
+    "ms": 1790
   },
   {
     "group": "big",
@@ -910,13 +910,13 @@
       "raw": {
         "ok": true,
         "bytes": 60160832,
-        "ms": 1253,
+        "ms": 1124,
         "estTokens": 15040208
       },
       "script": {
         "ok": true,
         "bytes": 34,
-        "ms": 1786,
+        "ms": 1662,
         "estTokens": 9,
         "connectorCalls": 1,
         "bytesFromConnectors": 47359711,
@@ -930,6 +930,6 @@
         "tokensPct": 100
       }
     },
-    "ms": 3064
+    "ms": 2807
   }
 ]
