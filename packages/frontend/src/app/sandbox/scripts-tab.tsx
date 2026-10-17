@@ -1,12 +1,12 @@
 'use client';
 
-import { useCallback, useEffect, useMemo, useState } from 'react';
+import { useMemo, useState } from 'react';
 import {
   sandbox,
+  type SandboxParametersSchema,
   type SandboxRunResponse,
   type SandboxSaveNotes,
   type SandboxScript,
-  type SandboxScriptSummary,
   type SandboxScriptUseInput,
   type SandboxSyntax,
 } from '@/lib/api';
@@ -19,6 +19,13 @@ import { BlockTitle, Pre, RunResultPanel } from './result-panel';
 import { ConnectorFilter, type ConnectorOption } from './connector-filter';
 import { ConnectorPin, ScriptUsesSection } from './script-uses';
 import { UsesPicker } from './uses-picker';
+import { ScriptParameters } from './script-parameters';
+import type { SandboxData } from './use-sandbox-data';
+import { MonacoField } from '@/components/code/monaco-field';
+import { declarationsFromTools } from '@/components/code/dts-from-tools';
+
+/** Top-level `await` (TS 1375, 1378): the body runs inside an async function. */
+const IGNORE_TOP_LEVEL_AWAIT = [1375, 1378];
 
 type Mode = 'idle' | 'view' | 'edit' | 'new';
 
@@ -56,14 +63,15 @@ export function ScriptsTab({
   token,
   canWrite,
   isAdmin,
+  data,
 }: {
   serverId: string;
   token: string;
   canWrite: boolean;
   isAdmin: boolean;
+  data: SandboxData;
 }) {
-  const [scripts, setScripts] = useState<SandboxScriptSummary[] | null>(null);
-  const [loadError, setLoadError] = useState<string | null>(null);
+  const { scripts, scriptsError: loadError, refreshScripts: load, refreshRuns, catalogTools } = data;
   const [selectedId, setSelectedId] = useState<string | null>(null);
   const [detail, setDetail] = useState<SandboxScript | null>(null);
   const [mode, setMode] = useState<Mode>('idle');
@@ -72,7 +80,8 @@ export function ScriptsTab({
     description: string;
     code: string;
     uses: SandboxScriptUseInput[];
-  }>({ name: '', description: '', code: '', uses: [] });
+    parameters: SandboxParametersSchema | null;
+  }>({ name: '', description: '', code: '', uses: [], parameters: null });
   const [filter, setFilter] = useState<string[]>([]);
   const [argsText, setArgsText] = useState('');
   const [running, setRunning] = useState(false);
@@ -81,26 +90,6 @@ export function ScriptsTab({
   const [saving, setSaving] = useState(false);
   const [notice, setNotice] = useState<{ tone: 'ok' | 'warn' | 'error'; text: string } | null>(null);
   const [confirmDelete, setConfirmDelete] = useState(false);
-
-  const load = useCallback(async () => {
-    try {
-      setScripts(await sandbox.scripts(serverId, token));
-      setLoadError(null);
-    } catch (err) {
-      setLoadError(errorText(err));
-    }
-  }, [serverId, token]);
-
-  // The first load sets state when the request settles, not synchronously in the effect.
-  useEffect(() => {
-    sandbox
-      .scripts(serverId, token)
-      .then((rows) => {
-        setScripts(rows);
-        setLoadError(null);
-      })
-      .catch((err) => setLoadError(errorText(err)));
-  }, [serverId, token]);
 
   const resetOutput = () => {
     setRun(null);
@@ -125,7 +114,7 @@ export function ScriptsTab({
     resetOutput();
     setSelectedId(null);
     setDetail(null);
-    setDraft({ name: '', description: '', code: NEW_SCRIPT_TEMPLATE, uses: [] });
+    setDraft({ name: '', description: '', code: NEW_SCRIPT_TEMPLATE, uses: [], parameters: null });
     setMode('new');
   };
 
@@ -137,6 +126,7 @@ export function ScriptsTab({
       description: detail.description ?? '',
       code: detail.code,
       uses: detail.uses.map((u) => ({ connectorId: u.connectorId, tools: [...u.tools] })),
+      parameters: detail.parameters,
     });
     setMode('edit');
   };
@@ -159,12 +149,13 @@ export function ScriptsTab({
                 code: draft.code,
                 description: draft.description.trim() || undefined,
                 uses: draft.uses,
+                parameters: draft.parameters,
               },
               token,
             )
           : await sandbox.updateScript(
               detail!.id,
-              { code: draft.code, description: draft.description, uses: draft.uses },
+              { code: draft.code, description: draft.description, uses: draft.uses, parameters: draft.parameters },
               token,
             );
       await load();
@@ -211,6 +202,7 @@ export function ScriptsTab({
           : { code: draft.code, args: args.value };
       setRun(await sandbox.run(serverId, body, token));
       if (mode === 'view') void load(); // the list shows the last run
+      void refreshRuns();
     } catch (err) {
       setRunError(errorText(err));
     } finally {
@@ -219,6 +211,13 @@ export function ScriptsTab({
   };
 
   const editing = mode === 'edit' || mode === 'new';
+
+  const codeLibs = useMemo(() => {
+    // The script may call the tools it declares; with none picked yet, offer every tool.
+    const picked = new Set(draft.uses.flatMap((u) => u.tools));
+    const tools = (catalogTools ?? []).filter((t) => picked.size === 0 || picked.has(t.name));
+    return [{ path: 'file:///amcp/code-mode.d.ts', content: declarationsFromTools(tools) }];
+  }, [catalogTools, draft.uses]);
   const canEdit = canWrite && !!detail?.ownedByYou;
   const canDelete = canWrite && !!detail && (detail.ownedByYou || isAdmin);
 
@@ -449,15 +448,30 @@ export function ScriptsTab({
             <div>
               <BlockTitle>Code</BlockTitle>
               {editing ? (
-                <textarea
-                  aria-label="Script code"
-                  spellCheck={false}
-                  className={cn(INPUT, 'min-h-[260px] py-2.5 font-mono text-xs leading-relaxed')}
+                <MonacoField
+                  ariaLabel="Script code"
+                  language="javascript"
                   value={draft.code}
-                  onChange={(e) => setDraft({ ...draft, code: e.target.value })}
+                  onChange={(code) => setDraft((d) => ({ ...d, code }))}
+                  extraLibs={codeLibs}
+                  ignoreDiagnostics={IGNORE_TOP_LEVEL_AWAIT}
+                  minLines={12}
+                  maxLines={40}
+                  className="border border-[var(--border)] bg-[var(--surface)]"
                 />
               ) : (
                 <Pre maxH="max-h-80">{detail ? detail.code : 'Loading…'}</Pre>
+              )}
+              {editing && (
+                <ScriptParameters
+                  code={draft.code}
+                  value={draft.parameters}
+                  onChange={(parameters) => setDraft((d) => ({ ...d, parameters }))}
+                  disabled={saving}
+                />
+              )}
+              {mode === 'view' && detail && (
+                <ScriptParameters code={detail.code} value={detail.parameters} onChange={() => {}} readOnly />
               )}
               {mode === 'view' && !detail?.ownedByYou && detail && (
                 <div className="mt-1.5 text-[11.5px] text-[var(--text-3)]">

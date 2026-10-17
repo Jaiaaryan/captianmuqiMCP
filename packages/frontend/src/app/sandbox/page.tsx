@@ -3,7 +3,7 @@
 import { useEffect, useState } from 'react';
 import Link from 'next/link';
 import { useAuth } from '@/lib/auth-context';
-import { ApiError, mcpServers, sandbox } from '@/lib/api';
+import { mcpServers } from '@/lib/api';
 import { AppShell } from '@/components/app-shell';
 import { AppSelect } from '@/components/ui/select';
 import { Card } from '@/components/ui/card';
@@ -13,6 +13,7 @@ import { errorText } from './format';
 import { IsolationTab } from './isolation-tab';
 import { RunsTab } from './runs-tab';
 import { ScriptsTab } from './scripts-tab';
+import { useSandboxData } from './use-sandbox-data';
 
 type Tab = 'scripts' | 'runs' | 'isolation' | 'benchmark';
 
@@ -27,13 +28,9 @@ export default function SandboxPage() {
   const { token, user } = useAuth();
   const [servers, setServers] = useState<{ id: string; name: string }[] | null>(null);
   const [serverId, setServerId] = useState('');
-  const [tab, setTab] = useState<Tab>('scripts');
-  // The server for which code mode answered "turned off" (derived, so nothing is reset by hand).
-  const [offFor, setOffFor] = useState('');
   const [error, setError] = useState<string | null>(null);
 
   const role = user?.role;
-  const off = offFor === serverId;
   const canWrite = role !== 'VIEWER';
   const isAdmin = role === 'ADMIN';
 
@@ -47,14 +44,6 @@ export default function SandboxPage() {
       })
       .catch((err) => setError(errorText(err)));
   }, [token]);
-
-  // Code mode can be switched off for the whole instance (SANDBOX_ENABLED=false).
-  useEffect(() => {
-    if (!token || !serverId) return;
-    sandbox.scripts(serverId, token).catch((err) => {
-      if (err instanceof ApiError && err.status === 404 && /turned off/i.test(err.message)) setOffFor(serverId);
-    });
-  }, [token, serverId]);
 
   const picker = servers && servers.length > 0 && (
     <AppSelect
@@ -80,41 +69,80 @@ export default function SandboxPage() {
         </Card>
       )}
 
-      {off && (
-        <Card className="p-8 text-center text-[13px] text-[var(--text-2)]">
-          Code mode is turned off on this instance (<span className="font-mono">SANDBOX_ENABLED=false</span>).
-        </Card>
-      )}
-
-      {token && serverId && !off && (
-        <>
-          <div role="tablist" aria-label="Code mode" className="mb-4 inline-flex gap-0.5 rounded-[10px] bg-[var(--surface-2)] p-[3px]">
-            {TABS.map((t) => (
-              <button
-                key={t.value}
-                role="tab"
-                type="button"
-                aria-selected={tab === t.value}
-                onClick={() => setTab(t.value)}
-                className={cn(
-                  'rounded-[7px] px-3.5 py-1.5 text-[12.5px] font-medium transition-colors',
-                  tab === t.value
-                    ? 'bg-[var(--surface)] text-[var(--text)] shadow-[var(--shadow-sm)]'
-                    : 'text-[var(--text-3)] hover:text-[var(--text)]',
-                )}
-              >
-                {t.label}
-              </button>
-            ))}
-          </div>
-
-          {/* keyed by server: choosing another one starts each tab from a clean state */}
-          {tab === 'scripts' && <ScriptsTab key={serverId} serverId={serverId} token={token} canWrite={canWrite} isAdmin={isAdmin} />}
-          {tab === 'runs' && <RunsTab key={serverId} serverId={serverId} token={token} isAdmin={isAdmin} />}
-          {tab === 'isolation' && <IsolationTab key={serverId} serverId={serverId} token={token} canWrite={canWrite} />}
-          {tab === 'benchmark' && <BenchmarkTab key={serverId} serverId={serverId} token={token} canWrite={canWrite} />}
-        </>
+      {/* keyed by server: choosing another one starts the data and every tab from a clean state */}
+      {token && serverId && (
+        <Workspace key={serverId} serverId={serverId} token={token} canWrite={canWrite} isAdmin={isAdmin} />
       )}
     </AppShell>
+  );
+}
+
+/**
+ * The four tabs of one server. They are mounted once and only hidden when another tab is
+ * chosen, so drafts, scroll positions and results survive switching, and the data they
+ * share is fetched once (useSandboxData) instead of on every switch.
+ */
+function Workspace({
+  serverId,
+  token,
+  canWrite,
+  isAdmin,
+}: {
+  serverId: string;
+  token: string;
+  canWrite: boolean;
+  isAdmin: boolean;
+}) {
+  const data = useSandboxData(serverId, token);
+  const [tab, setTab] = useState<Tab>('scripts');
+
+  if (data.off) {
+    return (
+      <Card className="p-8 text-center text-[13px] text-[var(--text-2)]">
+        Code mode is turned off on this instance (<span className="font-mono">SANDBOX_ENABLED=false</span>).
+      </Card>
+    );
+  }
+
+  return (
+    <>
+      <div role="tablist" aria-label="Code mode" className="mb-4 inline-flex gap-0.5 rounded-[10px] bg-[var(--surface-2)] p-[3px]">
+        {TABS.map((t) => (
+          <button
+            key={t.value}
+            id={`sandbox-tab-${t.value}`}
+            role="tab"
+            type="button"
+            aria-selected={tab === t.value}
+            aria-controls={`sandbox-panel-${t.value}`}
+            onClick={() => setTab(t.value)}
+            className={cn(
+              'rounded-[7px] px-3.5 py-1.5 text-[12.5px] font-medium transition-colors',
+              tab === t.value
+                ? 'bg-[var(--surface)] text-[var(--text)] shadow-[var(--shadow-sm)]'
+                : 'text-[var(--text-3)] hover:text-[var(--text)]',
+            )}
+          >
+            {t.label}
+          </button>
+        ))}
+      </div>
+
+      {TABS.map((t) => (
+        // A bare wrapper: the `hidden` attribute would lose to a display class on the tab itself.
+        <div
+          key={t.value}
+          id={`sandbox-panel-${t.value}`}
+          role="tabpanel"
+          aria-labelledby={`sandbox-tab-${t.value}`}
+          hidden={tab !== t.value}
+        >
+          {t.value === 'scripts' && <ScriptsTab serverId={serverId} token={token} canWrite={canWrite} isAdmin={isAdmin} data={data} />}
+          {t.value === 'runs' && <RunsTab isAdmin={isAdmin} data={data} />}
+          {t.value === 'isolation' && <IsolationTab serverId={serverId} token={token} canWrite={canWrite} />}
+          {t.value === 'benchmark' && <BenchmarkTab serverId={serverId} token={token} canWrite={canWrite} data={data} />}
+        </div>
+      ))}
+    </>
   );
 }

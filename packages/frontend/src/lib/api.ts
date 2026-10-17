@@ -800,6 +800,129 @@ export const tools = {
     }),
 };
 
+/* ------------------------------------------------------------------ */
+/*  Response processing (per-tool step chain)                          */
+/* ------------------------------------------------------------------ */
+
+export type ResponseProcessingUse =
+  | 'scale@1'
+  | 'offset@1'
+  | 'vat@1'
+  | 'round@1'
+  | 'clean_text@1'
+  | 'truncate@1'
+  | 'map@1'
+  | 'script@1';
+
+export type ResponseProcessingMode = 'add' | 'replace' | 'upsert';
+
+export interface ResponseProcessingStep {
+  id: string;
+  use: ResponseProcessingUse;
+  /** Path of the array whose elements the step runs on; empty = the response itself. */
+  each?: string;
+  reads: string;
+  writes: string;
+  mode: ResponseProcessingMode;
+  onMissing?: 'fail' | 'skip';
+  params?: Record<string, unknown>;
+  /** script@1 only. */
+  code?: string;
+}
+
+export interface ResponseProcessingChain {
+  version: 1;
+  enabled: boolean;
+  onError: 'fail' | 'passthrough';
+  steps: ResponseProcessingStep[];
+}
+
+export interface ResponseProcessingParam {
+  name: string;
+  type: 'number' | 'integer' | 'string' | 'boolean' | 'object' | 'any';
+  required?: boolean;
+  default?: unknown;
+  min?: number;
+  max?: number;
+}
+
+export interface ResponseProcessingBuiltin {
+  name: string;
+  version?: number | string;
+  title: string;
+  input?: string;
+  output?: string;
+  params: ResponseProcessingParam[];
+}
+
+export interface ResponseProcessingBuiltins {
+  builtins: ResponseProcessingBuiltin[];
+  modes: string[];
+  limits: {
+    maxSteps: number;
+    script: { timeoutMs: number; memoryMb: number; maxCodeBytes: number; maxResultBytes: number };
+  };
+}
+
+export type ResponseProcessingValidation = { valid: true } | { valid: false; problem: string };
+
+export interface ResponseProcessingStepReport {
+  id: string;
+  wrote: number;
+  skipped: number;
+  bytes: number;
+  sample?: unknown;
+}
+
+export interface ResponseProcessingDryRun {
+  ok: boolean;
+  result?: unknown;
+  steps?: ResponseProcessingStepReport[];
+  error?: string;
+  failedStep?: string;
+  failedPath?: string;
+}
+
+export interface ResponseProcessingPreview extends ResponseProcessingDryRun {
+  sampleSource?: 'request' | 'recorded';
+}
+
+export const responseProcessing = {
+  builtins: (token: string) =>
+    request<ResponseProcessingBuiltins>('/api/response-processing/builtins', { token }),
+  validate: (chain: ResponseProcessingChain, token: string) =>
+    request<ResponseProcessingValidation>('/api/response-processing/validate', {
+      method: 'POST',
+      body: { chain },
+      token,
+    }),
+  dryRun: (chain: ResponseProcessingChain, sample: unknown, token: string) =>
+    request<ResponseProcessingDryRun>('/api/response-processing/dry-run', {
+      method: 'POST',
+      body: { chain, sample },
+      token,
+    }),
+  forTool: (toolId: string, token: string) =>
+    request<{
+      chain: ResponseProcessingChain | null;
+      sampleAvailable: boolean;
+      sampleCapturedAt?: string | null;
+      /** The recorded response, cut to ≤ 64 KB, depth ≤ 8, arrays to 3 elements. */
+      sample?: unknown;
+      sampleTruncated?: boolean;
+    }>(`/api/response-processing/tools/${toolId}`, { token }),
+  preview: (
+    toolId: string,
+    body: { chain?: ResponseProcessingChain; sample?: unknown },
+    token: string,
+  ) =>
+    request<ResponseProcessingPreview>(`/api/response-processing/tools/${toolId}/preview`, {
+      method: 'POST',
+      body,
+      token,
+    }),
+};
+
 // Audit
 export const audit = {
   invocations: (token: string, params?: { limit?: number; offset?: number; toolId?: string; status?: string; search?: string; connectorId?: string; mcpServerId?: string }) => {
@@ -1056,6 +1179,23 @@ export interface PublicStats {
 
 export const publicStats = {
   get: () => request<PublicStats>('/api/public/stats'),
+};
+
+// Demo instance: the sign-in page lists ready-made accounts when enabled.
+export interface PublicDemoAccount {
+  email: string;
+  password: string;
+  name: string;
+  role: 'ADMIN' | 'VIEWER' | 'EDITOR';
+  workspace: 'A' | 'B';
+}
+
+export type PublicDemo =
+  | { enabled: false }
+  | { enabled: true; accounts: PublicDemoAccount[]; mcp: { A: string; B: string } };
+
+export const publicDemo = {
+  get: () => request<PublicDemo>('/api/public/demo'),
 };
 
 // Site Settings
@@ -1568,6 +1708,23 @@ export interface SandboxScriptUse {
   tools: string[];
 }
 
+/** One argument a saved script reads (`args.<name>`), as an MCP tool parameter. */
+export interface SandboxParameter {
+  type: 'string' | 'number' | 'integer' | 'boolean' | 'array' | 'object';
+  description?: string;
+  enum?: (string | number | boolean)[];
+  items?: { type: 'string' | 'number' | 'integer' | 'boolean' };
+  /** Keep the parameter although the code no longer reads it. */
+  'x-keep'?: boolean;
+}
+
+/** The arguments a saved script reads, as a JSON Schema object. A script that has one is also an MCP tool. */
+export interface SandboxParametersSchema {
+  type: 'object';
+  properties: Record<string, SandboxParameter>;
+  required: string[];
+}
+
 export interface SandboxScriptSummary {
   id: string;
   name: string;
@@ -1583,6 +1740,12 @@ export interface SandboxScriptSummary {
    */
   availableOnServer?: boolean;
   missingConnectors?: { id: string; name: string }[];
+  /** The arguments the script reads, or null: no tool of its own. */
+  parameters: SandboxParametersSchema | null;
+  /** The argument names the code reads right now. */
+  inferredParameters: string[];
+  /** Whether the server the list was asked about offers the script as a tool of its own name. Only the list has it. */
+  exposedAsTool?: boolean;
   lastRunAt: string | null;
   lastRunOk: boolean | null;
   lastRunMeta: { ms?: number; connectorCalls?: number; bytesFromConnectors?: number; bytesReturned?: number } | null;
@@ -1664,13 +1827,24 @@ export const sandbox = {
     request<SandboxScript>(`/api/sandbox/scripts/${id}`, { token }),
   createScript: (
     serverId: string,
-    data: { name: string; code: string; description?: string; uses?: SandboxScriptUseInput[] },
+    data: {
+      name: string;
+      code: string;
+      description?: string;
+      uses?: SandboxScriptUseInput[];
+      parameters?: SandboxParametersSchema | null;
+    },
     token: string,
   ) =>
     request<SandboxScript & { syntax: SandboxSyntax } & SandboxSaveNotes>(`/api/sandbox/servers/${serverId}/scripts`, { method: 'POST', body: data, token }),
   updateScript: (
     id: string,
-    data: { code?: string; description?: string; uses?: SandboxScriptUseInput[] },
+    data: {
+      code?: string;
+      description?: string;
+      uses?: SandboxScriptUseInput[];
+      parameters?: SandboxParametersSchema | null;
+    },
     token: string,
   ) =>
     request<SandboxScript & { syntax: SandboxSyntax } & SandboxSaveNotes>(`/api/sandbox/scripts/${id}`, { method: 'PATCH', body: data, token }),

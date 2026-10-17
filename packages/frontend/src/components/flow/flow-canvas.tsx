@@ -143,6 +143,12 @@ function Canvas({ graph, selectedId, onSelect, fitSignal, fitKey }: Props) {
     return () => window.removeEventListener('keydown', onKey);
   }, [fitView, onSelect]);
 
+  // Nothing to draw yet: an empty surface. React Flow mounts with the first layout, so
+  // page hydration does not also build the canvas, its controls and the MiniMap.
+  if (current.nodes.length === 0) {
+    return <div data-testid="flow-empty" className="h-full w-full bg-[var(--surface-2)]" />;
+  }
+
   return (
     <ReactFlow
       nodes={nodes}

@@ -1,7 +1,7 @@
 'use client';
 
-import { useEffect, useState } from 'react';
-import { connectors as connectorsApi, mcpServers, sandbox, type SandboxBenchmark } from '@/lib/api';
+import { useState } from 'react';
+import { sandbox, type SandboxBenchmark } from '@/lib/api';
 import { Card } from '@/components/ui/card';
 import { Button } from '@/components/ui/button';
 import { Badge, StatusPill } from '@/components/ui/badge';
@@ -9,6 +9,7 @@ import { AppSelect } from '@/components/ui/select';
 import { cn } from '@/lib/utils';
 import { errorText, formatBytes, formatMs, formatReduction, formatTokens, parseArgs, pretty } from './format';
 import { BlockTitle, Pre } from './result-panel';
+import type { SandboxData } from './use-sandbox-data';
 
 const INPUT =
   'w-full rounded-[9px] border border-[var(--border)] bg-[var(--surface)] px-3 text-[13px] text-[var(--text)] outline-none placeholder:text-[var(--text-3)] focus:border-[var(--brand)]';
@@ -43,38 +44,28 @@ function Metric({ label, value, hint }: { label: string; value: string; hint?: s
   );
 }
 
-export function BenchmarkTab({ serverId, token, canWrite }: { serverId: string; token: string; canWrite: boolean }) {
-  const [toolNames, setToolNames] = useState<string[]>([]);
-  const [tool, setTool] = useState('');
+export function BenchmarkTab({
+  serverId,
+  token,
+  canWrite,
+  data,
+}: {
+  serverId: string;
+  token: string;
+  canWrite: boolean;
+  data: SandboxData;
+}) {
+  const { toolNames, serverError, refreshRuns } = data;
+  // Until the user picks, the first tool of the server and a generic script for it.
+  const [pickedTool, setTool] = useState<string | null>(null);
+  const [pickedCode, setCode] = useState<string | null>(null);
   const [toolArgs, setToolArgs] = useState('');
-  const [code, setCode] = useState('');
   const [running, setRunning] = useState(false);
-  const [error, setError] = useState<string | null>(null);
+  const [runError, setError] = useState<string | null>(null);
   const [result, setResult] = useState<SandboxBenchmark | null>(null);
-
-  // The tools of the connectors assigned to this server.
-  useEffect(() => {
-    let cancelled = false;
-    (async () => {
-      try {
-        const server = await mcpServers.get(serverId, token);
-        const ids: string[] = (server.connectors ?? []).map((c: any) => c.connector?.id ?? c.connectorId).filter(Boolean);
-        const full = await Promise.all(ids.map((id) => connectorsApi.get(id, token)));
-        const names = full.flatMap((c: any) => (c.tools ?? []).map((t: any) => t.name as string)).sort();
-        if (cancelled) return;
-        setToolNames(names);
-        if (names.length > 0) {
-          setTool(names[0]);
-          setCode(genericCode(names[0]));
-        }
-      } catch (err) {
-        if (!cancelled) setError(errorText(err));
-      }
-    })();
-    return () => {
-      cancelled = true;
-    };
-  }, [serverId, token]);
+  const tool = pickedTool ?? toolNames[0] ?? '';
+  const code = pickedCode ?? (tool ? genericCode(tool) : '');
+  const error = runError ?? serverError;
 
   const pick = (name: string) => {
     setTool(name);
@@ -100,6 +91,7 @@ export function BenchmarkTab({ serverId, token, canWrite }: { serverId: string; 
     setResult(null);
     try {
       setResult(await sandbox.benchmark(serverId, { toolName: tool, toolArgs: args.value, code }, token));
+      void refreshRuns(); // the script half is recorded as a run
     } catch (err) {
       setError(errorText(err));
     } finally {

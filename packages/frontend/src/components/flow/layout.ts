@@ -1,5 +1,5 @@
 import dagre from '@dagrejs/dagre';
-import type { FlowEdge, FlowGraph, FlowNode, FlowNodeKind } from './types';
+import type { FlowEdge, FlowNode, FlowNodeKind } from './types';
 
 export type NodeSizes = Record<FlowNodeKind, { width: number; height: number }>;
 
@@ -30,14 +30,6 @@ const COLUMN: Record<FlowNodeKind, number> = {
   mapping: 4,
   connector: 5,
 };
-
-/** Strips a graph to what the layout reads (and what is sent to the worker). */
-export function layoutInput(graph: FlowGraph): LayoutInput {
-  return {
-    nodes: graph.nodes.map((n) => ({ id: n.id, kind: n.kind })),
-    edges: graph.edges.map((e) => ({ id: e.id, source: e.source, target: e.target })),
-  };
-}
 
 /**
  * Dagre orders the nodes inside each column; the column of every kind is fixed

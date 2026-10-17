@@ -1,8 +1,17 @@
 'use client';
 
 import { useEffect, useState } from 'react';
-import { layoutInput, layoutPositions, type NodeSizes, type Positions } from './layout';
+// Types only: dagre is evaluated in the worker, or loaded on demand where there is none.
+import type { LayoutInput, NodeSizes, Positions } from './layout';
 import type { FlowGraph } from './types';
+
+/** What the layout needs of a graph: ids, kinds and links (what is posted to the worker). */
+function layoutInput(graph: FlowGraph): LayoutInput {
+  return {
+    nodes: graph.nodes.map((n) => ({ id: n.id, kind: n.kind })),
+    edges: graph.edges.map((e) => ({ id: e.id, source: e.source, target: e.target })),
+  };
+}
 
 type Answer = { id: number; positions: Positions } | { id: number; error: string };
 
@@ -37,9 +46,9 @@ function layoutWorker(): Worker | null {
 function requestLayout(graph: FlowGraph, sizes: NodeSizes): { id: number; answer: Promise<Positions> } {
   const id = (nextId += 1);
   const input = layoutInput(graph);
-  const sync = () => layoutPositions(input, sizes);
+  const sync = () => import('./layout').then((m) => m.layoutPositions(input, sizes));
   const w = layoutWorker();
-  if (!w) return { id, answer: Promise.resolve().then(sync) };
+  if (!w) return { id, answer: sync() };
   const answer = new Promise<Answer>((resolve) => {
     waiting.set(id, resolve);
     w.postMessage({ id, graph: input, sizes });

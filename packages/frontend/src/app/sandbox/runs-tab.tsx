@@ -1,49 +1,24 @@
 'use client';
 
-import { Fragment, useCallback, useEffect, useState } from 'react';
-import { sandbox, type SandboxRunRecord } from '@/lib/api';
+import { Fragment, useMemo, useState } from 'react';
 import { Card } from '@/components/ui/card';
 import { Button } from '@/components/ui/button';
 import { Badge, StatusPill } from '@/components/ui/badge';
 import { cn } from '@/lib/utils';
-import { errorText, formatBytes, formatMs, formatWhen, pretty } from './format';
+import { formatBytes, formatMs, formatWhen, pretty } from './format';
 import { BlockTitle, Pre } from './result-panel';
+import type { SandboxData } from './use-sandbox-data';
 
 const GRID = '150px minmax(0,1.3fr) 130px 80px minmax(0,1.4fr)';
 
-export function RunsTab({ serverId, token, isAdmin }: { serverId: string; token: string; isAdmin: boolean }) {
-  const [runs, setRuns] = useState<SandboxRunRecord[] | null>(null);
-  const [names, setNames] = useState<Record<string, string>>({});
-  const [error, setError] = useState<string | null>(null);
-  const [loading, setLoading] = useState(true);
+export function RunsTab({ isAdmin, data }: { isAdmin: boolean; data: SandboxData }) {
+  const { runs, runsError: error, runsLoading: loading, refreshRuns, refreshScripts, scripts } = data;
   const [open, setOpen] = useState<string | null>(null);
+  const names = useMemo(() => Object.fromEntries((scripts ?? []).map((s) => [s.id, s.name])), [scripts]);
 
-  const fetchAll = useCallback(
-    () => Promise.all([sandbox.runs(serverId, token, 50), sandbox.scripts(serverId, token)]),
-    [serverId, token],
-  );
-
-  // State is set when the request settles, never synchronously inside the effect.
-  const show = useCallback(
-    (request: ReturnType<typeof fetchAll>) =>
-      request
-        .then(([rows, scripts]) => {
-          setRuns(rows);
-          setNames(Object.fromEntries(scripts.map((s) => [s.id, s.name])));
-          setError(null);
-        })
-        .catch((err) => setError(errorText(err)))
-        .finally(() => setLoading(false)),
-    [],
-  );
-
-  useEffect(() => {
-    void show(fetchAll());
-  }, [fetchAll, show]);
-
+  // An agent may have saved scripts since: re-read their names with the runs.
   const refresh = () => {
-    setLoading(true);
-    void show(fetchAll());
+    void Promise.all([refreshRuns(), refreshScripts()]);
   };
 
   return (
