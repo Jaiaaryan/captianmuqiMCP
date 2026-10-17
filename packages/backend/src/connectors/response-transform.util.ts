@@ -25,9 +25,13 @@ import {
   compile as jmespathCompile,
   search as jmespathSearch,
 } from '@jmespath-community/jmespath';
+import { Logger } from '@nestjs/common';
 import type { ResponseMapping } from './engines/engine-types';
 import { applyDecode, readDecode, type DecodeConfig } from './mime-decode.util';
 import { extractResponseImages, readImages, type ExtractedImage } from './response-images.util';
+import { readChain, runChain } from '../response-processing/chain';
+
+const processingLogger = new Logger('ResponseProcessing');
 
 /* ------------------------------------------------------------------ */
 /*  Public contract                                                    */
@@ -644,7 +648,15 @@ export function applyResponseTransform(
     isPlainObject(responseMapping) &&
     responseMapping.images !== undefined &&
     responseMapping.images !== null;
-  if (!transform && !hasDecode && !hasImages) return { value: raw, applied: false };
+  // `responseProcessing` (response-processing/chain.ts) edits the response
+  // before the transform selects from it. Same rule: read only when present.
+  const hasResponseProcessing =
+    isPlainObject(responseMapping) &&
+    responseMapping.responseProcessing !== undefined &&
+    responseMapping.responseProcessing !== null;
+  if (!transform && !hasDecode && !hasImages && !hasResponseProcessing) {
+    return { value: raw, applied: false };
+  }
 
   let images: ExtractedImage[] | undefined;
   let source: unknown = raw;
@@ -675,9 +687,31 @@ export function applyResponseTransform(
     if (hasDecode) {
       // Decoded first, so a transform can select from the decoded fields.
       work = applyDecode(work, readDecode(responseMapping) as DecodeConfig);
-      if (!transform) return withImages({ value: work, applied: work !== source });
     }
-    if (!transform) return withImages({ value: source, applied: false });
+
+    if (hasResponseProcessing) {
+      // After images and decode, before the transform: the transform selects
+      // from the processed response.
+      const chain = readChain(responseMapping)!;
+      const result = runChain(work, chain);
+      if (result.ok) {
+        work = result.value;
+      } else if (chain.onError === 'passthrough') {
+        processingLogger.warn(
+          `Response processing failed (${result.error}) — continuing without it.`,
+        );
+      } else {
+        // `fatal` makes the MCP caller get an error result, not the raw data.
+        return withImages({
+          value: source,
+          applied: false,
+          error: `Response processing failed: ${result.error}`,
+          fatal: true,
+        });
+      }
+    }
+
+    if (!transform) return withImages({ value: work, applied: work !== source });
 
     if (transform.exclude !== undefined) {
       work = omitPaths(work, assertPathList(transform.exclude, 'exclude'));

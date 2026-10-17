@@ -94,6 +94,81 @@ describe('ToolsController — response mapping validation', () => {
     const data = prisma.mcpTool.updateMany.mock.calls[0][0].data;
     expect(data.outputSchema).toBeUndefined();
   });
+
+  const chain = (decimals: number) => ({
+    version: 1,
+    enabled: true,
+    onError: 'fail',
+    steps: [
+      { id: 'r', use: 'round@1', each: '$.items[*]', reads: 'p', writes: 'p', mode: 'replace', params: { decimals } },
+    ],
+  });
+
+  it('rejects an invalid response processing chain on update', async () => {
+    const { controller, prisma } = buildController();
+    await expect(
+      controller.update(req(), 't1', 'c1', { responseMapping: { responseProcessing: chain(99) } } as any),
+    ).rejects.toThrow(/Invalid response mapping: step r: /);
+    expect(prisma.mcpTool.updateMany).not.toHaveBeenCalled();
+  });
+
+  it('rejects an invalid response processing chain on create and bulk create', async () => {
+    const { controller, prisma } = buildController();
+    const draft = {
+      name: 't',
+      description: 'd',
+      parameters: {},
+      endpointMapping: { method: 'GET', path: '/x' },
+      responseMapping: { responseProcessing: { ...chain(2), extra: true } },
+    };
+    await expect(controller.create(req(), 'c1', draft as any)).rejects.toThrow(BadRequestException);
+    await expect(controller.bulkCreate(req(), 'c1', { tools: [draft] } as any)).rejects.toThrow(
+      BadRequestException,
+    );
+    expect(prisma.mcpTool.create).not.toHaveBeenCalled();
+  });
+
+  it('accepts a valid chain and a null chain', async () => {
+    const { controller, prisma } = buildController();
+    await controller.update(req(), 't1', 'c1', { responseMapping: { responseProcessing: chain(2) } } as any);
+    await controller.update(req(), 't1', 'c1', { responseMapping: { responseProcessing: null } } as any);
+    expect(prisma.mcpTool.updateMany).toHaveBeenCalledTimes(2);
+  });
+
+  it('drops a stale outputSchema when the processing chain changes', async () => {
+    const { controller, prisma } = buildController();
+    prisma.mcpTool.findFirst.mockResolvedValue({
+      responseMapping: { transform: TRANSFORM, responseProcessing: chain(2) },
+    });
+    await controller.update(req(), 't1', 'c1', {
+      responseMapping: { transform: TRANSFORM, responseProcessing: chain(3) },
+    } as any);
+    expect(prisma.mcpTool.updateMany.mock.calls[0][0].data.outputSchema).toBeNull();
+  });
+
+  it('keeps the outputSchema when the stored chain comes back with its keys reordered', async () => {
+    const { controller, prisma } = buildController();
+    const reordered = JSON.parse(
+      JSON.stringify(chain(2), (_k, v) =>
+        v && typeof v === 'object' && !Array.isArray(v)
+          ? Object.fromEntries(Object.keys(v).reverse().map((k) => [k, v[k]]))
+          : v,
+      ),
+    );
+    expect(JSON.stringify(reordered)).not.toBe(JSON.stringify(chain(2)));
+    prisma.mcpTool.findFirst.mockResolvedValue({ responseMapping: { responseProcessing: reordered } });
+    await controller.update(req(), 't1', 'c1', { responseMapping: { responseProcessing: chain(2) } } as any);
+    expect(prisma.mcpTool.updateMany.mock.calls[0][0].data.outputSchema).toBeUndefined();
+  });
+
+  it('keeps the outputSchema when the processing chain is unchanged', async () => {
+    const { controller, prisma } = buildController();
+    prisma.mcpTool.findFirst.mockResolvedValue({ responseMapping: { responseProcessing: chain(2) } });
+    await controller.update(req(), 't1', 'c1', {
+      responseMapping: { responseProcessing: chain(2), cacheTtl: 60 },
+    } as any);
+    expect(prisma.mcpTool.updateMany.mock.calls[0][0].data.outputSchema).toBeUndefined();
+  });
 });
 
 describe('ToolsController — PATCH response-mapping', () => {

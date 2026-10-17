@@ -211,6 +211,36 @@ curl -s http://localhost:4000/api/connectors/$ID/tools/bulk \
 
 See [Tool Definition Format](tool-definition.md) for the full schema.
 
+### Response Processing
+
+A tool's [Response Processing](response-processing.md) chain is stored in its
+`responseMapping.responseProcessing` and saved with the tool: there is no
+separate save route. `POST /api/connectors/:id/tools`, `POST .../tools/bulk` and
+`PUT /api/connectors/:id/tools/:toolId` validate the chain and answer `400` with
+`Invalid response mapping: <problem>` when it is invalid. A `PUT` that changes
+the chain (or `transform`) also clears the tool's `outputSchema`; the next
+successful test infers a new one.
+
+The editor routes below use the dashboard JWT and are scoped to the caller's
+organization. The `POST` routes answer `200` and refuse viewers with `403`.
+
+| Method | Endpoint | Description |
+|--------|----------|-------------|
+| GET | `/api/response-processing/builtins` | Built-in contracts, write modes and `limits` (`maxSteps`, `script.timeoutMs`, `script.memoryMb`, `script.maxCodeBytes`, `script.maxResultBytes`) |
+| POST | `/api/response-processing/validate` | Body `{ chain }`: `{ valid: true }` or `{ valid: false, problem }` |
+| POST | `/api/response-processing/dry-run` | Body `{ chain, sample }`: run the chain on the sample, with a per-step trace |
+| GET | `/api/response-processing/tools/:toolId` | The stored `chain`, `sampleAvailable` and, when recorded, `sampleCapturedAt`, `sample` (cut to 64 KB) and `sampleTruncated` |
+| POST | `/api/response-processing/tools/:toolId/preview` | Body `{ chain?, sample? }`: a dry run defaulting to the stored chain and the most recent recorded response |
+
+```bash
+curl -s http://localhost:4000/api/response-processing/validate \
+  -H "Authorization: Bearer $TOKEN" \
+  -H 'Content-Type: application/json' \
+  -d '{"chain": {"version": 1, "enabled": true, "onError": "fail", "steps": [
+        {"id": "eur", "use": "scale@1", "each": "$.items[*]", "reads": "price_usd",
+         "writes": "price_eur", "mode": "add", "params": {"factor": 0.92, "round": 2}}]}}'
+```
+
 ---
 
 ## MCP Server Endpoints
@@ -233,10 +263,10 @@ dashboard JWT, and are scoped to the caller's organization. Details, roles and l
 | Method | Endpoint | Description |
 |--------|----------|-------------|
 | POST | `/api/sandbox/servers/:serverId/run` | Run `code` or a saved `scriptId` (exactly one), optional `args`, `timeoutMs` |
-| GET | `/api/sandbox/servers/:serverId/scripts` | List the organization's saved scripts with their connectors and tools, and whether this server can run each (`includeCode=1` to include code) |
-| POST | `/api/sandbox/servers/:serverId/scripts` | Save a script, with the connectors and tools it uses |
-| GET | `/api/sandbox/scripts/:scriptId` | Read a script |
-| PATCH | `/api/sandbox/scripts/:scriptId` | Edit a script and/or its connectors and tools (author only) |
+| GET | `/api/sandbox/servers/:serverId/scripts` | List the organization's saved scripts with their connectors and tools, their `parameters` and `inferredParameters`, and whether this server can run each (`availableOnServer`) and offers it as a tool of its own name (`exposedAsTool`); `includeCode=1` to include code |
+| POST | `/api/sandbox/servers/:serverId/scripts` | Save a script, with the connectors and tools it uses and optional `parameters` (JSON Schema of the arguments it reads) |
+| GET | `/api/sandbox/scripts/:scriptId` | Read a script, with `parameters` and `inferredParameters` |
+| PATCH | `/api/sandbox/scripts/:scriptId` | Edit a script, its connectors and tools and/or its `parameters` (author only) |
 | DELETE | `/api/sandbox/scripts/:scriptId` | Delete a script (author or admin) |
 | GET | `/api/sandbox/servers/:serverId/runs` | Recent runs (all for admins, own for others) |
 | POST | `/api/sandbox/servers/:serverId/isolation-tests` | Run the live isolation test suite |

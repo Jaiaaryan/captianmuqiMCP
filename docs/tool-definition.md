@@ -667,6 +667,13 @@ modes and a **live preview** that runs the mapping against a real response and
 reports the before/after size. A tool with a broken mapping is flagged in the
 tool list rather than failing silently.
 
+**Editing the response first.** To compute or rewrite values before the mapping
+selects from them (a currency conversion, VAT, trimmed text, a filtered list), add
+a chain under `responseMapping.responseProcessing`, or use the Response Processing
+panel above Response Mapping in the tool editor. The chain is validated when the
+tool is saved, and the mapping's paths refer to the processed shape. See
+[Response Processing](response-processing.md).
+
 > A tool without a mapping behaves exactly as before — same object, byte for
 > byte. The no-op path is the one that must never regress.
 

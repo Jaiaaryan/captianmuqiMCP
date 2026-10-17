@@ -1,3 +1,4 @@
+import { Logger } from '@nestjs/common';
 import {
   applyResponseTransform,
   hasTransform,
@@ -548,5 +549,125 @@ describe('validateTransform', () => {
     expect(validateTransform({ maxBytes: -1 })).toMatch(/non-negative/);
     expect(validateTransform({ fallbackToRaw: 'yes' })).toMatch(/boolean/);
     expect(validateTransform({ expression: 'a'.repeat(5000) })).toMatch(/too long/);
+  });
+});
+
+describe('applyResponseTransform — responseProcessing', () => {
+  const chain = (over: Record<string, unknown> = {}) => ({
+    version: 1,
+    enabled: true,
+    onError: 'fail',
+    steps: [
+      {
+        id: 'convert_to_eur',
+        use: 'scale@1',
+        each: '$.items[*]',
+        reads: 'price_usd',
+        writes: 'price_eur',
+        mode: 'add',
+        params: { factor: 0.5, round: 2 },
+      },
+    ],
+    ...over,
+  });
+  const raw = () => ({ items: [{ id: 1, price_usd: 10 }, { id: 2, price_usd: 7.77 }] });
+
+  it('leaves a tool without the key untouched, same reference', () => {
+    const input = raw();
+    const out = applyResponseTransform(input, { cacheTtl: 5 });
+    expect(out.value).toBe(input);
+    expect(out.applied).toBe(false);
+  });
+
+  it('runs the chain on its own, without a transform', () => {
+    const out = applyResponseTransform(raw(), { responseProcessing: chain() });
+    expect(out.applied).toBe(true);
+    expect(out.error).toBeUndefined();
+    expect((out.value as any).items).toEqual([
+      { id: 1, price_usd: 10, price_eur: 5 },
+      { id: 2, price_usd: 7.77, price_eur: 3.89 },
+    ]);
+  });
+
+  it('runs before the transform, which selects from the processed response', () => {
+    const out = applyResponseTransform(raw(), {
+      responseProcessing: chain(),
+      transform: {
+        select: { rows: { $from: '$.items[*]', $select: { id: 'id', eur: 'price_eur' } } },
+      },
+    });
+    expect(out.error).toBeUndefined();
+    expect(out.value).toEqual({ rows: [{ id: 1, eur: 5 }, { id: 2, eur: 3.89 }] });
+  });
+
+  it('does not mutate the raw response', () => {
+    const input = raw();
+    applyResponseTransform(input, { responseProcessing: chain() });
+    expect(input).toEqual(raw());
+  });
+
+  it('a disabled chain does nothing', () => {
+    const input = raw();
+    const out = applyResponseTransform(input, { responseProcessing: chain({ enabled: false }) });
+    expect(out.value).toBe(input);
+    expect(out.applied).toBe(false);
+  });
+
+  it('onError "fail" reports a fatal error and not the processed or raw data as success', () => {
+    const input = { items: [{ id: 1, price_usd: 'n/a' }] };
+    const out = applyResponseTransform(input, { responseProcessing: chain() });
+    expect(out.error).toBe(
+      'Response processing failed: step convert_to_eur: $.items[0].price_usd is not a number',
+    );
+    expect(out.fatal).toBe(true);
+    expect(out.applied).toBe(false);
+  });
+
+  it('a failing chain is fatal even when the transform would fall back to raw', () => {
+    const out = applyResponseTransform(
+      { items: [{ price_usd: 'x' }] },
+      { responseProcessing: chain(), transform: { select: { a: 'items' }, fallbackToRaw: true } },
+    );
+    expect(out.fatal).toBe(true);
+  });
+
+  it('onError "passthrough" skips the chain, warns, and still applies the transform', () => {
+    const warn = jest.spyOn(Logger.prototype, 'warn').mockImplementation(() => undefined);
+    try {
+      const input = { items: [{ id: 1, price_usd: 'n/a' }] };
+      const out = applyResponseTransform(input, {
+        responseProcessing: chain({ onError: 'passthrough' }),
+        transform: { select: { first: '$.items[0].id' } },
+      });
+      expect(out.error).toBeUndefined();
+      expect(out.fatal).toBeUndefined();
+      expect(out.value).toEqual({ first: 1 });
+      expect(warn).toHaveBeenCalledWith(
+        expect.stringContaining('step convert_to_eur: $.items[0].price_usd is not a number'),
+      );
+
+      const bare = applyResponseTransform(input, {
+        responseProcessing: chain({ onError: 'passthrough' }),
+      });
+      expect(bare.value).toBe(input);
+      expect(bare.applied).toBe(false);
+    } finally {
+      warn.mockRestore();
+    }
+  });
+
+  it('treats a malformed stored chain as a chain failure', () => {
+    const out = applyResponseTransform(raw(), { responseProcessing: { version: 9 } });
+    expect(out.error).toBe('Response processing failed: version must be 1');
+    expect(out.fatal).toBe(true);
+  });
+
+  it('runs after decode and image extraction', () => {
+    const out = applyResponseTransform(
+      { items: [{ price_usd: 4 }], pic: 'x' },
+      { responseProcessing: chain(), images: { paths: ['pic'] } },
+    );
+    expect(out.error).toBeUndefined();
+    expect((out.value as any).items[0].price_eur).toBe(2);
   });
 });

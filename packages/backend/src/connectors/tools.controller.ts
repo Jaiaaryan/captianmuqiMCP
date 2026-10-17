@@ -39,6 +39,7 @@ import {
 } from './response-transform.util';
 import { validateDecode } from './mime-decode.util';
 import { validateImages } from './response-images.util';
+import { validateChain } from '../response-processing/chain';
 import {
   ToolAnnotations,
   deriveToolAnnotations,
@@ -353,6 +354,11 @@ export class ToolsController {
     if (imagesError) {
       throw new BadRequestException(`Invalid response mapping: ${imagesError}`);
     }
+    const chain = (responseMapping as Record<string, unknown>).responseProcessing;
+    if (chain !== undefined && chain !== null) {
+      const problem = validateChain(chain);
+      if (problem) throw new BadRequestException(`Invalid response mapping: ${problem}`);
+    }
     const transform = (responseMapping as Record<string, unknown>).transform;
     if (transform === undefined || transform === null) return;
     const error = validateTransform(transform);
@@ -394,6 +400,19 @@ export class ToolsController {
    * preview endpoints so the UI can render the same "12.4 KB → 0.9 KB (−93%)"
    * badge in both places.
    */
+  /**
+   * JSON with object keys sorted, for comparing stored mappings: Postgres
+   * jsonb reorders keys, so a plain JSON.stringify would see an unchanged
+   * mapping sent back by the editor as a change.
+   */
+  private static canonicalJson(value: unknown): string {
+    return JSON.stringify(value, (_key, v) =>
+      v && typeof v === 'object' && !Array.isArray(v)
+        ? Object.fromEntries(Object.keys(v).sort().map((k) => [k, v[k]]))
+        : v,
+    );
+  }
+
   private static mappingSummary(raw: unknown, mapping: unknown) {
     const outcome = applyResponseTransform(raw, mapping as any);
     const rawBytes = ToolsController.byteLength(raw);
@@ -600,19 +619,23 @@ export class ToolsController {
       }
     }
 
-    // A changed transform changes the shape clients receive, so the stored
-    // outputSchema (inferred from the previous shape) no longer describes it.
-    // Drop it and let the next successful test re-infer it.
+    // A changed transform or processing chain changes the shape clients
+    // receive, so the stored outputSchema (inferred from the previous shape)
+    // no longer describes it. Drop it and let the next successful test
+    // re-infer it.
     if (dto.responseMapping !== undefined) {
       const current = await this.prisma.mcpTool.findFirst({
         where: { id: toolId, connectorId },
         select: { responseMapping: true },
       });
-      const before = JSON.stringify(
-        (current?.responseMapping as Record<string, unknown> | null)?.transform ?? null,
+      const previous = current?.responseMapping as Record<string, unknown> | null;
+      const next = dto.responseMapping as Record<string, unknown> | null;
+      const shapeChanged = (['transform', 'responseProcessing'] as const).some(
+        (key) =>
+          ToolsController.canonicalJson(previous?.[key] ?? null) !==
+          ToolsController.canonicalJson(next?.[key] ?? null),
       );
-      const after = JSON.stringify(dto.responseMapping?.transform ?? null);
-      if (before !== after) data.outputSchema = null;
+      if (shapeChanged) data.outputSchema = null;
     }
 
     // Bind the toolId to the connectorId in the WHERE clause so that
