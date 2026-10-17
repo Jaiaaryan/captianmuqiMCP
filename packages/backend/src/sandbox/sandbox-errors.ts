@@ -19,11 +19,17 @@ export const HINTS: Partial<Record<SandboxErrorCode, string>> = {
   RUNTIME_ERROR:
     'Check field names with tools.describe(...) or log a sample first: console.log(rows.slice(0, 2)).',
   CODE_TOO_LARGE: 'Shorten the script or split it into saved scripts.',
+  WRITE_NOT_ALLOWED:
+    'Sandbox scripts are read-only. Use the data tool directly if the user asked for a change.',
+  CONNECTOR_TIMEOUT:
+    'The connector was too slow. Narrow the query (date range, status, limit) or fetch less per call.',
+  CANCELLED: 'The request was cancelled before the script finished.',
   BUSY: 'Too many scripts are running for this organization. Retry in a moment.',
 };
 
 /** Codes the bridge raises inside the isolate as `CODE: message`. */
-const BRIDGE_ERROR = /^(TOOL_NOT_ALLOWED|TOOL_ERROR|CONNECTOR_CALL_LIMIT|CONNECTOR_BYTES_LIMIT): ([\s\S]*)$/;
+const BRIDGE_ERROR =
+  /^(TOOL_NOT_ALLOWED|TOOL_ERROR|CONNECTOR_CALL_LIMIT|CONNECTOR_BYTES_LIMIT|WRITE_NOT_ALLOWED|CONNECTOR_TIMEOUT): ([\s\S]*)$/;
 
 const FRAME = new RegExp(`${SCRIPT_FILE.replace('.', '\\.')}:(\\d+):(\\d+)`);
 
@@ -85,6 +91,7 @@ function errorText(err: unknown): string {
 
 interface ClassifyContext {
   timedOut: boolean;
+  cancelled?: boolean;
   lineCount: number;
   timeoutMs: number;
   memoryMb: number;
@@ -104,6 +111,9 @@ export function toSandboxError(err: unknown, ctx: ClassifyContext): SandboxError
   // for more buffer or string memory than the isolate may hold.
   if (/due to memory limit|Array buffer allocation failed|Invalid string length/.test(raw)) {
     return withHint('MEMORY_LIMIT', `Script exceeded the ${ctx.memoryMb} MB memory limit.`);
+  }
+  if (ctx.cancelled) {
+    return withHint('CANCELLED', 'The run was cancelled.');
   }
   if (ctx.timedOut || /Script execution timed out/.test(raw)) {
     return withHint('TIMEOUT', `Script did not finish within ${ctx.timeoutMs} ms.`);

@@ -231,6 +231,27 @@ export class McpEndpointController {
   /** Last time a duplicate tool name was logged, per `server:name`. */
   private readonly duplicateWarnedAt = new Map<string, number>();
 
+  /**
+   * The tools a caller may use on a server at this moment, for a sandbox run.
+   * Mirrors the selection a request makes (assigned connectors, then the role
+   * allow-list for the server's organization), read fresh.
+   */
+  private async currentSandboxTools(
+    serverId: string,
+    serverOrganizationId: string,
+    userId: string | undefined,
+  ) {
+    const [connectorIds, allowedToolIds] = await Promise.all([
+      this.mcpServersService.getConnectorIds(serverId),
+      userId
+        ? this.rolesService.getAllowedToolIds(userId, serverOrganizationId)
+        : Promise.resolve(null as string[] | null),
+    ]);
+    const assigned = new Set(connectorIds);
+    const serverTools = this.toolRegistry.getAllTools().filter((t) => assigned.has(t.connectorId));
+    return toSandboxTools(visibleServerTools(serverTools, allowedToolIds));
+  }
+
   private shouldWarnDuplicate(key: string, now = Date.now()): boolean {
     const last = this.duplicateWarnedAt.get(key);
     if (last !== undefined && now - last < 60 * 60 * 1000) return false;
@@ -1665,6 +1686,14 @@ export class McpEndpointController {
         {
           storageOrganizationId: params.sandboxOrganizationId,
           invocationContext,
+          // Decided again for every run: a stateful session keeps the plan it
+          // was created with, and a role may have changed since.
+          reauthorize: () =>
+            this.currentSandboxTools(
+              invocationContext.mcpServerId,
+              params.sandboxOrganizationId as string,
+              invocationContext.userId,
+            ),
         },
         // Exactly what a script may call: the tools that survived every filter above.
         toSandboxTools(visibleTools),

@@ -1,4 +1,4 @@
-import { createHash } from 'node:crypto';
+import { createHash, randomUUID } from 'node:crypto';
 import {
   BadRequestException,
   ConflictException,
@@ -7,7 +7,7 @@ import {
   NotFoundException,
 } from '@nestjs/common';
 import { z } from 'zod';
-import { SANDBOX_LIMITS, SANDBOX_TIMEOUT_RANGE_MS } from './limits';
+import { SANDBOX_LIMITS, SANDBOX_TIMEOUT_RANGE_MS, areSandboxWritesAllowed } from './limits';
 import { SandboxScriptsService } from './sandbox-scripts.service';
 import {
   SCRIPT_CODE_MAX_CHARS,
@@ -42,7 +42,18 @@ export interface SandboxToolDeps {
   executeTool: SandboxExecuteTool;
 }
 
+/** The part of the SDK's handler context the run tool uses: the request's abort signal. */
+interface HandlerContext {
+  mcpReq?: { signal?: AbortSignal };
+}
+
 export interface SandboxToolScope {
+  /**
+   * Looks the caller's visible tools up again. Called at the start of every run,
+   * so a role changed since the session was planned (a stateful session keeps its
+   * plan) takes effect on the next run. Failing closed: if it throws, nothing runs.
+   */
+  reauthorize?: () => Promise<SandboxTool[]>;
   /**
    * Organization that owns the MCP server. Scripts and runs are stored under
    * it; it can differ from invocationContext.organizationId (the caller's
@@ -113,16 +124,23 @@ export function buildSandboxToolEntries(
   const serverId = invocationContext.mcpServerId;
   const userId = invocationContext.userId;
 
-  const signature = buildToolsSignature(allowedTools);
+  // Write tools are not offered unless the trusted policy allows them, so the
+  // model is not shown a tool that every call would be refused.
+  const signature = buildToolsSignature(
+    allowedTools.filter((t) => t.readOnly || areSandboxWritesAllowed()),
+  );
   const description = runDescription(signature);
   const sig = `sandbox:v1:${createHash('sha1').update(description).digest('hex').slice(0, 16)}`;
 
-  const run = async (input: {
-    code?: string;
-    scriptName?: string;
-    args?: Record<string, unknown>;
-    timeoutMs?: number;
-  }) => {
+  const run = async (
+    input: {
+      code?: string;
+      scriptName?: string;
+      args?: Record<string, unknown>;
+      timeoutMs?: number;
+    },
+    handlerContext?: HandlerContext,
+  ) => {
     const hasCode = typeof input.code === 'string' && input.code.length > 0;
     const hasName = typeof input.scriptName === 'string' && input.scriptName.length > 0;
     if (hasCode === hasName) {
@@ -151,15 +169,32 @@ export function buildSandboxToolEntries(
       };
     }
 
+    // Authorization is decided now, not when the session was planned.
+    let tools = allowedTools;
+    if (scope.reauthorize) {
+      try {
+        tools = await scope.reauthorize();
+      } catch (err) {
+        logger.warn(`Could not re-check access for a sandbox run: ${(err as Error)?.message ?? err}`);
+        return textResult('Could not verify your access to the tools. Try again.', true);
+      }
+    }
+
+    // One id for the run: its row in sandbox_runs, and the mark on the audit row
+    // of every connector call it makes.
+    const runId = randomUUID();
     const result = await sandbox.run({
       code,
       args: input.args,
-      allowedTools,
-      invocationContext,
+      allowedTools: tools,
+      allowWrites: areSandboxWritesAllowed(),
+      signal: handlerContext?.mcpReq?.signal,
+      invocationContext: { ...invocationContext, sandboxRunId: runId },
       executeTool,
       limits: input.timeoutMs ? { timeoutMs: input.timeoutMs } : undefined,
     });
     await scripts.recordRun({
+      id: runId,
       organizationId: orgId,
       mcpServerId: serverId,
       scriptId,
@@ -171,7 +206,7 @@ export function buildSandboxToolEntries(
 
     if (result.ok) {
       return jsonResult(
-        { ok: true, result: result.result, meta: result.meta, ...(scriptInfo && { script: scriptInfo }) },
+        { ok: true, runId, result: result.result, meta: result.meta, ...(scriptInfo && { script: scriptInfo }) },
         { structured: true },
       );
     }
@@ -179,6 +214,7 @@ export function buildSandboxToolEntries(
     return jsonResult(
       {
         ok: false,
+        runId,
         error: { code: errorCode, message, hint, line, column },
         meta: result.meta,
         ...(scriptInfo && { script: scriptInfo }),
@@ -293,11 +329,11 @@ export function buildSandboxToolEntries(
             error: z.any().optional(),
             meta: z.any(),
           }),
-          // It can call whatever write tools the server exposes, and it reaches
-          // the connectors' external systems.
+          // Read-only while writes are off (the default): a script can then only
+          // read through the connectors. It reaches their external systems.
           annotations: {
             title: 'Run script in sandbox',
-            readOnlyHint: false,
+            readOnlyHint: !areSandboxWritesAllowed(),
             destructiveHint: false,
             openWorldHint: true,
           },

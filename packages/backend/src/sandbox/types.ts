@@ -19,6 +19,8 @@ export interface SandboxMcpToolEntry {
  * sandbox has no import path back into the MCP module.
  */
 export interface SandboxInvocationContext {
+  /** Set by the host for each run; lets the audit rows of a run's connector calls be traced to it. */
+  sandboxRunId?: string;
   userId?: string;
   userEmail?: string;
   organizationId?: string;
@@ -30,11 +32,27 @@ export interface SandboxInvocationContext {
   intent?: string;
 }
 
+/** Outcome of checking a script's arguments against a tool's own schema. */
+export type SandboxArgsCheck =
+  | { ok: true; args: Record<string, unknown> }
+  | { ok: false; message: string };
+
 /** The slice of a RegisteredTool the sandbox needs. */
 export type SandboxTool = Pick<
   RegisteredTool,
   'name' | 'connectorId' | 'description' | 'parameters' | 'outputSchema'
->;
+> & {
+  /**
+   * True only for a tool known not to change anything. A tool whose kind is
+   * unknown is not read-only: scripts may call it only if writes are allowed.
+   */
+  readOnly: boolean;
+  /**
+   * Checks (and normalises) a script's arguments on the host, with the same
+   * schema the MCP endpoint applies to a direct call. Absent: no extra check.
+   */
+  validateArgs?: (args: Record<string, unknown>) => SandboxArgsCheck;
+};
 
 /** Result shape of DynamicMcpTools.executeTool. */
 export interface SandboxToolResult {
@@ -57,8 +75,16 @@ export type SandboxExecuteTool = (
 export interface SandboxRunRequest {
   code: string;
   args?: Record<string, unknown>;
-  /** Already role-filtered by planToolSet: the only tools the script can call. */
+  /** Already role-filtered by the host: the only tools the script can see. */
   allowedTools: SandboxTool[];
+  /**
+   * Trusted write policy, set by the host and never by the script or the calling
+   * agent. Default false: scripts may then call read-only tools only, and a
+   * write tool is refused before it is executed.
+   */
+  allowWrites?: boolean;
+  /** Aborts the run (client went away): the isolate is disposed and the run ends CANCELLED. */
+  signal?: AbortSignal;
   invocationContext: SandboxInvocationContext;
   executeTool: SandboxExecuteTool;
   limits?: Partial<SandboxLimits>;
@@ -75,6 +101,9 @@ export type SandboxErrorCode =
   | 'SYNTAX_ERROR'
   | 'RUNTIME_ERROR'
   | 'CODE_TOO_LARGE'
+  | 'WRITE_NOT_ALLOWED'
+  | 'CONNECTOR_TIMEOUT'
+  | 'CANCELLED'
   | 'BUSY';
 
 export interface SandboxError {

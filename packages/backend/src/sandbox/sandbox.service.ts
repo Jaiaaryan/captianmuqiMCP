@@ -122,8 +122,14 @@ export class SandboxService {
     failWith: (error: SandboxError) => SandboxRunResult,
   ): Promise<SandboxRunResult> {
     const lineCount = countLines(req.code);
+    const allowWrites = req.allowWrites === true;
+    // Fixed for the whole run: the script cannot add a tool, and a change to the
+    // caller's role while it runs does not reach it.
     const allowed = new Map<string, SandboxTool>(req.allowedTools.map((t) => [t.name, t]));
-    const names = [...allowed.keys()];
+    // What the script is told it can call. A write tool stays known, so that a
+    // call to it is refused with a reason, but it is not listed unless writes
+    // are allowed.
+    const names = req.allowedTools.filter((t) => t.readOnly || allowWrites).map((t) => t.name);
 
     let argsJson: string;
     try {
@@ -134,17 +140,30 @@ export class SandboxService {
 
     const isolate = new ivm.Isolate({ memoryLimit: limits.memoryMb });
     let timedOut = false;
+    let cancelled = false;
     let done = false;
-    // Host-side wall clock. Disposing a busy isolate stops it (about 200 ms).
+    // Deadlines of connector calls still being waited on: settled when the run ends.
+    const liveCalls = new Set<() => void>();
+    // Host-side wall clock for the whole run: the script, the time it spends
+    // waiting on connectors, and the handling of its result. Disposing a busy
+    // isolate stops it (about 200 ms).
     const timer = setTimeout(() => {
       timedOut = true;
       disposeQuietly(isolate);
     }, limits.timeoutMs);
+    // The caller went away: stop the isolate now instead of finishing for nobody.
+    const onAbort = () => {
+      cancelled = true;
+      disposeQuietly(isolate);
+    };
+    if (req.signal?.aborted) onAbort();
+    else req.signal?.addEventListener('abort', onAbort, { once: true });
 
     const classify = (err: unknown): SandboxRunResult =>
       failWith(
         toSandboxError(err, {
           timedOut,
+          cancelled,
           lineCount,
           timeoutMs: limits.timeoutMs,
           memoryMb: limits.memoryMb,
@@ -164,6 +183,14 @@ export class SandboxService {
         const name = String(nameArg);
         const tool = allowed.get(name);
         if (!tool) return refuse('TOOL_NOT_ALLOWED', notAvailable(name, names));
+        // Checked on every call, before anything runs: a tool that may change
+        // data is refused unless the trusted policy allows writes.
+        if (!tool.readOnly && !allowWrites) {
+          return refuse(
+            'WRITE_NOT_ALLOWED',
+            `Tool '${name}' can change data, and sandbox scripts are read-only.`,
+          );
+        }
         if (meta.connectorCalls >= limits.maxConnectorCalls) {
           return refuse(
             'CONNECTOR_CALL_LIMIT',
@@ -183,18 +210,52 @@ export class SandboxService {
           );
         }
 
+        // The same check the MCP endpoint applies to a direct call, here on the
+        // host: the script's arguments are data, never trusted as they come.
+        let callArgs: Record<string, unknown> = parsed;
+        if (tool.validateArgs) {
+          let checked;
+          try {
+            checked = tool.validateArgs(parsed);
+          } catch {
+            return refuse('TOOL_ERROR', `Arguments for '${name}' could not be checked.`);
+          }
+          if (!checked.ok) return refuse('TOOL_ERROR', checked.message);
+          callArgs = checked.args;
+        }
+
         meta.connectorCalls++;
         if (!meta.toolsCalled.includes(name)) meta.toolsCalled.push(name);
 
+        // A call gets its own deadline only when that is shorter than what is
+        // left of the run. Otherwise the whole-run deadline is the one that
+        // applies, so the two never race for the same instant.
+        const left = limits.timeoutMs - (Date.now() - started);
+        const callMs = limits.connectorTimeoutMs < left ? limits.connectorTimeoutMs : undefined;
         let result: SandboxToolResult;
         try {
           // Scope to the owning connector (avoids cross-connector name clashes)
           // and keep everything else from the authenticated session.
-          result = await req.executeTool(name, parsed, {
-            ...req.invocationContext,
-            connectorIds: [tool.connectorId],
-          });
+          result = await withDeadline(
+            Promise.resolve().then(() =>
+              req.executeTool(name, callArgs, {
+                ...req.invocationContext,
+                connectorIds: [tool.connectorId],
+              }),
+            ),
+            callMs,
+            liveCalls,
+          );
         } catch (err) {
+          if (err === RUN_ENDED) {
+            return refuse('TOOL_ERROR', 'The sandbox run has already finished.');
+          }
+          if (err === DEADLINE) {
+            return refuse(
+              'CONNECTOR_TIMEOUT',
+              `Tool '${name}' did not answer within ${limits.connectorTimeoutMs} ms.`,
+            );
+          }
           this.logger.warn(
             `Tool "${name}" threw inside a sandbox run: ${(err as Error)?.constructor?.name ?? 'error'}`,
           );
@@ -203,8 +264,25 @@ export class SandboxService {
         if (done) return refuse('TOOL_ERROR', 'The sandbox run has already finished.');
         if (result.isError) return refuse('TOOL_ERROR', toolErrorText(result));
 
+        // A cheap bound before the payload is serialised again and copied into
+        // the isolate. The text form is pretty-printed, so it is never smaller
+        // than the compact JSON; the exact check follows.
+        const textBytes = Buffer.byteLength(result.content?.[0]?.text ?? '', 'utf8');
+        if (textBytes > limits.maxConnectorResponseBytes * 4) {
+          return refuse(
+            'CONNECTOR_BYTES_LIMIT',
+            `Connector response is larger than the per-response limit (${limits.maxConnectorResponseBytes} bytes).`,
+          );
+        }
         const out = JSON.stringify(toolValue(result)) ?? 'null';
-        meta.bytesFromConnectors += Buffer.byteLength(out);
+        const outBytes = Buffer.byteLength(out, 'utf8');
+        if (outBytes > limits.maxConnectorResponseBytes) {
+          return refuse(
+            'CONNECTOR_BYTES_LIMIT',
+            `Connector response of ${outBytes} bytes is larger than the per-response limit (${limits.maxConnectorResponseBytes} bytes).`,
+          );
+        }
+        meta.bytesFromConnectors += outBytes;
         if (meta.bytesFromConnectors > limits.maxConnectorBytes) {
           return refuse(
             'CONNECTOR_BYTES_LIMIT',
@@ -222,6 +300,12 @@ export class SandboxService {
         const name = String(nameArg);
         const tool = allowed.get(name);
         if (!tool) return refuse('TOOL_NOT_ALLOWED', notAvailable(name, names));
+        if (!tool.readOnly && !allowWrites) {
+          return refuse(
+            'WRITE_NOT_ALLOWED',
+            `Tool '${name}' can change data, and sandbox scripts are read-only.`,
+          );
+        }
         return `{"ok":true,"v":${JSON.stringify({
           name: tool.name,
           description: tool.description,
@@ -279,6 +363,9 @@ export class SandboxService {
     } finally {
       done = true;
       clearTimeout(timer);
+      req.signal?.removeEventListener('abort', onAbort);
+      // No call outlives the run: its timer is cleared and its waiter released.
+      for (const settle of [...liveCalls]) settle();
       disposeQuietly(isolate);
     }
   }
@@ -324,6 +411,58 @@ export class SandboxService {
       message: 'Script ended without producing a result.',
     });
   }
+}
+
+/** Marks a connector call that the run stopped waiting for. */
+const DEADLINE = Symbol('deadline');
+/** Marks a connector call still pending when its run ended. */
+const RUN_ENDED = Symbol('run-ended');
+
+/**
+ * Stops waiting for a call after `ms`. The call itself is not cancelled: the
+ * executor takes no signal, and the connector engines carry their own timeouts.
+ * What this guarantees is that the run moves on, and that the call's eventual
+ * outcome, a result or a rejection, is absorbed here and reaches nothing.
+ *
+ * `live` holds a settle function for each call still being waited on; the run
+ * calls them all when it ends, so no timer outlives it.
+ */
+function withDeadline<T>(
+  pending: Promise<T>,
+  ms: number | undefined,
+  live: Set<() => void>,
+): Promise<T> {
+  pending.catch(() => undefined);
+  return new Promise<T>((resolve, reject) => {
+    const finish = () => {
+      if (timer) clearTimeout(timer);
+      live.delete(end);
+    };
+    const end = () => {
+      finish();
+      reject(RUN_ENDED);
+    };
+    // No timer when the run's own deadline is the only one that applies.
+    const timer =
+      ms === undefined
+        ? undefined
+        : setTimeout(() => {
+            finish();
+            reject(DEADLINE);
+          }, ms);
+    timer?.unref?.();
+    live.add(end);
+    pending.then(
+      (value) => {
+        finish();
+        resolve(value);
+      },
+      (err) => {
+        finish();
+        reject(err);
+      },
+    );
+  });
 }
 
 function mergeLimits(over?: Partial<SandboxLimits>): SandboxLimits {

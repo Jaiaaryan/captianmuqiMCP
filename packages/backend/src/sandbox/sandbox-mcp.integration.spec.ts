@@ -35,9 +35,16 @@ const tool = (id: string, name: string, extra: Record<string, unknown> = {}) => 
 
 const ORDERS = tool('t1', 'erp_orders_list');
 const CUSTOMERS = tool('t2', 'erp_customers_list');
+// A tool that changes data: a statement that is not a read.
+const PURGE = tool('t3', 'erp_orders_purge', {
+  endpointMapping: { method: 'query', path: 'DELETE FROM orders' },
+});
 
-function makeController(opts: { withSandbox?: boolean } = {}) {
+function makeController(
+  opts: { withSandbox?: boolean; roleAllows?: string[] | null; registryTools?: unknown[] } = {},
+) {
   const withSandbox = opts.withSandbox ?? true;
+  const roles = { getAllowedToolIds: jest.fn(async () => opts.roleAllows ?? null) };
   const executeTool = jest.fn(async (name: string) => ({
     content: [{ type: 'text' as const, text: 'ignored' }],
     structured: name === 'erp_orders_list' ? orderRows : [{ id: 'c1' }],
@@ -50,10 +57,13 @@ function makeController(opts: { withSandbox?: boolean } = {}) {
     recordRun: jest.fn(async () => 'run-1'),
   };
   const controller = new McpEndpointController(
-    { findById: jest.fn() } as any,
-    { getAllTools: jest.fn().mockReturnValue([]) } as any,
+    {
+      findById: jest.fn(),
+      getConnectorIds: jest.fn(async () => ['conn-t1', 'conn-t2', 'conn-t3']),
+    } as any,
+    { getAllTools: jest.fn().mockReturnValue(opts.registryTools ?? [ORDERS, CUSTOMERS]) } as any,
     { executeTool } as any,
-    { getAllowedToolIds: jest.fn() } as any,
+    roles as any,
     { lookup: jest.fn(), isEnabled: jest.fn(), captureIntentEnabled: jest.fn() } as any,
     { get: jest.fn(), add: jest.fn(), remove: jest.fn() } as any,
     { resolve: jest.fn().mockResolvedValue(null) } as any,
@@ -62,7 +72,7 @@ function makeController(opts: { withSandbox?: boolean } = {}) {
     withSandbox ? new SandboxService() : undefined,
     withSandbox ? (scripts as any) : undefined,
   );
-  return { controller, executeTool, scripts };
+  return { controller, executeTool, scripts, roles };
 }
 
 const baseParams = (over: Record<string, unknown> = {}) => ({
@@ -182,7 +192,8 @@ describe('code mode through planToolSet', () => {
       expect(run.description).toContain('tools.erp_orders_list({ limit?: number })');
       expect(run.description).toContain('tools.erp_customers_list(');
       expect(run.description).not.toContain('Longer text that must not appear');
-      expect(run.annotations).toMatchObject({ readOnlyHint: false, openWorldHint: true });
+      // Read-only while writes are off, which is the default.
+      expect(run.annotations).toMatchObject({ readOnlyHint: true, openWorldHint: true });
       expect(Object.keys(run.inputSchema.properties ?? {}).sort()).toEqual(['args', 'code', 'scriptName', 'timeoutMs']);
       expect(listed.find((t) => t.name === 'sandbox_list_scripts')!.annotations?.readOnlyHint).toBe(true);
     });
@@ -254,7 +265,7 @@ describe('code mode through planToolSet', () => {
     });
 
     it('lets a script call only the tools the role allows', async () => {
-      const { controller, executeTool } = makeController();
+      const { controller, executeTool } = makeController({ roleAllows: [ORDERS.id] });
       const entries = (controller as any).planToolSet(
         baseParams({ allowedToolIds: [ORDERS.id] }), // CUSTOMERS filtered out by role
       );
@@ -309,6 +320,161 @@ describe('code mode through planToolSet', () => {
         arguments: { scriptName: 'delayed_orders', args: { month: 'previous' } },
       });
       expect(rerun.structuredContent.result).toEqual({ rerun: 'previous' });
+    });
+
+    describe('authorization at run time', () => {
+      it('honours a role that changed after the session was planned', async () => {
+        const { controller, executeTool, roles } = makeController();
+        // Planned while the caller may use every tool, as a stateful session would be.
+        const client = await connect((controller as any).planToolSet(baseParams()));
+        const first: any = await client.callTool({
+          name: 'sandbox_run_script',
+          arguments: { code: 'return (await tools.erp_customers_list({})).length' },
+        });
+        expect(first.structuredContent.result).toBe(1);
+
+        roles.getAllowedToolIds.mockResolvedValue([ORDERS.id]); // customers revoked
+        const second: any = await client.callTool({
+          name: 'sandbox_run_script',
+          arguments: { code: 'return await tools.erp_customers_list({})' },
+        });
+        expect(second.structuredContent.error.code).toBe('TOOL_NOT_ALLOWED');
+        expect(executeTool).toHaveBeenCalledTimes(1);
+      });
+
+      it('runs nothing when access cannot be re-checked', async () => {
+        const { controller, executeTool, roles, scripts } = makeController();
+        const client = await connect((controller as any).planToolSet(baseParams()));
+        roles.getAllowedToolIds.mockRejectedValue(new Error('db down'));
+        const res: any = await client.callTool({
+          name: 'sandbox_run_script',
+          arguments: { code: 'return 1' },
+        });
+        expect(res.isError).toBe(true);
+        expect(res.content[0].text).toMatch(/could not verify your access/i);
+        expect(res.content[0].text).not.toMatch(/db down/);
+        expect(executeTool).not.toHaveBeenCalled();
+        expect(scripts.recordRun).not.toHaveBeenCalled();
+      });
+    });
+
+    describe('read-only by default', () => {
+      const withWriteTool = () =>
+        makeController({ registryTools: [ORDERS, CUSTOMERS, PURGE] });
+      const planWithWriteTool = (controller: any) =>
+        controller.planToolSet(baseParams({ serverTools: [ORDERS, CUSTOMERS, PURGE] }));
+
+      afterEach(() => {
+        delete process.env.SANDBOX_ALLOW_WRITES;
+      });
+
+      it('refuses a write tool before it runs, and does not offer it', async () => {
+        const { controller, executeTool } = withWriteTool();
+        const client = await connect(planWithWriteTool(controller));
+        const listed = (await client.listTools()).tools.find((t) => t.name === 'sandbox_run_script')!;
+        expect(listed.description).toContain('erp_orders_list');
+        expect(listed.description).not.toContain('erp_orders_purge');
+
+        const res: any = await client.callTool({
+          name: 'sandbox_run_script',
+          arguments: { code: 'return await tools.erp_orders_purge({})' },
+        });
+        expect(res.structuredContent.error.code).toBe('WRITE_NOT_ALLOWED');
+        expect(res.structuredContent.error.hint).toMatch(/read-only/i);
+        expect(executeTool).not.toHaveBeenCalled();
+      });
+
+      it('has no way for the agent to ask for writes', async () => {
+        const { controller, executeTool } = withWriteTool();
+        const client = await connect(planWithWriteTool(controller));
+        const listed = (await client.listTools()).tools.find((t) => t.name === 'sandbox_run_script')!;
+        expect(Object.keys(listed.inputSchema.properties ?? {})).not.toContain('allowWrite');
+        // An extra argument is not a grant either: the call is refused or the key is ignored.
+        const res: any = await client
+          .callTool({
+            name: 'sandbox_run_script',
+            arguments: { code: 'return await tools.erp_orders_purge({})', allowWrite: true, allowWrites: true },
+          })
+          .catch((e) => ({ thrown: String(e) }));
+        expect(executeTool).not.toHaveBeenCalled();
+        if (!res.thrown) expect(res.structuredContent.error.code).toBe('WRITE_NOT_ALLOWED');
+      });
+
+      it('allows the write only when the operator\'s policy says so', async () => {
+        process.env.SANDBOX_ALLOW_WRITES = 'true';
+        const { controller, executeTool } = withWriteTool();
+        const client = await connect(planWithWriteTool(controller));
+        const listed = (await client.listTools()).tools.find((t) => t.name === 'sandbox_run_script')!;
+        expect(listed.description).toContain('erp_orders_purge');
+        expect(listed.annotations).toMatchObject({ readOnlyHint: false });
+
+        const res: any = await client.callTool({
+          name: 'sandbox_run_script',
+          arguments: { code: 'return await tools.erp_orders_purge({})' },
+        });
+        expect(res.isError).toBeFalsy();
+        expect(executeTool).toHaveBeenCalledWith('erp_orders_purge', {}, expect.any(Object));
+      });
+    });
+
+    describe('audit and cancellation', () => {
+      it('puts the run id on every connector call and on the stored run', async () => {
+        const { controller, executeTool, scripts } = makeController();
+        const client = await connect((controller as any).planToolSet(baseParams()));
+        const res: any = await client.callTool({
+          name: 'sandbox_run_script',
+          arguments: {
+            code: 'await tools.erp_orders_list({}); await tools.erp_customers_list({}); return 1',
+          },
+        });
+        const runId = res.structuredContent.runId;
+        expect(runId).toMatch(/^[0-9a-f-]{36}$/);
+        const contexts = executeTool.mock.calls.map((c: any[]) => c[2]);
+        expect(contexts).toHaveLength(2);
+        for (const ctx of contexts) {
+          expect(ctx.sandboxRunId).toBe(runId);
+          // ...next to the caller's own identity, which the script cannot touch.
+          expect(ctx).toMatchObject({ userId: 'u1', organizationId: SERVER_ORG, mcpServerId: 'srv-A' });
+        }
+        expect(scripts.recordRun).toHaveBeenCalledWith(expect.objectContaining({ id: runId }));
+      });
+
+      it('gives two runs two different ids', async () => {
+        const { controller } = makeController();
+        const client = await connect((controller as any).planToolSet(baseParams()));
+        const a: any = await client.callTool({ name: 'sandbox_run_script', arguments: { code: 'return 1' } });
+        const b: any = await client.callTool({ name: 'sandbox_run_script', arguments: { code: 'return 1' } });
+        expect(a.structuredContent.runId).not.toBe(b.structuredContent.runId);
+      });
+
+      it('stops the run when the client cancels the request', async () => {
+        const { controller, executeTool, scripts } = makeController();
+        // A connector that never answers: the script is parked on an await.
+        executeTool.mockImplementation(() => new Promise(() => undefined));
+        const client = await connect((controller as any).planToolSet(baseParams()));
+
+        const abort = new AbortController();
+        const pending = client
+          .callTool(
+            { name: 'sandbox_run_script', arguments: { code: 'return await tools.erp_orders_list({})' } },
+            { signal: abort.signal } as any,
+          )
+          .catch((e) => ({ aborted: true, e }));
+        await new Promise((r) => setTimeout(r, 200));
+        abort.abort();
+        await pending;
+
+        // The run is not left waiting out its 10 s deadline: it ends as CANCELLED.
+        const deadline = Date.now() + 3_000;
+        while (!scripts.recordRun.mock.calls.length && Date.now() < deadline) {
+          await new Promise((r) => setTimeout(r, 50));
+        }
+        expect(scripts.recordRun).toHaveBeenCalledTimes(1);
+        const stored: any = (scripts.recordRun.mock.calls[0] as any[])[0];
+        expect(stored.result.ok).toBe(false);
+        expect(stored.result.error.code).toBe('CANCELLED');
+        expect(stored.result.meta.ms).toBeLessThan(3_000);
+      });
     });
   });
 });

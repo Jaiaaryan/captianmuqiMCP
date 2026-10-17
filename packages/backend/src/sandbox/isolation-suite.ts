@@ -1,3 +1,4 @@
+import { z } from 'zod';
 import type { SandboxLimits } from './limits';
 import type { SandboxService } from './sandbox.service';
 import type {
@@ -50,19 +51,35 @@ export interface IsolationCaseResult {
 
 const SUITE_CONNECTOR = 'conn-suite';
 
-const tool = (name: string, description: string): SandboxTool => ({
+const tool = (name: string, description: string, readOnly = true): SandboxTool => ({
   name,
   connectorId: SUITE_CONNECTOR,
   description,
   parameters: { type: 'object', properties: {} },
+  readOnly,
 });
 
-/** The only tools the suite's scripts may call. `other_org_customers_list` is deliberately absent. */
+// Checked the way the MCP endpoint checks a direct call: the tool's own schema.
+const ordersListArgs = z.object({ limit: z.number().optional() });
+
+/** The only tools the suite's scripts may see. `other_org_customers_list` is deliberately absent. */
 const SUITE_TOOLS: SandboxTool[] = [
-  tool('erp_orders_list', 'Up to 1000 synthetic orders.'),
+  {
+    ...tool('erp_orders_list', 'Up to 1000 synthetic orders.'),
+    validateArgs: (args) => {
+      const parsed = ordersListArgs.safeParse(args);
+      return parsed.success
+        ? { ok: true, args: parsed.data }
+        : { ok: false, message: `Invalid arguments: limit: ${parsed.error.issues[0]?.message}` };
+    },
+  },
   tool('erp_orders_export', 'About 7 MB of synthetic orders: the "large call" of the brief.'),
   tool('erp_products_list', 'A handful of synthetic products.'),
   tool('erp_whoami', 'Echoes the identity the bridge handed to the executor.'),
+  tool('erp_slow', 'Answers after three seconds.'),
+  tool('erp_hangs', 'Never answers.'),
+  // A tool that changes data. Present on purpose: scripts must be refused it.
+  tool('erp_refund_create', 'Refunds an order.', false),
 ];
 
 const orderRows = (n: number) =>
@@ -85,6 +102,14 @@ const executeTool: SandboxExecuteTool = async (name, args, context) => {
       return ok((exportRows ??= orderRows(60_000)));
     case 'erp_products_list':
       return ok([{ id: 1, sku: 'P-1' }]);
+    case 'erp_slow':
+      // unref: an abandoned call must not keep the process alive.
+      return new Promise((resolve) => setTimeout(() => resolve(ok([])), 3_000).unref());
+    case 'erp_hangs':
+      return new Promise(() => undefined);
+    case 'erp_refund_create':
+      // Reaching this would be a failure of the read-only policy.
+      return ok({ refunded: true });
     case 'erp_whoami':
       return ok({
         organizationId: context.organizationId,
@@ -249,6 +274,64 @@ export const ISOLATION_CASES: IsolationCase[] = [
     },
   },
   {
+    id: 'write-refused',
+    name: 'Write tools are refused by default',
+    claim: 'A tool that changes data is refused before it runs; sandbox scripts are read-only unless the operator allows writes.',
+    specRef: 'extra',
+    code: 'return await tools.erp_refund_create({ orderId: 1 });',
+    expected: 'WRITE_NOT_ALLOWED',
+    verify: (r) =>
+      r.meta.connectorCalls === 0 && r.meta.toolsCalled.length === 0
+        ? null
+        : `the write tool was reached: ${JSON.stringify(r.meta.toolsCalled)}`,
+  },
+  {
+    id: 'writes-not-listed',
+    name: 'Write tools are not offered',
+    claim: 'The tool list a script sees leaves out everything that could change data.',
+    specRef: 'extra',
+    code: 'return tools.list();',
+    expected: 'OK',
+    verify: (r) => {
+      const list = r.result as string[];
+      return Array.isArray(list) && !list.includes('erp_refund_create') && list.includes('erp_orders_list')
+        ? null
+        : `listed: ${JSON.stringify(list)}`;
+    },
+  },
+  {
+    id: 'argument-validation',
+    name: 'Arguments are validated on the host',
+    claim: 'A script’s arguments are checked against the tool’s schema before the tool runs, like a direct call.',
+    specRef: 'extra',
+    code: 'return await tools.erp_orders_list({ limit: { $gt: 0 } });',
+    expected: 'TOOL_ERROR',
+    verify: (r) =>
+      r.meta.connectorCalls === 0 && /limit/.test(r.error?.message ?? '')
+        ? null
+        : `calls=${r.meta.connectorCalls}, message: ${r.error?.message}`,
+  },
+  {
+    id: 'slow-connector-times-out',
+    name: 'A slow connector call times out',
+    claim: 'One slow connector call is abandoned at its own deadline; the script can carry on or fail cleanly.',
+    specRef: 'extra',
+    code: 'return await tools.erp_slow({});',
+    expected: 'CONNECTOR_TIMEOUT',
+    limits: { connectorTimeoutMs: 300, timeoutMs: 5_000 },
+    verify: (r) => (r.meta.ms < 1_500 ? null : `took ${r.meta.ms} ms for a 300 ms call deadline`),
+  },
+  {
+    id: 'waiting-on-connector',
+    name: 'A connector that never answers cannot keep the run alive',
+    claim: 'The whole-run deadline covers time spent waiting on a connector.',
+    specRef: 'extra',
+    code: 'return await tools.erp_hangs({});',
+    expected: 'TIMEOUT',
+    limits: { connectorTimeoutMs: 60_000, timeoutMs: TIMEOUT_MS },
+    verify: (r) => (r.meta.ms <= TIMEOUT_MS + 500 ? null : `took ${r.meta.ms} ms for a ${TIMEOUT_MS} ms limit`),
+  },
+  {
     id: 'call-limit',
     name: 'Connector call limit',
     claim: 'A script cannot hammer a connector: calls per run are capped.',
@@ -292,6 +375,8 @@ export async function runIsolationSuite(
       allowedTools: SUITE_TOOLS,
       invocationContext,
       executeTool,
+      // The default policy, stated outright: the suite shows what a normal run gets.
+      allowWrites: false,
       limits: c.limits,
     });
     const ms = Date.now() - started;

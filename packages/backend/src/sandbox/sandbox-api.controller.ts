@@ -1,3 +1,4 @@
+import { randomUUID } from 'node:crypto';
 import {
   BadRequestException,
   Body,
@@ -15,8 +16,10 @@ import {
   Post,
   Query,
   Req,
+  Res,
   UseGuards,
 } from '@nestjs/common';
+import type { Response } from 'express';
 import { AuthGuard } from '@nestjs/passport';
 import { ApiBearerAuth, ApiOperation, ApiTags } from '@nestjs/swagger';
 import { DynamicMcpTools } from '../mcp-server/dynamic-mcp-tools';
@@ -26,7 +29,7 @@ import { toSandboxTools, visibleServerTools } from '../mcp-server/visible-tools'
 import { McpServersService } from '../mcp-servers/mcp-servers.service';
 import { RolesService } from '../roles/roles.service';
 import { runIsolationSuite } from './isolation-suite';
-import { isSandboxEnabled } from './limits';
+import { areSandboxWritesAllowed, isSandboxEnabled } from './limits';
 import {
   BenchmarkDto,
   CreateSandboxScriptDto,
@@ -108,6 +111,7 @@ export class SandboxApiController {
     @Req() req: DashboardRequest,
     @Param('serverId') serverId: string,
     @Body() dto: RunSandboxDto,
+    @Res({ passthrough: true }) res?: Response,
   ) {
     const server = await this.serverFor(req, serverId, { write: true, active: true });
     const hasCode = typeof dto.code === 'string' && dto.code.length > 0;
@@ -123,15 +127,21 @@ export class SandboxApiController {
     if (saved) code = saved.code;
 
     const scope = await this.toolScope(req, server);
+    // One id for the run: its row in sandbox_runs and the mark on the audit row
+    // of each connector call it makes.
+    const runId = randomUUID();
     const result = await this.sandbox.run({
       code,
       args: dto.args,
       allowedTools: toSandboxTools(scope.visible),
-      invocationContext: scope.invocationContext,
+      allowWrites: areSandboxWritesAllowed(),
+      signal: abortOnDisconnect(res),
+      invocationContext: { ...scope.invocationContext, sandboxRunId: runId },
       executeTool: this.executeTool,
       limits: dto.timeoutMs ? { timeoutMs: dto.timeoutMs } : undefined,
     });
-    const runId = await this.scripts.recordRun({
+    await this.scripts.recordRun({
+      id: runId,
       organizationId: server.organizationId,
       mcpServerId: server.id,
       scriptId: saved?.id,
@@ -170,6 +180,7 @@ export class SandboxApiController {
     @Req() req: DashboardRequest,
     @Param('serverId') serverId: string,
     @Body() dto: BenchmarkDto,
+    @Res({ passthrough: true }) res?: Response,
   ) {
     const server = await this.serverFor(req, serverId, { write: true, active: true });
     const scope = await this.toolScope(req, server);
@@ -185,11 +196,14 @@ export class SandboxApiController {
     }
 
     // The raw path: what the model would receive if it called the tool itself.
+    // It carries the run's id, so both halves of the comparison are traceable.
+    const runId = randomUUID();
     const rawStarted = Date.now();
     let raw: SandboxToolResult | undefined;
     try {
       raw = await this.executeTool(tool.name, dto.toolArgs ?? {}, {
         ...scope.invocationContext,
+        sandboxRunId: runId,
         connectorIds: [tool.connectorId],
       });
     } catch (err) {
@@ -211,10 +225,13 @@ export class SandboxApiController {
       code: dto.code,
       args: dto.args,
       allowedTools: toSandboxTools(scope.visible),
-      invocationContext: scope.invocationContext,
+      allowWrites: areSandboxWritesAllowed(),
+      signal: abortOnDisconnect(res),
+      invocationContext: { ...scope.invocationContext, sandboxRunId: runId },
       executeTool: this.executeTool,
     });
-    const runId = await this.scripts.recordRun({
+    await this.scripts.recordRun({
+      id: runId,
       organizationId: server.organizationId,
       mcpServerId: server.id,
       userId: req.user.sub,
@@ -444,6 +461,20 @@ export class SandboxApiController {
     }
     return body;
   }
+}
+
+/**
+ * A signal that fires when the client goes away before the response is done, so
+ * the run stops instead of finishing for nobody. (`close` on the response, not
+ * on the request: the request closes as soon as its body has been read.)
+ */
+function abortOnDisconnect(res: Response | undefined): AbortSignal | undefined {
+  if (!res) return undefined;
+  const controller = new AbortController();
+  res.once('close', () => {
+    if (!res.writableFinished) controller.abort();
+  });
+  return controller.signal;
 }
 
 function rawErrorText(raw: SandboxToolResult | undefined): string {

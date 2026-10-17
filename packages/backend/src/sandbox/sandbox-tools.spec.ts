@@ -27,17 +27,24 @@ const TOOLS: SandboxTool[] = [
     description: 'List orders. Paginated.',
     parameters: { type: 'object', properties: { limit: { type: 'number' } } },
     outputSchema: { type: 'array', items: { type: 'object', properties: { id: { type: 'number' } } } },
+    readOnly: true,
   },
 ];
 
 const okMeta = { ms: 5, connectorCalls: 1, bytesFromConnectors: 900, bytesReturned: 12, logs: [], toolsCalled: [] };
 
-type Handler = (input: any) => Promise<any>;
+type Handler = (input: any, handlerContext?: any) => Promise<any>;
 
-function setup(overrides: { tools?: SandboxTool[]; runResult?: SandboxRunResult } = {}) {
+function setup(
+  overrides: {
+    tools?: SandboxTool[];
+    runResult?: SandboxRunResult;
+    reauthorize?: () => Promise<SandboxTool[]>;
+  } = {},
+) {
   const sandbox = {
     run: jest.fn(
-      async (): Promise<SandboxRunResult> =>
+      async (_request?: any): Promise<SandboxRunResult> =>
         overrides.runResult ?? { ok: true, result: { n: 3 }, meta: okMeta },
     ),
     checkSyntax: jest.fn(async (_code: string) => ({ ok: true }) as any),
@@ -61,7 +68,7 @@ function setup(overrides: { tools?: SandboxTool[]; runResult?: SandboxRunResult 
   const executeTool = jest.fn(async (): Promise<SandboxToolResult> => ({ content: [] }));
   const entries = buildSandboxToolEntries(
     { sandbox: sandbox as any, scripts: scripts as any, executeTool },
-    { storageOrganizationId: SERVER_ORG, invocationContext: ctx },
+    { storageOrganizationId: SERVER_ORG, invocationContext: ctx, reauthorize: overrides.reauthorize },
     overrides.tools ?? TOOLS,
   );
 
@@ -73,7 +80,8 @@ function setup(overrides: { tools?: SandboxTool[]; runResult?: SandboxRunResult 
     }),
   };
   for (const e of entries) e.register(fakeServer as any);
-  const call = (name: string, input: any = {}) => registered.get(name)!.handler(input);
+  const call = (name: string, input: any = {}, handlerContext?: any) =>
+    registered.get(name)!.handler(input, handlerContext);
   const payload = (res: any) => JSON.parse(res.content[0].text);
   return { entries, registered, call, payload, sandbox, scripts, executeTool };
 }
@@ -101,7 +109,8 @@ describe('buildSandboxToolEntries', () => {
       const { registered } = setup();
       const hints = (n: string) => registered.get(n)!.config.annotations;
       expect(hints('sandbox_list_scripts').readOnlyHint).toBe(true);
-      expect(hints('sandbox_run_script')).toMatchObject({ readOnlyHint: false, openWorldHint: true });
+      // Read-only while writes are off (the default), and it reaches external systems.
+      expect(hints('sandbox_run_script')).toMatchObject({ readOnlyHint: true, openWorldHint: true });
       // They write to the database: a client must not treat them as probe-safe.
       expect(hints('sandbox_create_script').readOnlyHint).toBe(false);
       expect(hints('sandbox_edit_script').readOnlyHint).toBe(false);
@@ -128,15 +137,18 @@ describe('buildSandboxToolEntries', () => {
           code: 'return 1',
           args: { month: 'previous' },
           allowedTools: TOOLS,
-          invocationContext: ctx,
+          allowWrites: false,
+          invocationContext: { ...ctx, sandboxRunId: expect.any(String) },
           executeTool,
         }),
       );
-      expect(payload(res)).toEqual({ ok: true, result: { n: 3 }, meta: okMeta });
+      expect(payload(res)).toEqual({ ok: true, runId: expect.any(String), result: { n: 3 }, meta: okMeta });
       expect(res.structuredContent).toEqual(payload(res));
       expect(res.isError).toBeUndefined();
       expect(scripts.recordRun).toHaveBeenCalledWith(
         expect.objectContaining({
+          // The stored run and the context handed to the connectors share one id.
+          id: payload(res).runId,
           organizationId: SERVER_ORG,
           mcpServerId: 'srv-1',
           userId: 'user-1',
@@ -144,6 +156,53 @@ describe('buildSandboxToolEntries', () => {
           scriptId: undefined,
         }),
       );
+      expect(sandbox.run.mock.calls[0][0].invocationContext.sandboxRunId).toBe(payload(res).runId);
+    });
+
+    it('passes the request\'s abort signal on, so a cancelled request stops the run', async () => {
+      const { call, sandbox } = setup();
+      const abort = new AbortController();
+      await call('sandbox_run_script', { code: 'return 1' }, { mcpReq: { signal: abort.signal } });
+      expect(sandbox.run.mock.calls[0][0].signal).toBe(abort.signal);
+    });
+
+    it('never takes the write policy from its input', async () => {
+      const { call, sandbox } = setup();
+      await call('sandbox_run_script', { code: 'return 1', allowWrites: true, allowWrite: true });
+      expect(sandbox.run.mock.calls[0][0].allowWrites).toBe(false);
+    });
+
+    describe('authorization is decided again for every run', () => {
+      const other: SandboxTool = { ...TOOLS[0], name: 'erp_other_list' };
+
+      it('runs with the tools the caller has now, not the ones the session was planned with', async () => {
+        const reauthorize = jest.fn(async () => [other]);
+        const { call, sandbox } = setup({ reauthorize });
+        await call('sandbox_run_script', { code: 'return 1' });
+        await call('sandbox_run_script', { code: 'return 2' });
+        expect(reauthorize).toHaveBeenCalledTimes(2);
+        expect(sandbox.run.mock.calls[0][0].allowedTools).toEqual([other]);
+      });
+
+      it('runs a saved script with the runner\'s current tools, whoever wrote it', async () => {
+        const reauthorize = jest.fn(async () => []);
+        const { call, sandbox, scripts } = setup({ reauthorize });
+        scripts.getByName.mockResolvedValueOnce({ id: 'sc-9', name: 'monthly', version: 4, code: 'return 9', createdById: 'someone-else' });
+        await call('sandbox_run_script', { scriptName: 'monthly' });
+        expect(sandbox.run.mock.calls[0][0].allowedTools).toEqual([]);
+      });
+
+      it('runs nothing, and says so plainly, when access cannot be checked', async () => {
+        const reauthorize = jest.fn(async () => {
+          throw new Error('connection refused to db.internal:5432');
+        });
+        const { call, sandbox, scripts } = setup({ reauthorize });
+        const res = await call('sandbox_run_script', { code: 'return 1' });
+        expect(res.isError).toBe(true);
+        expect(res.content[0].text).toBe('Could not verify your access to the tools. Try again.');
+        expect(sandbox.run).not.toHaveBeenCalled();
+        expect(scripts.recordRun).not.toHaveBeenCalled();
+      });
     });
 
     it('stores under the server\'s organization, not the caller\'s active one', async () => {
@@ -400,7 +459,11 @@ describe('buildSandboxToolEntries', () => {
       expect(body.result).toEqual({ delayed: 400 });
       expect(body.meta.bytesFromConnectors).toBeGreaterThan(30_000);
       expect(res.content[0].text.length).toBeLessThan(500);
-      expect(executeTool).toHaveBeenCalledWith('erp_orders_list', {}, { ...ctx, connectorIds: ['conn-1'] });
+      expect(executeTool).toHaveBeenCalledWith(
+        'erp_orders_list',
+        {},
+        { ...ctx, sandboxRunId: body.runId, connectorIds: ['conn-1'] },
+      );
     });
   });
 });

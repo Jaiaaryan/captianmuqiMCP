@@ -221,6 +221,8 @@ export class DynamicMcpTools {
       mcpServerName?: string;
       connectorIds?: string[];
       intent?: string;
+      /** Set when the call is made by a sandbox script: ties the audit row to that run. */
+      sandboxRunId?: string;
     },
   ): Promise<{
     content: ToolResultContent;
@@ -495,6 +497,7 @@ export class DynamicMcpTools {
           apiKeyName: context.apiKeyName,
           userEmail: context.userEmail,
           mcpServerName: context.mcpServerName,
+          sandboxRunId: context.sandboxRunId,
         }) : undefined,
       });
 
@@ -569,6 +572,7 @@ export class DynamicMcpTools {
           apiKeyName: context.apiKeyName,
           userEmail: context.userEmail,
           mcpServerName: context.mcpServerName,
+          sandboxRunId: context.sandboxRunId,
         }) : undefined,
       });
 

@@ -31,6 +31,8 @@ const SUMMARY_SELECT = {
 } as const;
 
 export interface RecordRunInput {
+  /** The run's id, when it was handed out before the run (the audit rows carry it). */
+  id?: string;
   organizationId: string;
   mcpServerId: string;
   scriptId?: string;
@@ -232,6 +234,7 @@ export class SandboxScriptsService {
     try {
       const run = await this.prisma.sandboxRun.create({
         data: {
+          ...(input.id && { id: input.id }),
           organizationId: input.organizationId,
           mcpServerId: input.mcpServerId,
           scriptId: input.scriptId ?? null,

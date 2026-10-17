@@ -20,13 +20,14 @@ const baseContext: SandboxInvocationContext = {
   connectorIds: ['conn-1', 'conn-2'],
 };
 
-function tool(name: string, connectorId = 'conn-1'): SandboxTool {
+function tool(name: string, connectorId = 'conn-1', readOnly = true): SandboxTool {
   return {
     name,
     connectorId,
     description: `${name} description`,
     parameters: { type: 'object', properties: { limit: { type: 'number' } } },
     outputSchema: { type: 'array' },
+    readOnly,
   };
 }
 

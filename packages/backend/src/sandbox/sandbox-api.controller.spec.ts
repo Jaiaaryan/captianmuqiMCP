@@ -199,7 +199,9 @@ describe('SandboxApiController', () => {
       expect(call.code).toBe('return await tools.shop_list_orders({})');
       expect(call.args).toEqual({ month: '2026-09' });
       expect(call.limits).toEqual({ timeoutMs: 5000 });
+      expect(call.allowWrites).toBe(false);
       expect(call.invocationContext).toEqual({
+        sandboxRunId: expect.any(String),
         userId: 'u-editor',
         userEmail: 'editor@a.test',
         organizationId: ORG,
@@ -215,9 +217,12 @@ describe('SandboxApiController', () => {
           userId: 'u-editor',
           scriptId: undefined,
           code: 'return await tools.shop_list_orders({})',
+          // The id of the stored run is the one the connectors' audit rows carry.
+          id: (body as any).runId,
         }),
       );
-      expect(body).toMatchObject({ runId: 'run-1', ok: true, result: { total: 3 } });
+      expect(call.invocationContext.sandboxRunId).toBe((body as any).runId);
+      expect(body).toMatchObject({ runId: expect.any(String), ok: true, result: { total: 3 } });
       expect(body).not.toHaveProperty('script');
     });
 
@@ -276,7 +281,7 @@ describe('SandboxApiController', () => {
       const { controller, sandbox } = setup();
       sandbox.run.mockResolvedValue(failResult('TIMEOUT'));
       const body: any = await controller.run(asReq(EDITOR), SERVER, { code: 'while(true){}' });
-      expect(body).toMatchObject({ runId: 'run-1', ok: false, error: { code: 'TIMEOUT' } });
+      expect(body).toMatchObject({ runId: expect.any(String), ok: false, error: { code: 'TIMEOUT' } });
     });
 
     it('answers 429 with the body when the organization has no free slot', async () => {
@@ -318,7 +323,10 @@ describe('SandboxApiController', () => {
       });
       expect(body.reduction.bytesPct).toBeCloseTo((1 - 3 / rawBytes) * 100, 1);
       expect(body.reduction.tokensPct).toBeGreaterThan(99);
-      expect(body.runId).toBe('run-1');
+      expect(body.runId).toMatch(/^[0-9a-f-]{36}$/);
+      // Both halves of the comparison carry the run's id.
+      expect(executor.executeTool.mock.calls[0][2].sandboxRunId).toBe(body.runId);
+      expect(sandbox.run.mock.calls[0][0].invocationContext.sandboxRunId).toBe(body.runId);
       // The raw call is made as the caller, scoped to the tool's own connector.
       expect(executor.executeTool).toHaveBeenCalledWith(
         'shop_list_orders',
