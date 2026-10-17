@@ -83,6 +83,11 @@ import {
   SANDBOX_RUN_TOOL,
   buildSandboxToolEntries,
 } from '../sandbox/sandbox-tools';
+import { ProcessorChainService } from './processor-chain.service';
+import {
+  areProcessorChainToolsEnabled,
+  buildProcessorToolEntries,
+} from './processor-tools';
 import { isSandboxEnabled } from '../sandbox/limits';
 import { toSandboxTools, visibleServerTools } from './visible-tools';
 import { readFileSync } from 'node:fs';
@@ -192,6 +197,14 @@ interface ToolSetParams {
    * and never get a code-execution tool by omission.
    */
   sandboxOrganizationId?: string;
+  /**
+   * Whether this caller may change the configuration of a connector on this
+   * server — the connector's owner, or an admin of the owning organization.
+   * Setting it is what offers the response processor chain tools, so a viewer
+   * and an API-key-only session are never shown a tool whose every call would
+   * be refused. Decided before planning (the plan itself is synchronous).
+   */
+  processorChainEditable?: boolean;
 }
 
 interface InvocationContext {
@@ -252,6 +265,27 @@ export class McpEndpointController {
     return toSandboxTools(visibleServerTools(serverTools, allowedToolIds));
   }
 
+  /**
+   * Whether to offer the response processor chain tools on this session. Fails
+   * closed: without the service, with the operator switch off, or on any error,
+   * the tools are simply not offered.
+   */
+  private async canEditProcessorChains(
+    userId: string | undefined,
+    organizationId: string,
+    connectorIds: string[],
+  ): Promise<boolean> {
+    if (!this.processorChains || !areProcessorChainToolsEnabled() || !userId) return false;
+    try {
+      return await this.processorChains.canEdit({ userId, organizationId, connectorIds });
+    } catch (err: any) {
+      this.logger.warn(
+        `Could not check who may edit response chains on ${organizationId}: ${err?.message ?? err}`,
+      );
+      return false;
+    }
+  }
+
   private shouldWarnDuplicate(key: string, now = Date.now()): boolean {
     const last = this.duplicateWarnedAt.get(key);
     if (last !== undefined && now - last < 60 * 60 * 1000) return false;
@@ -273,6 +307,7 @@ export class McpEndpointController {
     // Optional so specs that construct the controller by hand keep compiling.
     @Optional() private readonly sandbox?: SandboxService,
     @Optional() private readonly sandboxScripts?: SandboxScriptsService,
+    @Optional() private readonly processorChains?: ProcessorChainService,
   ) {}
 
   // Streamable-HTTP response framing. Default: SSE-framed responses
@@ -1142,6 +1177,12 @@ export class McpEndpointController {
         ? await this.kgService.isEnabled(invocationContext.organizationId)
         : false;
 
+    const processorChainEditable = await this.canEditProcessorChains(
+      invocationContext.userId,
+      mcpServerConfig.organizationId,
+      connectorIds,
+    );
+
     const params: ToolSetParams = {
       serverTools,
       allowedToolIds,
@@ -1149,6 +1190,7 @@ export class McpEndpointController {
       kgEnabled,
       invocationContext,
       sandboxOrganizationId: mcpServerConfig.organizationId,
+      processorChainEditable,
     };
 
     // Register this server's tool surface onto the per-request McpServer.
@@ -1492,6 +1534,13 @@ export class McpEndpointController {
         kgEnabled,
         invocationContext,
         sandboxOrganizationId: serverOrganizationId,
+        // Re-checked here too: a role or an owner changed since the session was
+        // planned takes effect on the next reconciliation.
+        processorChainEditable: await this.canEditProcessorChains(
+          invocationContext.userId,
+          serverOrganizationId,
+          connectorIds,
+        ),
       });
       const signature = this.aggregateSig(entries);
       if (signature === session.signature) return; // nothing changed here
@@ -1704,6 +1753,30 @@ export class McpEndpointController {
         if (registeredNames.has(entry.name)) continue;
         registeredNames.add(entry.name);
         entries.push(entry);
+      }
+    }
+
+    // Response processor chains: let the agent fix a tool that keeps answering
+    // in the wrong shape (a price in the wrong currency, a net amount where
+    // gross is wanted, a description full of newlines) on the tool itself,
+    // once, instead of in every prompt that reads it. Only for a caller who may
+    // already change the connector through the dashboard, so nothing offered
+    // here would be refused.
+    if (this.processorChains && params.processorChainEditable) {
+      const chainScope = {
+        userId: invocationContext.userId,
+        organizationId: params.sandboxOrganizationId ?? invocationContext.organizationId ?? '',
+        connectorIds: invocationContext.connectorIds,
+        // A chain can only be put on a tool this session can see: the server's
+        // own connectors, after the caller's role filtered the list.
+        visibleToolNames: new Set(visibleTools.map((t) => t.name)),
+      };
+      if (chainScope.organizationId) {
+        for (const entry of buildProcessorToolEntries(this.processorChains, chainScope)) {
+          if (registeredNames.has(entry.name)) continue;
+          registeredNames.add(entry.name);
+          entries.push(entry);
+        }
       }
     }
 

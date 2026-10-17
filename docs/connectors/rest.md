@@ -35,6 +35,8 @@ If you'd rather use a pre-built adapter (DHL, DPD, Personio, VIES, …) instead 
 
 The REST connector lets you expose HTTP-based APIs as MCP tools. It supports all HTTP methods, authentication types, and can auto-import tool definitions from multiple formats.
 
+On a connector's tool card, **Test → Run Test** executes a real request with the JSON inputs shown. The panel fills in parameter examples, defaults, or enum values from the tool's schema. Optional fields without a sample are omitted so the upstream API can apply its defaults. Supply real identifiers for required fields: an empty tracking number cannot identify a parcel. Missing required values are flagged before a request is sent. This behavior is the same in Cloud and self-hosted deployments.
+
 **Keywords:** REST API to MCP, OpenAPI to MCP, Swagger to MCP, Postman to MCP, cURL to MCP, HTTP API MCP bridge
 
 ---
@@ -291,6 +293,12 @@ Response mapping applies to every connector type, not just REST.
 - API: `PATCH /api/connectors/:id/tools/:toolId/response-mapping` sets or clears
   it, `POST .../preview-mapping` dry-runs one. The tool test endpoint returns
   both `result` (raw) and `mapped`.
+
+A mapping can only drop, rename or restructure what the API already returned. To
+*change* a value — convert a currency, add VAT, clean up a description, translate
+a status code — put a **response processor chain** on the tool
+(`responseMapping.processors`), which runs before the mapping. See
+[Response processor chains](../response-processors.md).
 
 ---
 

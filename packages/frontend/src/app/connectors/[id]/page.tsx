@@ -19,6 +19,7 @@ import ReactMarkdown from 'react-markdown';
 import remarkGfm from 'remark-gfm';
 import { authTypeLabel, cn } from '@/lib/utils';
 import { ToolAnnotationsEditor } from '@/components/tool-annotations-editor';
+import { toolTestInputError, toolTestParams } from '@/lib/tool-test-params';
 
 const IMPORT_SOURCES = [
   { id: 'openapi', label: 'OpenAPI / Swagger', placeholder: 'Paste OpenAPI JSON/YAML or enter URL...' },
@@ -252,6 +253,7 @@ export default function ConnectorDetailPage() {
   // Tool playground state
   const [testingToolId, setTestingToolId] = useState<string | null>(null);
   const [testParams, setTestParams] = useState('{}');
+  const [testInputError, setTestInputError] = useState<string | null>(null);
   const [testRunning, setTestRunning] = useState(false);
   const [toolTestResult, setToolTestResult] = useState<ToolTestResult | null>(null);
   // Which side of a mapped response the playground shows. Defaults to what an
@@ -767,12 +769,24 @@ export default function ConnectorDetailPage() {
 
   const handleTestTool = async (toolId: string, paramsOverride?: unknown) => {
     if (!token) return;
+    setTestInputError(null);
     setTestRunning(true);
     setToolTestResult(null);
     setTestResponseView('mapped');
     try {
       const params =
         paramsOverride !== undefined ? paramsOverride : JSON.parse(testParams);
+      const tool = toolList.find((t) => t.id === toolId);
+      const inputError = toolTestInputError(
+        params,
+        tool?.parameters,
+        tool?.endpointMapping?.path,
+        envVarEntries.map((e) => e.key.trim()).filter(Boolean),
+      );
+      if (inputError) {
+        setTestInputError(inputError);
+        return;
+      }
       const result = await tools.test(id, toolId, params, token);
       setToolTestResult(result);
     } catch (err: any) {
@@ -2032,18 +2046,13 @@ export default function ConnectorDetailPage() {
                               } else {
                                 setTestingToolId(tool.id);
                                 setToolTestResult(null);
+                                setTestInputError(null);
                                 // Pre-fill params from tool's parameter schema,
                                 // excluding params covered by environment variables
-                                const props = tool.parameters?.properties || {};
-                                const envKeys = new Set(envVarEntries.map((e) => e.key.trim()).filter(Boolean));
-                                const example: Record<string, unknown> = {};
-                                for (const [k, v] of Object.entries(props)) {
-                                  if (envKeys.has(k)) continue; // skip env-var-covered params
-                                  const prop = v as any;
-                                  if (prop.type === 'string') example[k] = '';
-                                  else if (prop.type === 'number' || prop.type === 'integer') example[k] = 0;
-                                  else if (prop.type === 'boolean') example[k] = false;
-                                }
+                                const example = toolTestParams(
+                                  tool.parameters,
+                                  envVarEntries.map((e) => e.key.trim()).filter(Boolean),
+                                );
                                 setTestParams(JSON.stringify(example, null, 2));
                               }
                             }}
@@ -2129,14 +2138,20 @@ export default function ConnectorDetailPage() {
                           )}
                           <div className="grid grid-cols-1 md:grid-cols-2 gap-3">
                             <div>
-                              <label className="block text-xs font-medium mb-1">Input Parameters (JSON)</label>
+                              <label htmlFor={`tool-test-params-${tool.id}`} className="block text-xs font-medium mb-1">Input Parameters (JSON)</label>
                               <textarea
+                                id={`tool-test-params-${tool.id}`}
                                 value={testParams}
-                                onChange={(e) => setTestParams(e.target.value)}
+                                onChange={(e) => { setTestParams(e.target.value); setTestInputError(null); }}
+                                aria-invalid={testInputError ? true : undefined}
+                                aria-describedby={testInputError ? `tool-test-error-${tool.id}` : undefined}
                                 rows={5}
                                 className="w-full border border-[var(--border)] rounded-[9px] px-3 py-2 text-xs bg-[var(--surface)] font-mono focus:outline-none focus:border-[var(--border-strong)]"
                                 placeholder='{ "param": "value" }'
                               />
+                              {testInputError && (
+                                <p id={`tool-test-error-${tool.id}`} role="alert" className="mt-1 text-xs text-[var(--danger)]">{testInputError}</p>
+                              )}
                               <Button variant="primary" size="sm" className="mt-2" onClick={() => handleTestTool(tool.id)} disabled={testRunning}>
                                 {testRunning ? 'Running...' : 'Run Test'}
                               </Button>

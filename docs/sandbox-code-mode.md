@@ -8,6 +8,14 @@ only the small answer goes back to the model.
 Use it when a tool would return a long list and the agent only needs a count, a
 sum, a filtered subset, a join or a summary.
 
+If the problem is not *which* data a tool returns but the **shape of one tool's
+own answer** — a price in the wrong currency, a net amount where gross is
+wanted, a description full of newlines, a numeric status code — reach for a
+[response processor chain](response-processors.md) first. It is the cheaper,
+declarative sibling of a script: a script *calls* tools and computes an answer
+across them, while a chain *edits* one tool's answer in place, with no sandbox,
+no code and no agent in the loop, for every client of that tool.
+
 Code mode is served only on per-server endpoints (`/mcp/<serverId>`) that the
 caller has authenticated to. The shared `/mcp` endpoint and the public
 `/mcp/demo` server never offer it.

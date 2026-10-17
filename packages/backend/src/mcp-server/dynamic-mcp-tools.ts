@@ -591,7 +591,13 @@ export class DynamicMcpTools {
   /**
    * Turn a raw engine result into the MCP tool result.
    *
-   * Two opt-in per-tool behaviours live here, in this order:
+   * Three opt-in per-tool behaviours live here, in this order:
+   *
+   *  0. `responseMapping.processors` — the response processor chain edits the
+   *     response before anything selects from it (convert a currency, add VAT,
+   *     clean a description). Unlike a mapping it is fail-closed: a step that
+   *     refuses a value fails the call, naming the step and the JSON path,
+   *     because a half-converted response is worse than none.
    *
    *  1. `responseMapping.transform` — response shaping. Upstream endpoints
    *     routinely return far more than the tool needs (a Datto RMM device
@@ -622,23 +628,21 @@ export class DynamicMcpTools {
     const outcome = applyResponseTransform(raw, responseMapping);
 
     if (outcome.error) {
+      const stage =
+        outcome.stage === 'processors' ? 'Processor chain failed' : 'Response mapping failed';
       if (outcome.fatal) {
         return {
           content: [
             {
               type: 'text' as const,
-              text: JSON.stringify(
-                { error: `Response mapping failed: ${outcome.error}` },
-                null,
-                2,
-              ),
+              text: JSON.stringify({ error: `${stage}: ${outcome.error}` }, null, 2),
             },
           ],
           isError: true,
         };
       }
       this.logger.warn(
-        `Response mapping for tool ${toolName} failed (${outcome.error}) — returning the raw response.`,
+        `${stage} for tool ${toolName} (${outcome.error}) — returning the unedited response.`,
       );
     }
 

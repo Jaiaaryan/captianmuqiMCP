@@ -608,6 +608,58 @@ the API actually returned.
 | `maxBytes` | Hard cap on the serialized output. `0` or absent means no cap |
 | `cacheTtl` | Seconds to cache the **raw** upstream response; shaping happens on read |
 | `images` | Paths to base64 images in the response, returned to the client as MCP image content (see below) |
+| `processors` | A response processor chain that **edits** values before the mapping selects from them (see below) |
+
+### Editing the values first (`responseMapping.processors`)
+
+A mapping can only drop or rename what the upstream system already returned. It
+cannot turn a USD price into a EUR one, add VAT to a net amount, collapse the
+newlines in a pasted description or turn the status code `2` into `shipped`.
+
+`responseMapping.processors` is a **response processor chain**: an ordered list
+of steps that edits the response before the mapping runs.
+
+```
+upstream response  →  processors (edits)  →  transform (selects)  →  MCP client
+```
+
+```json
+{
+  "processors": {
+    "version": 1,
+    "steps": [
+      { "id": "convert_to_eur", "processor": "number_scale@1", "each": "$.items[*]",
+        "reads": "price_usd", "writes": "price_eur", "mode": "add",
+        "params": { "factor": 0.92, "round": 2 } },
+      { "id": "clean_description", "processor": "text_clean@1", "each": "$.items[*]",
+        "reads": "description", "writes": "description", "mode": "replace" }
+    ]
+  }
+}
+```
+
+Each step names a versioned processor from a fixed registry (`number_scale@1`,
+`number_vat@1`, `text_clean@1`, `text_truncate@1`, `value_map@1`, …), the
+collection it runs over (`each`), the field it reads, the field it writes, and
+how it may write (`mode`: `add` — the field must be new, `replace` — it must
+exist, `upsert` — either, the default). Steps run in order, so a later step can
+read what an earlier one wrote.
+
+There is no expression language and nothing is executed: a processor is a pure
+function of one value and its declared parameters, and a chain is validated
+against the registry before it can be stored. A step that refuses a value fails
+the tool call, naming the step and the JSON path
+(`step convert_to_eur: $.items[0].price_usd is not a number`), and the
+half-edited response is discarded rather than shown to a model.
+
+`GET /api/processors` lists the processors and the limits;
+`POST /api/connectors/:id/tools/:toolId/preview-processors` runs a chain step by
+step against a real recorded response without storing anything.
+
+**Full reference:** [Response processor chains](response-processors.md) — every
+processor and its parameters, the write modes, `onMissing` / `onError`, the
+limits, and the three ways to set a chain up (dashboard, REST, or an agent over
+MCP with the `response_chain_*` tools).
 
 ### Images in the response (`images`)
 

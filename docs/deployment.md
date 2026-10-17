@@ -362,6 +362,7 @@ curl -s http://localhost:4000/api/mcp-api-keys \
 | `SANDBOX_ENABLED` | No | Set to `false` to stop offering [code mode](sandbox-code-mode.md) (default: on) |
 | `SANDBOX_ALLOW_WRITES` | No | Exactly `true` lets code-mode scripts call tools that change data (default: read-only) |
 | `SANDBOX_MEMORY_MB`, `SANDBOX_TIMEOUT_MS`, `SANDBOX_MAX_OUTPUT_BYTES`, `SANDBOX_MAX_CONNECTOR_CALLS`, `SANDBOX_MAX_CONNECTOR_BYTES`, `SANDBOX_MAX_CONNECTOR_RESPONSE_BYTES`, `SANDBOX_CONNECTOR_TIMEOUT_MS`, `SANDBOX_MAX_CONCURRENT` | No | Per-run limits of code mode; defaults and meaning in [Sandbox code mode](sandbox-code-mode.md#limits-and-configuration) |
+| `PROCESSOR_CHAIN_MCP_TOOLS` | No | Set to `false` to stop offering the four `response_chain_*` MCP tools, with which an agent can edit a tool's response. The dashboard and the REST API are unaffected. See [Response processor chains](response-processors.md) (default: on) |
 
 ---
 

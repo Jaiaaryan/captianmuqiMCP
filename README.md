@@ -203,7 +203,10 @@ Everything runs on your infrastructure, so you decide what leaves it. OAuth2, RB
 }
 ```
 
-[Response mapping reference](docs/tool-definition.md#3-response-mapping-optional)
+- **Response processors.** A mapping can drop and rename fields; a processor chain can *change* a value. Steps on a tool convert a currency, add VAT, clean a description or translate a status code before the model sees anything — once, on the tool, instead of in every prompt that reads it. Steps are configuration checked against a fixed registry of pure processors, never code, and a step that refuses a value fails the call naming the step and the JSON path, so a half-converted response never reaches a model. The dashboard, the REST API and an AI agent over MCP all write the same chain.
+
+[Response mapping reference](docs/tool-definition.md#3-response-mapping-optional) ·
+[Response processor chains](docs/response-processors.md)
 
 ---
 

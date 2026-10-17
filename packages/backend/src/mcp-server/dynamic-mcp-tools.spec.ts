@@ -147,6 +147,130 @@ describe('DynamicMcpTools — response shaping', () => {
   });
 });
 
+describe('DynamicMcpTools — response processor chains', () => {
+  const OFFERS = {
+    category: 'fasteners',
+    items: [
+      { itemNo: 'A-OFF-FAS-001', description: '  Black   Screw\n60mm ', price_usd: 54.67, moq: 100 },
+      { itemNo: 'A-OFF-FAS-002', description: 'Steel Plate 19mm', price_usd: 75.87, moq: 10 },
+    ],
+  };
+
+  /** Convert to EUR, add VAT on the converted price, tidy the description. */
+  const CHAIN = {
+    processors: {
+      version: 1,
+      steps: [
+        {
+          id: 'convert_to_eur',
+          processor: 'number_scale@1',
+          each: '$.items[*]',
+          reads: 'price_usd',
+          writes: 'price_eur',
+          mode: 'add',
+          params: { factor: 0.92, round: 2 },
+        },
+        {
+          id: 'add_vat',
+          processor: 'number_vat@1',
+          each: '$.items[*]',
+          reads: 'price_eur',
+          writes: 'price_eur_gross',
+          mode: 'add',
+          params: { rate: 0.19, round: 2 },
+        },
+        {
+          id: 'clean_description',
+          processor: 'text_clean@1',
+          each: '$.items[*]',
+          reads: 'description',
+          writes: 'description',
+          mode: 'replace',
+        },
+      ],
+    },
+  };
+
+  it('edits the response the client receives, leaving every other field alone', async () => {
+    const { executor } = build(makeTool(CHAIN), { engineResult: OFFERS });
+    const res = await executor.executeTool('mock_supplier_list_offers', {});
+    expect(res.isError).toBeUndefined();
+    const out = JSON.parse(res.content[0].text);
+    expect(out.items[0]).toEqual({
+      itemNo: 'A-OFF-FAS-001',
+      description: 'Black Screw 60mm',
+      price_usd: 54.67,
+      moq: 100,
+      price_eur: 50.3,
+      price_eur_gross: 59.86,
+    });
+    expect(out.items[1]).toMatchObject({ price_eur: 69.8, price_eur_gross: 83.06 });
+    // Order is preserved, and so is everything the chain was not pointed at.
+    expect(out.items.map((i: any) => i.itemNo)).toEqual(['A-OFF-FAS-001', 'A-OFF-FAS-002']);
+    expect(out.category).toBe('fasteners');
+    expect(res.structured).toEqual(out);
+  });
+
+  it('runs the chain before the mapping, so the mapping can select what it wrote', async () => {
+    const { executor } = build(
+      makeTool({
+        ...CHAIN,
+        transform: { select: { gross: { $from: '$.items[*]', $select: { g: 'price_eur_gross' } } } },
+      }),
+      { engineResult: OFFERS },
+    );
+    const res = await executor.executeTool('mock_supplier_list_offers', {});
+    expect(JSON.parse(res.content[0].text)).toEqual({ gross: [{ g: 59.86 }, { g: 83.06 }] });
+  });
+
+  it('fails the call and names the step and the path when a step refuses a value', async () => {
+    const broken = {
+      category: 'broken',
+      items: [
+        { itemNo: 'A-OFF-BRK-001', description: 'x', price_usd: 'n/a', moq: 1 },
+        { itemNo: 'A-OFF-BRK-002', description: 'y', price_usd: 10, moq: 1 },
+      ],
+    };
+    const { executor } = build(makeTool(CHAIN), { engineResult: broken });
+    const res = await executor.executeTool('mock_supplier_list_offers', {});
+    expect(res.isError).toBe(true);
+    const { error } = JSON.parse(res.content[0].text);
+    expect(error).toBe(
+      'Processor chain failed: step convert_to_eur: $.items[0].price_usd is not a number',
+    );
+    // Nothing half-converted reaches the client: not even the good row's price.
+    expect(res.content[0].text).not.toContain('price_eur');
+    expect(res.content[0].text).not.toContain('9.2');
+  });
+
+  it('returns the unedited response without failing when the chain says passthrough', async () => {
+    const { executor } = build(
+      makeTool({ processors: { ...CHAIN.processors, onError: 'passthrough' } }),
+      { engineResult: { items: [{ description: 'x', price_usd: 'n/a' }] } },
+    );
+    const res = await executor.executeTool('mock_supplier_list_offers', {});
+    expect(res.isError).toBeUndefined();
+    expect(JSON.parse(res.content[0].text)).toEqual({ items: [{ description: 'x', price_usd: 'n/a' }] });
+  });
+
+  it('does not run a chain that is switched off', async () => {
+    const { executor } = build(
+      makeTool({ processors: { ...CHAIN.processors, enabled: false } }),
+      { engineResult: OFFERS },
+    );
+    const res = await executor.executeTool('mock_supplier_list_offers', {});
+    expect(res.content[0].text).toBe(JSON.stringify(OFFERS, null, 2));
+  });
+
+  it('audits the raw upstream response, not the edited one', async () => {
+    const { executor, audit } = build(makeTool(CHAIN), { engineResult: OFFERS });
+    await executor.executeTool('mock_supplier_list_offers', {});
+    expect(audit.logInvocation).toHaveBeenCalledWith(
+      expect.objectContaining({ output: OFFERS, status: 'SUCCESS' }),
+    );
+  });
+});
+
 describe('DynamicMcpTools — actionable hint on upstream errors', () => {
   it('appends a hint for a weclapp "unknown property" 400, next to the vendor body', async () => {
     const { AxiosError } = await import('axios');

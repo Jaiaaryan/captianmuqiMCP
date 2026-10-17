@@ -26,6 +26,12 @@ import {
   search as jmespathSearch,
 } from '@jmespath-community/jmespath';
 import type { ResponseMapping } from './engines/engine-types';
+import {
+  chainFailsTheCall,
+  readProcessorChain,
+  runProcessorChain,
+  type ProcessorStepTrace,
+} from './processor-chain.util';
 import { applyDecode, readDecode, type DecodeConfig } from './mime-decode.util';
 import { extractResponseImages, readImages, type ExtractedImage } from './response-images.util';
 
@@ -65,6 +71,14 @@ export interface TransformOutcome {
   fatal?: boolean;
   /** True when `maxBytes` kicked in. */
   truncated?: boolean;
+  /**
+   * Which stage produced `error`. `processors` is the response processor chain
+   * that runs before the mapping; its failures are fatal by default, because a
+   * half-edited response is worse than none.
+   */
+  stage?: 'processors' | 'transform';
+  /** What each processor step touched. Present when a chain ran. */
+  processorSteps?: ProcessorStepTrace[];
   /**
    * Images taken out of the response by `responseMapping.images`, to be
    * returned as MCP image content next to `value` (which holds placeholders).
@@ -622,15 +636,62 @@ function validateTemplate(template: Record<string, unknown>, depth: number): voi
 }
 
 /**
- * Apply a tool's response mapping to a raw engine result.
+ * Everything a tool does to a response on the way out, in order:
  *
- * Returns the raw value untouched (same reference) when no transform is
- * configured — this is the hot path for every existing tool and must stay a
- * single check.
+ *   1. `responseMapping.processors` — the response processor chain *edits* the
+ *      response: convert a currency, add VAT, clean a description. It runs
+ *      first, on what the upstream system actually answered, and its failures
+ *      are fatal by default: a half-converted response must never reach the
+ *      model (see processor-chain.util).
+ *   2. `responseMapping.images` / `decode` / `transform` — the mapping then
+ *      *selects* from what is left.
+ *
+ * Returns the raw value untouched (same reference) when neither is configured —
+ * the hot path for every existing tool, still two property checks.
  */
 export function applyResponseTransform(
   raw: unknown,
   responseMapping: ResponseMapping | Record<string, unknown> | null | undefined,
+): TransformOutcome {
+  const chain = readProcessorChain(responseMapping as Record<string, unknown> | null | undefined);
+  if (!chain) return applyMapping(raw, responseMapping, false);
+
+  const run = runProcessorChain(raw, chain);
+  if (run.ok) {
+    return {
+      ...applyMapping(run.value, responseMapping, run.applied),
+      processorSteps: run.steps,
+    };
+  }
+
+  // A refused value: the response as it arrived, never the half-edited copy.
+  if (chainFailsTheCall(chain)) {
+    return {
+      value: raw,
+      applied: false,
+      error: run.error,
+      fatal: true,
+      stage: 'processors',
+      processorSteps: run.steps,
+    };
+  }
+  // `onError: "passthrough"` — the operator chose the old "never break a
+  // working tool" behaviour, so the mapping still runs on the untouched
+  // response and the reason is carried out for the log.
+  const mapped = applyMapping(raw, responseMapping, false);
+  return {
+    ...mapped,
+    error: mapped.error ?? run.error,
+    stage: mapped.error ? mapped.stage : 'processors',
+    processorSteps: run.steps,
+  };
+}
+
+/** The response mapping stages: images, decode, then the transform itself. */
+function applyMapping(
+  raw: unknown,
+  responseMapping: ResponseMapping | Record<string, unknown> | null | undefined,
+  priorApplied: boolean,
 ): TransformOutcome {
   const transform = readTransform(responseMapping);
   // `decode` (mime-decode.util) and `images` (response-images.util) are
@@ -644,7 +705,7 @@ export function applyResponseTransform(
     isPlainObject(responseMapping) &&
     responseMapping.images !== undefined &&
     responseMapping.images !== null;
-  if (!transform && !hasDecode && !hasImages) return { value: raw, applied: false };
+  if (!transform && !hasDecode && !hasImages) return { value: raw, applied: priorApplied };
 
   let images: ExtractedImage[] | undefined;
   let source: unknown = raw;
@@ -661,11 +722,14 @@ export function applyResponseTransform(
         applied: false,
         error: err?.message ? String(err.message) : 'Image extraction failed',
         fatal: true,
+        stage: 'transform',
       };
     }
   }
   const withImages = (outcome: TransformOutcome): TransformOutcome =>
-    hasImages ? { ...outcome, images, applied: outcome.applied || source !== raw } : outcome;
+    hasImages
+      ? { ...outcome, images, applied: outcome.applied || priorApplied || source !== raw }
+      : outcome;
 
   const fallbackToRaw = transform?.fallbackToRaw !== false;
 
@@ -675,9 +739,9 @@ export function applyResponseTransform(
     if (hasDecode) {
       // Decoded first, so a transform can select from the decoded fields.
       work = applyDecode(work, readDecode(responseMapping) as DecodeConfig);
-      if (!transform) return withImages({ value: work, applied: work !== source });
+      if (!transform) return withImages({ value: work, applied: priorApplied || work !== source });
     }
-    if (!transform) return withImages({ value: source, applied: false });
+    if (!transform) return withImages({ value: source, applied: priorApplied });
 
     if (transform.exclude !== undefined) {
       work = omitPaths(work, assertPathList(transform.exclude, 'exclude'));
@@ -718,9 +782,10 @@ export function applyResponseTransform(
     const message = err?.message ? String(err.message) : 'Response mapping failed';
     return withImages({
       value: source,
-      applied: false,
+      applied: priorApplied,
       error: message,
       fatal: !fallbackToRaw,
+      stage: 'transform',
     });
   }
 }

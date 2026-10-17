@@ -37,6 +37,12 @@ import {
   hasTransform,
   validateTransform,
 } from './response-transform.util';
+import {
+  hasProcessorChain,
+  readProcessorChain,
+  runProcessorChain,
+  validateProcessorChain,
+} from './processor-chain.util';
 import { validateDecode } from './mime-decode.util';
 import { validateImages } from './response-images.util';
 import {
@@ -65,7 +71,43 @@ const RESPONSE_MAPPING_DESC =
   'static values, `{ $from, $select }` to reshape array elements), ' +
   '`expression` with `mode: "jmespath"`, `fallbackToRaw` (default true) and ' +
   '`maxBytes`. Omit `transform` and the raw upstream response is returned ' +
-  'unchanged.';
+  'unchanged. `processors` holds a response processor chain, which *edits* the ' +
+  'response (convert a currency, add VAT, clean a description) before ' +
+  '`transform` selects from it: `{ steps: [{ id, processor, each, reads, ' +
+  'writes, mode, params }] }`. `GET /api/processors` lists the processors and ' +
+  'their parameters. A step that refuses a value fails the call, naming the ' +
+  'step and the JSON path.';
+
+const PROCESSORS_EXAMPLE = {
+  steps: [
+    {
+      id: 'convert_to_eur',
+      processor: 'number_scale@1',
+      each: '$.items[*]',
+      reads: 'price_usd',
+      writes: 'price_eur',
+      mode: 'add',
+      params: { factor: 0.92, round: 2 },
+    },
+    {
+      id: 'add_vat',
+      processor: 'number_vat@1',
+      each: '$.items[*]',
+      reads: 'price_eur',
+      writes: 'price_eur_gross',
+      mode: 'add',
+      params: { rate: 0.19, round: 2 },
+    },
+    {
+      id: 'clean_description',
+      processor: 'text_clean@1',
+      each: '$.items[*]',
+      reads: 'description',
+      writes: 'description',
+      mode: 'replace',
+    },
+  ],
+};
 
 const RESPONSE_MAPPING_EXAMPLE = {
   transform: {
@@ -270,6 +312,20 @@ class SetResponseMappingDto {
   @IsOptional()
   @IsObject()
   transform?: Record<string, unknown> | null;
+
+  @ApiPropertyOptional({
+    description:
+      'The response processor chain to store — the steps that edit the ' +
+      'response before the transform selects from it. Send `null` to remove ' +
+      'it. Omit the key to leave the stored chain alone.',
+    type: 'object',
+    additionalProperties: true,
+    nullable: true,
+    example: PROCESSORS_EXAMPLE,
+  })
+  @IsOptional()
+  @IsObject()
+  processors?: Record<string, unknown> | null;
 }
 
 class PreviewMappingDto {
@@ -283,6 +339,18 @@ class PreviewMappingDto {
   @IsOptional()
   @IsObject()
   transform?: Record<string, unknown> | null;
+
+  @ApiPropertyOptional({
+    description:
+      'The processor chain to evaluate. Defaults to the one stored on the tool.',
+    type: 'object',
+    additionalProperties: true,
+    nullable: true,
+    example: PROCESSORS_EXAMPLE,
+  })
+  @IsOptional()
+  @IsObject()
+  processors?: Record<string, unknown> | null;
 
   @ApiPropertyOptional({
     description:
@@ -353,6 +421,12 @@ export class ToolsController {
     if (imagesError) {
       throw new BadRequestException(`Invalid response mapping: ${imagesError}`);
     }
+    const processorsError = validateProcessorChain(
+      (responseMapping as Record<string, unknown>).processors,
+    );
+    if (processorsError) {
+      throw new BadRequestException(`Invalid response mapping: ${processorsError}`);
+    }
     const transform = (responseMapping as Record<string, unknown>).transform;
     if (transform === undefined || transform === null) return;
     const error = validateTransform(transform);
@@ -403,7 +477,13 @@ export class ToolsController {
     return {
       mapped: outcome.value,
       mappingApplied: outcome.applied,
-      ...(outcome.error ? { mappingError: outcome.error } : {}),
+      ...(outcome.error && outcome.stage !== 'processors'
+        ? { mappingError: outcome.error }
+        : {}),
+      ...(outcome.error && outcome.stage === 'processors'
+        ? { processorError: outcome.error }
+        : {}),
+      ...(outcome.processorSteps ? { processorSteps: outcome.processorSteps } : {}),
       ...(outcome.truncated ? { mappingTruncated: true } : {}),
       rawBytes,
       mappedBytes,
@@ -726,10 +806,11 @@ export class ToolsController {
 
   @Get(':toolId/response-mapping')
   @ApiOperation({
-    summary: 'Get the response mapping configured for a tool',
+    summary: 'Get the response mapping and processor chain configured for a tool',
     description:
-      'Returns the stored `transform` (or null), whether it is active, and ' +
-      'whether a recent real response is available to preview it against.',
+      'Returns the stored `transform` and `processors` (either may be null), ' +
+      'whether each is active, and whether a recent real response is ' +
+      'available to preview them against.',
   })
   async getResponseMapping(
     @Req() req: any,
@@ -749,6 +830,8 @@ export class ToolsController {
     return {
       transform: (responseMapping?.transform as Record<string, unknown>) ?? null,
       active: hasTransform(responseMapping),
+      processors: (responseMapping?.processors as Record<string, unknown>) ?? null,
+      processorsActive: hasProcessorChain(responseMapping),
       sampleAvailable: !!lastSample,
       sampleCapturedAt: lastSample?.createdAt ?? null,
     };
@@ -756,14 +839,16 @@ export class ToolsController {
 
   @Patch(':toolId/response-mapping')
   @ApiOperation({
-    summary: 'Set or clear the response mapping for a tool',
+    summary: 'Set or clear the response mapping and processor chain for a tool',
     description:
-      'Stores `responseMapping.transform` without touching `cacheTtl` or ' +
-      '`followUp`. Response mapping shrinks what an MCP client receives — ' +
-      'fewer tokens, and only the fields the tool actually needs leave the ' +
-      'workspace. Send `transform: null` to go back to the raw response. ' +
-      'A malformed transform is rejected here rather than silently ignored at ' +
-      'call time.',
+      'Stores `responseMapping.transform` and/or `responseMapping.processors` ' +
+      'without touching `cacheTtl` or `followUp`. The mapping shrinks what an ' +
+      'MCP client receives — fewer tokens, and only the fields the tool ' +
+      'actually needs leave the workspace; the processor chain edits the ' +
+      'values on the way out (convert a currency, add VAT, clean a ' +
+      'description). Send `transform: null` / `processors: null` to remove ' +
+      'one, or omit the key to leave it as it is. Both are validated here ' +
+      'rather than silently ignored at call time.',
   })
   async setResponseMapping(
     @Req() req: any,
@@ -783,6 +868,10 @@ export class ToolsController {
       const error = validateTransform(dto.transform);
       if (error) throw new BadRequestException(`Invalid response mapping: ${error}`);
     }
+    if (dto.processors) {
+      const error = validateProcessorChain(dto.processors);
+      if (error) throw new BadRequestException(`Invalid processor chain: ${error}`);
+    }
 
     // Merge, so cacheTtl / followUp survive a mapping edit.
     const current = (tool.responseMapping as Record<string, unknown> | null) ?? {};
@@ -791,6 +880,16 @@ export class ToolsController {
       next.transform = dto.transform;
     } else {
       delete next.transform;
+    }
+    // Unlike `transform`, an omitted `processors` leaves the stored chain
+    // alone: the dashboard edits the two in separate panels, and a mapping
+    // save must not silently drop a chain the other panel owns.
+    if (dto.processors !== undefined) {
+      if (dto.processors === null) {
+        delete next.processors;
+      } else {
+        next.processors = dto.processors;
+      }
     }
 
     await this.prisma.mcpTool.updateMany({
@@ -806,18 +905,21 @@ export class ToolsController {
     return {
       transform: dto.transform ?? null,
       active: hasTransform(next),
+      processors: (next.processors as Record<string, unknown>) ?? null,
+      processorsActive: hasProcessorChain(next),
     };
   }
 
   @Post(':toolId/preview-mapping')
   @ApiOperation({
-    summary: 'Preview a response mapping without calling the upstream API',
+    summary: 'Preview a processor chain and response mapping without calling the upstream API',
     description:
-      'Runs a transform against a sample response and returns the mapped ' +
-      'result plus the size delta. With no `sample`, the most recent real ' +
-      'response recorded for this tool is used — so a mapping can be built and ' +
-      'checked against production-shaped data without hitting the API again. ' +
-      'Purely read-only: nothing is stored.',
+      'Runs the processor chain and then the transform against a sample ' +
+      'response, and returns the result, the size delta and what every ' +
+      'processor step touched (`processorSteps`). With no `sample`, the most ' +
+      'recent real response recorded for this tool is used — so a chain or a ' +
+      'mapping can be built and checked against production-shaped data ' +
+      'without hitting the API again. Purely read-only: nothing is stored.',
   })
   async previewMapping(
     @Req() req: any,
@@ -836,6 +938,10 @@ export class ToolsController {
     if (dto.transform) {
       const error = validateTransform(dto.transform);
       if (error) throw new BadRequestException(`Invalid response mapping: ${error}`);
+    }
+    if (dto.processors) {
+      const error = validateProcessorChain(dto.processors);
+      if (error) throw new BadRequestException(`Invalid processor chain: ${error}`);
     }
 
     let sample = dto.sample;
@@ -858,14 +964,23 @@ export class ToolsController {
       sampleCapturedAt = last.createdAt;
     }
 
-    // An explicit `transform: null` previews "no mapping"; omitting the key
-    // previews whatever is stored on the tool.
-    const mapping =
-      dto.transform !== undefined
-        ? dto.transform === null
-          ? null
-          : { transform: dto.transform }
-        : (tool.responseMapping as Record<string, unknown> | null);
+    // An explicit `transform: null` / `processors: null` previews "none of
+    // that"; omitting a key previews whatever is stored on the tool.
+    const stored = (tool.responseMapping as Record<string, unknown> | null) ?? {};
+    const mapping: Record<string, unknown> = {};
+    const pick = (key: 'transform' | 'processors', given: unknown) => {
+      const value = given !== undefined ? given : stored[key];
+      if (value !== undefined && value !== null) mapping[key] = value;
+    };
+    pick('transform', dto.transform);
+    pick('processors', dto.processors);
+    // Everything else the tool configured (decode, images) stays as stored, so
+    // the preview shows what the client would really receive.
+    for (const [key, value] of Object.entries(stored)) {
+      if (key !== 'transform' && key !== 'processors' && !(key in mapping)) {
+        mapping[key] = value;
+      }
+    }
 
     return {
       ok: true,
@@ -873,6 +988,89 @@ export class ToolsController {
       sampleCapturedAt,
       raw: sample,
       ...ToolsController.mappingSummary(sample, mapping),
+    };
+  }
+
+  @Post(':toolId/preview-processors')
+  @ApiOperation({
+    summary: 'Run a processor chain step by step against a sample response',
+    description:
+      'The step-by-step view: runs the chain and returns the response after ' +
+      'every step, so a chain can be built and understood before it is ' +
+      'activated. The response mapping is not applied, so what each step did ' +
+      'is visible on its own. With no `sample` the most recent real response ' +
+      'for this tool is used. Read-only: nothing is stored.',
+  })
+  async previewProcessors(
+    @Req() req: any,
+    @Param('toolId') toolId: string,
+    @Param('connectorId') connectorId: string,
+    @Body() dto: PreviewMappingDto,
+  ) {
+    await this.assertCanWriteConnector(connectorId, req);
+
+    const tool = await this.prisma.mcpTool.findFirst({
+      where: { id: toolId, connectorId },
+      select: { responseMapping: true },
+    });
+    if (!tool) throw new ForbiddenException('Tool not found');
+
+    if (dto.processors) {
+      const error = validateProcessorChain(dto.processors);
+      if (error) throw new BadRequestException(`Invalid processor chain: ${error}`);
+    }
+
+    let sample = dto.sample;
+    let sampleSource: 'body' | 'last-invocation' | 'none' = 'body';
+    let sampleCapturedAt: Date | null = null;
+    if (sample === undefined) {
+      const last = await this.findLatestSample(toolId);
+      if (!last) {
+        return {
+          ok: false,
+          sampleSource: 'none' as const,
+          error:
+            'No sample available. Run the tool once (Test, or from a connected ' +
+            'client), or pass a `sample` in the request body.',
+        };
+      }
+      sample = last.output;
+      sampleSource = 'last-invocation';
+      sampleCapturedAt = last.createdAt;
+    }
+
+    const chain =
+      dto.processors !== undefined
+        ? readProcessorChain(dto.processors === null ? null : { processors: dto.processors })
+        : readProcessorChain(tool.responseMapping as Record<string, unknown> | null);
+    if (!chain) {
+      return {
+        ok: true,
+        sampleSource,
+        sampleCapturedAt,
+        raw: sample,
+        chainActive: false,
+        steps: [],
+        result: sample,
+      };
+    }
+
+    // `trace: true` keeps the size and a sample element after every step: that
+    // is the whole point of this endpoint.
+    const run = runProcessorChain(sample, chain, { trace: true });
+    return {
+      ok: run.ok,
+      sampleSource,
+      sampleCapturedAt,
+      raw: sample,
+      chainActive: true,
+      steps: run.steps,
+      result: run.value,
+      rawBytes: ToolsController.byteLength(sample),
+      resultBytes: ToolsController.byteLength(run.value),
+      ...(run.ok
+        ? {}
+        : { error: run.error, failedStep: run.failedStep, failedPath: run.failedPath }),
     };
   }
 

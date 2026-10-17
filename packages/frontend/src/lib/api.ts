@@ -710,6 +710,135 @@ export interface MappingPreview extends MappingSummary {
   error?: string;
 }
 
+/**
+ * A response processor chain — the ordered steps that *edit* a tool's response
+ * (convert a currency, add VAT, clean a description, translate a status code)
+ * before the response mapping selects from it. Stored on the tool under
+ * `responseMapping.processors`.
+ */
+export type ProcessorWriteMode = 'add' | 'replace' | 'upsert';
+
+export interface ProcessorStepConfig {
+  /** Stable name. It appears in every error and in the step-by-step preview. */
+  id: string;
+  /** A registry entry: `number_scale` (newest) or `number_scale@1` (pinned). */
+  processor: string;
+  /** The collection the step runs over (`$.items[*]`). Omit to run it once on the whole response. */
+  each?: string;
+  /** Field the processor reads, relative to the element. */
+  reads: string;
+  /** Field the result is written to, relative to the element. */
+  writes: string;
+  /** `add` (must not exist), `replace` (must exist), `upsert` (either, default). */
+  mode?: ProcessorWriteMode;
+  /** The processor's parameters, checked against its declared contract. */
+  params?: Record<string, unknown>;
+  /** What to do when `reads` is not there: fail the call (default) or leave the element alone. */
+  onMissing?: 'fail' | 'skip';
+}
+
+export interface ProcessorChainConfig {
+  /** Config format version. Only 1 exists. */
+  version?: number;
+  /** `false` keeps the chain on the tool without running it. Default true. */
+  enabled?: boolean;
+  /** `fail` (default): a refused value fails the tool call. `passthrough`: return the response untouched and log. */
+  onError?: 'fail' | 'passthrough';
+  steps: ProcessorStepConfig[];
+}
+
+/** What one processor reads or writes, as the registry declares it. */
+export interface ProcessorPort {
+  name: string;
+  type: 'number' | 'string' | 'boolean' | 'object' | 'array' | 'any';
+  description: string;
+}
+
+/** One declared parameter of a processor — the dashboard renders its input from this. */
+export interface ProcessorParameterDescriptor {
+  name: string;
+  type: 'number' | 'integer' | 'string' | 'boolean' | 'object';
+  description: string;
+  required: boolean;
+  default?: unknown;
+  min?: number;
+  max?: number;
+}
+
+export interface ProcessorDescriptor {
+  /** How a chain names it so its behaviour stays pinned (`number_scale@1`). */
+  ref: string;
+  name: string;
+  version: number;
+  title: string;
+  description: string;
+  input: ProcessorPort;
+  output: ProcessorPort;
+  parameters: ProcessorParameterDescriptor[];
+}
+
+export interface ProcessorRegistry {
+  processors: ProcessorDescriptor[];
+  writeModes: Array<{ mode: ProcessorWriteMode; description: string }>;
+  limits: {
+    maxSteps: number;
+    maxTargets: number;
+    maxPathLength: number;
+    maxPathSegments: number;
+    maxStepIdLength: number;
+  };
+}
+
+/** What one step did, for the step-by-step view. */
+export interface ProcessorStepTrace {
+  id: string;
+  processor: string;
+  mode: ProcessorWriteMode;
+  /** Elements the step ran over. */
+  targets: number;
+  /** Elements it wrote to. */
+  written: number;
+  /** Elements skipped because `reads` was missing and `onMissing` is `skip`. */
+  skipped: number;
+  /** Size of the whole response after this step. */
+  bytesAfter?: number;
+  /** The first element after the step. */
+  sample?: unknown;
+}
+
+export interface ProcessorsPreview {
+  ok: boolean;
+  sampleSource: 'body' | 'last-invocation' | 'none';
+  sampleCapturedAt?: string | null;
+  raw?: unknown;
+  chainActive?: boolean;
+  steps?: ProcessorStepTrace[];
+  result?: unknown;
+  rawBytes?: number;
+  resultBytes?: number;
+  /** `step convert_to_eur: $.items[0].price_usd is not a number` */
+  error?: string;
+  /** The step that refused, and the JSON path of the value it refused. */
+  failedStep?: string;
+  failedPath?: string;
+}
+
+/**
+ * The processor registry: what a chain can be built from, and whether a chain
+ * is valid. It belongs to the installation, not to one tool, so it needs
+ * nothing but a signed-in user.
+ */
+export const processors = {
+  list: (token: string) => request<ProcessorRegistry>('/api/processors', { token }),
+  /** The same check that runs before a chain can be stored on a tool. */
+  validate: (body: { processors?: ProcessorChainConfig | null }, token: string) =>
+    request<{ valid: boolean; error?: string }>('/api/processors/validate', {
+      method: 'POST',
+      body,
+      token,
+    }),
+};
+
 export interface ToolTestResult extends MappingSummary {
   ok: boolean;
   durationMs: number;
@@ -759,6 +888,8 @@ export const tools = {
     request<{
       transform: ResponseTransform | null;
       active: boolean;
+      processors: ProcessorChainConfig | null;
+      processorsActive: boolean;
       sampleAvailable: boolean;
       sampleCapturedAt: string | null;
     }>(`/api/connectors/${connectorId}/tools/${toolId}/response-mapping`, { token }),
@@ -767,20 +898,47 @@ export const tools = {
     toolId: string,
     transform: ResponseTransform | null,
     token: string,
+    /** Omit to leave the stored chain alone; `null` removes it. */
+    processors?: ProcessorChainConfig | null,
   ) =>
-    request<{ transform: ResponseTransform | null; active: boolean }>(
-      `/api/connectors/${connectorId}/tools/${toolId}/response-mapping`,
-      { method: 'PATCH', body: { transform }, token },
-    ),
+    request<{
+      transform: ResponseTransform | null;
+      active: boolean;
+      processors: ProcessorChainConfig | null;
+      processorsActive: boolean;
+    }>(`/api/connectors/${connectorId}/tools/${toolId}/response-mapping`, {
+      method: 'PATCH',
+      body: { transform, ...(processors !== undefined ? { processors } : {}) },
+      token,
+    }),
   /** Dry-run a mapping against a sample (or the last real response). No API call. */
   previewMapping: (
     connectorId: string,
     toolId: string,
-    body: { transform?: ResponseTransform | null; sample?: unknown },
+    body: {
+      transform?: ResponseTransform | null;
+      processors?: ProcessorChainConfig | null;
+      sample?: unknown;
+    },
     token: string,
   ) =>
     request<MappingPreview>(
       `/api/connectors/${connectorId}/tools/${toolId}/preview-mapping`,
+      { method: 'POST', body, token },
+    ),
+  /**
+   * Run a processor chain step by step against a sample (or the tool's most
+   * recent real response). The mapping is not applied, so what each step did
+   * is visible on its own. No API call, nothing stored.
+   */
+  previewProcessors: (
+    connectorId: string,
+    toolId: string,
+    body: { processors?: ProcessorChainConfig | null; sample?: unknown },
+    token: string,
+  ) =>
+    request<ProcessorsPreview>(
+      `/api/connectors/${connectorId}/tools/${toolId}/preview-processors`,
       { method: 'POST', body, token },
     ),
   delete: (connectorId: string, toolId: string, token: string) =>

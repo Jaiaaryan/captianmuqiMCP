@@ -121,6 +121,8 @@ export interface ResponseMapping {
   fields?: string[];
   followUp?: string;
   transform?: Record<string, unknown>;
+  /** Response processor chain; runs before `transform` (processor-chain.util). */
+  processors?: Record<string, unknown>;
   [k: string]: unknown;
 }
 

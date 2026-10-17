@@ -20,6 +20,7 @@ import { McpServersModule } from '../mcp-servers/mcp-servers.module';
 import { LicenseModule } from '../license/license.module';
 import { SharedSetupRegistry } from './shared-setup';
 import { SandboxModule } from '../sandbox/sandbox.module';
+import { ProcessorChainService } from './processor-chain.service';
 
 const ENGINES = [
   RestEngine,
@@ -33,7 +34,7 @@ const ENGINES = [
 @Module({
   imports: [McpServersModule, LicenseModule, SandboxModule],
   controllers: [McpEndpointController, WellKnownOAuthController, RegistryCatchUpController],
-  providers: [SharedSetupRegistry, McpServerService, ToolRegistry, DynamicMcpTools, McpCombinedAuthGuard, McpPrincipalRateLimitGuard, OAuth2TokenService, LoginTokenService, GraphqlSchemaService, ...ENGINES],
-  exports: [McpServerService, ToolRegistry, DynamicMcpTools, SharedSetupRegistry, OAuth2TokenService],
+  providers: [SharedSetupRegistry, McpServerService, ToolRegistry, DynamicMcpTools, ProcessorChainService, McpCombinedAuthGuard, McpPrincipalRateLimitGuard, OAuth2TokenService, LoginTokenService, GraphqlSchemaService, ...ENGINES],
+  exports: [McpServerService, ToolRegistry, DynamicMcpTools, SharedSetupRegistry, OAuth2TokenService, ProcessorChainService],
 })
 export class McpServerModule {}

@@ -2,6 +2,7 @@ import { Module } from '@nestjs/common';
 import { ConnectorsService } from './connectors.service';
 import { ConnectorsController } from './connectors.controller';
 import { ToolsController } from './tools.controller';
+import { ProcessorsController } from './processors.controller';
 import { McpServerModule } from '../mcp-server/mcp-server.module';
 import { RestEngine } from './engines/rest.engine';
 import { SoapEngine } from './engines/soap.engine';
@@ -41,7 +42,12 @@ const PARSERS = [OpenApiParser, WsdlParser, GraphqlParser, PostmanParser, CurlPa
 // at once, and a provider that rotates it revoked the connector's token.
 @Module({
   imports: [McpServerModule, McpServersModule, LicenseModule],
-  controllers: [ConnectorsController, McpOAuthCallbackController, ToolsController],
+  controllers: [
+    ConnectorsController,
+    McpOAuthCallbackController,
+    ToolsController,
+    ProcessorsController,
+  ],
   providers: [
     ConnectorsService,
     McpOAuthService,

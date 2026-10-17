@@ -11,7 +11,15 @@ import {
   stateToTransform,
   type ResponseMappingState,
 } from './response-mapping-panel';
-import type { ResponseTransform } from '@/lib/api';
+import {
+  EMPTY_PROCESSOR_STATE,
+  ProcessorChainPanel,
+  parseProcessorsToState,
+  processorStateInvalid,
+  stateToProcessors,
+  type ProcessorChainState,
+} from './processor-chain-panel';
+import type { ProcessorChainConfig, ResponseTransform } from '@/lib/api';
 
 /* ------------------------------------------------------------------ */
 /*  Types                                                             */
@@ -66,6 +74,8 @@ export interface ToolEditorData {
   staticResponse?: string;
   /** Optional shaping of the API response before it reaches the AI client */
   responseMapping?: ResponseMappingState;
+  /** Ordered steps that edit the response before the mapping selects from it */
+  processors?: ProcessorChainState;
   /**
    * Everything else already stored under responseMapping (e.g. followUp).
    * Round-tripped verbatim so saving from the GUI cannot silently drop keys
@@ -324,9 +334,10 @@ function parseExistingTool(
   }
 
   // Split responseMapping into the parts this editor renders (cacheTtl,
-  // transform) and everything else, which is round-tripped untouched.
+  // transform, processors) and everything else, which is round-tripped
+  // untouched.
   const rm = (tool.responseMapping ?? {}) as Record<string, unknown>;
-  const { cacheTtl: _cacheTtl, transform, ...responseMappingExtra } = rm;
+  const { cacheTtl: _cacheTtl, transform, processors, ...responseMappingExtra } = rm;
 
   return {
     name: tool.name,
@@ -340,6 +351,7 @@ function parseExistingTool(
     staticResponse: em.staticResponse || undefined,
     cacheTtl: (rm.cacheTtl as number) || 0,
     responseMapping: parseTransformToState(transform as ResponseTransform | undefined),
+    processors: parseProcessorsToState(processors as ProcessorChainConfig | undefined),
     responseMappingExtra,
     bodyTemplate: detectedBodyTemplate,
     useBodyTemplate: detectedUseBodyTemplate,
@@ -500,6 +512,10 @@ function buildToolPayload(data: ToolEditorData, connectorType: string) {
   if (transform) {
     responseMapping.transform = transform;
   }
+  const processors = data.processors ? stateToProcessors(data.processors) : null;
+  if (processors) {
+    responseMapping.processors = processors;
+  }
   // Always sent, even when empty: omitting the key leaves whatever is stored in
   // place, so switching the mapping back to "Off" would never take effect.
   result.responseMapping = responseMapping;
@@ -543,6 +559,8 @@ export function ToolEditor({
   const [responseMapping, setResponseMapping] =
     useState<ResponseMappingState>(EMPTY_MAPPING_STATE);
   const [responseMappingExtra, setResponseMappingExtra] = useState<Record<string, unknown>>({});
+  const [processorChain, setProcessorChain] =
+    useState<ProcessorChainState>(EMPTY_PROCESSOR_STATE);
 
   // Initialize from existing tool
   useEffect(() => {
@@ -565,6 +583,7 @@ export function ToolEditor({
       if (parsed.bodyEncoding) setBodyEncoding(parsed.bodyEncoding);
       if (parsed.staticResponse) setStaticResponse(parsed.staticResponse);
       setResponseMapping(parsed.responseMapping ?? EMPTY_MAPPING_STATE);
+      setProcessorChain(parsed.processors ?? EMPTY_PROCESSOR_STATE);
       setResponseMappingExtra(parsed.responseMappingExtra ?? {});
     }
   }, [existingTool, type]);
@@ -666,6 +685,7 @@ export function ToolEditor({
       useBodyMappingJson,
       bodyEncoding: !useBodyTemplate ? bodyEncoding : undefined,
       responseMapping,
+      processors: processorChain,
       responseMappingExtra,
     };
     onSave(buildToolPayload(data, type));
@@ -680,7 +700,8 @@ export function ToolEditor({
     description.trim() &&
     params.every((p) => p.name.trim()) &&
     !bodyMappingJsonInvalid &&
-    !mappingStateInvalid(responseMapping);
+    !mappingStateInvalid(responseMapping) &&
+    !processorStateInvalid(processorChain);
 
   return (
     <div className="border border-[var(--border)] rounded-lg p-5 space-y-5 bg-[var(--card)]">
@@ -1199,6 +1220,16 @@ export function ToolEditor({
         </p>
       </div>
 
+      {/* Response Processors — they run before the mapping selects from the response */}
+      {method !== 'static' && (
+        <ProcessorChainPanel
+          state={processorChain}
+          onChange={setProcessorChain}
+          connectorId={connectorId}
+          toolId={toolId}
+        />
+      )}
+
       {/* Response Mapping */}
       {method !== 'static' && (
         <ResponseMappingPanel
@@ -1217,7 +1248,7 @@ export function ToolEditor({
           </summary>
           <pre className="mt-2 p-3 bg-[var(--muted)] rounded text-[10px] font-mono overflow-x-auto max-h-48 overflow-y-auto">
             {JSON.stringify(
-              buildToolPayload({ name, description, method, path, params, graphqlQuery, sqlTemplate, staticResponse: method === 'static' ? staticResponse : undefined, cacheTtl, bodyTemplate: useBodyTemplate ? bodyTemplate : undefined, useBodyTemplate, bodyMappingJson: useBodyMappingJson ? bodyMappingJson : undefined, useBodyMappingJson, bodyEncoding: !useBodyTemplate ? bodyEncoding : undefined, responseMapping, responseMappingExtra }, type),
+              buildToolPayload({ name, description, method, path, params, graphqlQuery, sqlTemplate, staticResponse: method === 'static' ? staticResponse : undefined, cacheTtl, bodyTemplate: useBodyTemplate ? bodyTemplate : undefined, useBodyTemplate, bodyMappingJson: useBodyMappingJson ? bodyMappingJson : undefined, useBodyMappingJson, bodyEncoding: !useBodyTemplate ? bodyEncoding : undefined, responseMapping, processors: processorChain, responseMappingExtra }, type),
               null,
               2,
             )}
