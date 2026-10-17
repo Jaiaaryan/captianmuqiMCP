@@ -8,7 +8,8 @@ import {
 } from '@nestjs/common';
 import { z } from 'zod';
 import { SANDBOX_LIMITS, SANDBOX_TIMEOUT_RANGE_MS, areSandboxWritesAllowed } from './limits';
-import { SandboxScriptsService } from './sandbox-scripts.service';
+import { toZodShape } from './script-parameters.util';
+import { SandboxScriptsService, type ExposedScript } from './sandbox-scripts.service';
 import { declaredOnly, missingConnectors, type ScriptUse } from './script-uses.util';
 import {
   SCRIPT_CODE_MAX_CHARS,
@@ -18,8 +19,10 @@ import {
   SCRIPT_NAME_PATTERN,
 } from './sandbox-scripts.dto';
 import { SandboxService } from './sandbox.service';
+import { runWithCapabilities, type ScriptRunCapabilities } from './script-http';
 import { buildToolsSignature } from './tool-signature.util';
 import type {
+  SandboxRunResult,
   SandboxExecuteTool,
   SandboxInvocationContext,
   SandboxMcpToolEntry,
@@ -112,14 +115,22 @@ function writeFailure(err: unknown, scriptName: string) {
 }
 
 /**
- * The four MCP tools of code mode, scoped to one authenticated MCP session:
- * the tools a script may call are exactly `allowedTools` (already filtered by
+ * The MCP tools of code mode, scoped to one authenticated MCP session: the four
+ * `sandbox_*` tools, then one tool per saved script in `exposedScripts` (those
+ * with parameters that this server can run; see SandboxScriptsService.listExposed).
+ * The tools a script may call are exactly `allowedTools` (already filtered by
  * role), and every call carries the session's own invocation context.
+ *
+ * The caller reads `exposedScripts` when it plans the tool set, so a script saved
+ * since the last plan is on the next one: the next request in stateless mode, the
+ * next reconcile of a stateful session (each entry's `sig` covers its description
+ * and schema, so a changed script is re-registered).
  */
 export function buildSandboxToolEntries(
   deps: SandboxToolDeps,
   scope: SandboxToolScope,
   allowedTools: SandboxTool[],
+  exposedScripts: ExposedScript[] = [],
 ): SandboxMcpToolEntry[] {
   const { sandbox, scripts, executeTool } = deps;
   const { storageOrganizationId: orgId, invocationContext } = scope;
@@ -134,7 +145,13 @@ export function buildSandboxToolEntries(
   const description = runDescription(signature);
   const sig = `sandbox:v1:${createHash('sha1').update(description).digest('hex').slice(0, 16)}`;
 
-  const run = async (
+  /**
+   * Runs code or a saved script, with the authority of this session's caller.
+   * Both `sandbox_run_script` and the tools of saved scripts go through here, so
+   * they cannot differ: the same lookup, the same re-check of access, the same
+   * declared-tools-only rule, the same audit row.
+   */
+  const execute = async (
     input: {
       code?: string;
       scriptName?: string;
@@ -142,11 +159,19 @@ export function buildSandboxToolEntries(
       timeoutMs?: number;
     },
     handlerContext?: HandlerContext,
-  ) => {
+  ): Promise<
+    | { refused: ReturnType<typeof textResult> }
+    | {
+        refused?: undefined;
+        runId: string;
+        result: SandboxRunResult;
+        scriptInfo?: { name: string; version: number; ownedByYou: boolean };
+      }
+  > => {
     const hasCode = typeof input.code === 'string' && input.code.length > 0;
     const hasName = typeof input.scriptName === 'string' && input.scriptName.length > 0;
     if (hasCode === hasName) {
-      return textResult('Provide exactly one of "code" or "scriptName".', true);
+      return { refused: textResult('Provide exactly one of "code" or "scriptName".', true) };
     }
 
     let code = input.code as string;
@@ -156,19 +181,24 @@ export function buildSandboxToolEntries(
     let scriptInfo: { name: string; version: number; ownedByYou: boolean } | undefined;
     // What a saved script declares it uses: it can call those tools and no others.
     let declared: ScriptUse[] | undefined;
+    // Level 3 switches of the saved script; inline code never has any.
+    let savedCapabilities: unknown = null;
     if (hasName) {
       const saved = await scripts.getByName(orgId, input.scriptName as string);
       // A script is offered on a server only if the server has every connector the
       // script uses, so one that needs a connector this server lacks is not found.
       if (!saved || missingConnectors(saved.uses, invocationContext.connectorIds).length > 0) {
-        return textResult(
-          `Script '${input.scriptName}' not found. Call sandbox_list_scripts to see the saved scripts.`,
-          true,
-        );
+        return {
+          refused: textResult(
+            `Script '${input.scriptName}' not found. Call sandbox_list_scripts to see the saved scripts.`,
+            true,
+          ),
+        };
       }
       code = saved.code;
       scriptId = saved.id;
       declared = saved.uses;
+      savedCapabilities = (saved as { capabilities?: unknown }).capabilities ?? null;
       scriptInfo = {
         name: saved.name,
         version: saved.version,
@@ -183,7 +213,21 @@ export function buildSandboxToolEntries(
         tools = await scope.reauthorize();
       } catch (err) {
         logger.warn(`Could not re-check access for a sandbox run: ${(err as Error)?.message ?? err}`);
-        return textResult('Could not verify your access to the tools. Try again.', true);
+        return { refused: textResult('Could not verify your access to the tools. Try again.', true) };
+      }
+    }
+
+    // Level 3: `env` and `http.fetch` for the declared connectors the caller may
+    // use. Resolved now, with the access just re-checked. Fails closed.
+    let capabilities: ScriptRunCapabilities | null = null;
+    if (declared && savedCapabilities) {
+      try {
+        capabilities = await scripts.runCapabilities(orgId, { capabilities: savedCapabilities, uses: declared }, tools, {
+          allowWrites: areSandboxWritesAllowed(),
+        });
+      } catch (err) {
+        logger.warn(`Could not prepare a script's capabilities: ${(err as Error)?.constructor?.name ?? 'error'}`);
+        return { refused: textResult('Could not prepare the script\'s connector access. Try again.', true) };
       }
     }
 
@@ -192,7 +236,9 @@ export function buildSandboxToolEntries(
     // One id for the run: its row in sandbox_runs, and the mark on the audit row
     // of every connector call it makes.
     const runId = randomUUID();
-    const result = await sandbox.run({
+    // Secrets of the declared connectors are masked in the result before it is
+    // stored or returned.
+    const result = await runWithCapabilities(sandbox, {
       code,
       args: input.args,
       allowedTools: tools,
@@ -201,7 +247,7 @@ export function buildSandboxToolEntries(
       invocationContext: { ...invocationContext, sandboxRunId: runId },
       executeTool,
       limits: input.timeoutMs ? { timeoutMs: input.timeoutMs } : undefined,
-    });
+    }, capabilities);
     if (declared && result.error?.code === 'TOOL_NOT_ALLOWED') {
       result.error.hint = (
         `${result.error.hint ?? ''} A saved script can call only the tools it declares: add the tool ` +
@@ -218,7 +264,21 @@ export function buildSandboxToolEntries(
       args: input.args,
       result,
     });
+    return { runId, result, scriptInfo };
+  };
 
+  const run = async (
+    input: {
+      code?: string;
+      scriptName?: string;
+      args?: Record<string, unknown>;
+      timeoutMs?: number;
+    },
+    handlerContext?: HandlerContext,
+  ) => {
+    const outcome = await execute(input, handlerContext);
+    if (outcome.refused) return outcome.refused;
+    const { runId, result, scriptInfo } = outcome;
     if (result.ok) {
       return jsonResult(
         { ok: true, runId, result: result.result, meta: result.meta, ...(scriptInfo && { script: scriptInfo }) },
@@ -237,6 +297,31 @@ export function buildSandboxToolEntries(
       { structured: true, isError: true },
     );
   };
+
+  /**
+   * A saved script offered as a tool of its own name: it runs as
+   * `sandbox_run_script { scriptName, args }` would and returns the script's JSON
+   * result as it is, without the run's wrapper.
+   */
+  const runExposed =
+    (scriptName: string) => async (input: Record<string, unknown>, handlerContext?: HandlerContext) => {
+      const outcome = await execute({ scriptName, args: input }, handlerContext);
+      if (outcome.refused) return outcome.refused;
+      const { runId, result } = outcome;
+      if (result.ok) {
+        const value = result.result ?? null;
+        const plain = typeof value === 'object' && value !== null && !Array.isArray(value);
+        return {
+          content: [{ type: 'text' as const, text: JSON.stringify(value) }],
+          ...(plain ? { structuredContent: value as Record<string, unknown> } : {}),
+        };
+      }
+      const { code: errorCode, message, hint, line, column } = result.error!;
+      return jsonResult(
+        { ok: false, runId, error: { code: errorCode, message, hint, line, column }, meta: result.meta },
+        { isError: true },
+      );
+    };
 
   /** The uses of a script as an agent reads them: connector name and its tool names. */
   const showUses = (uses: ScriptUse[]) => uses.map((u) => ({ connector: u.connectorName, tools: u.tools }));
@@ -312,6 +397,8 @@ export function buildSandboxToolEntries(
           name: s.name,
           description: s.description,
           version: s.version,
+          parameters: s.parameters ?? null,
+          capabilities: (s as { capabilities?: unknown }).capabilities ?? null,
           ownedByYou: (s.createdById ?? null) === (userId ?? null),
           uses: showUses(s.uses),
           lastRunAt: s.lastRunAt,
@@ -346,7 +433,35 @@ export function buildSandboxToolEntries(
     register: (mcpServer) => build(mcpServer) as { remove: () => void },
   });
 
-  return [
+  const reserved = new Set<string>(SANDBOX_TOOL_NAMES);
+  const scriptEntries: SandboxMcpToolEntry[] = exposedScripts
+    .filter((script) => !reserved.has(script.name))
+    .map((script) => {
+      const scriptDescription = script.description?.trim() || `Saved script ${script.name} v${script.version}`;
+      const readOnlyHint = !areSandboxWritesAllowed();
+      const scriptSig = `sandbox-script:v1:${createHash('sha1')
+        .update(JSON.stringify([script.name, scriptDescription, script.parameters, readOnlyHint]))
+        .digest('hex')
+        .slice(0, 16)}`;
+      return {
+        name: script.name,
+        sig: scriptSig,
+        register: (mcpServer) =>
+          mcpServer.registerTool(
+            script.name,
+            {
+              description: scriptDescription,
+              inputSchema: toZodShape(script.parameters),
+              // Reads through the connectors only while writes are off, like
+              // sandbox_run_script; it reaches their external systems.
+              annotations: { title: script.name, readOnlyHint, openWorldHint: true },
+            },
+            runExposed(script.name),
+          ) as unknown as { remove: () => void },
+      };
+    });
+
+  const sandboxEntries: SandboxMcpToolEntry[] = [
     entry(SANDBOX_RUN_TOOL, (mcpServer) =>
       mcpServer.registerTool(
         SANDBOX_RUN_TOOL,
@@ -456,4 +571,6 @@ export function buildSandboxToolEntries(
       ),
     ),
   ];
+
+  return [...sandboxEntries, ...scriptEntries];
 }

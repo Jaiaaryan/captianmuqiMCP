@@ -68,7 +68,7 @@ const savedScript = (over: Record<string, unknown> = {}) => ({
   ...over,
 });
 
-function setup(opts: { allowedToolIds?: string[] | null; server?: any } = {}) {
+function setup(opts: { allowedToolIds?: string[] | null; server?: any; sessions?: any } = {}) {
   const server =
     opts.server === undefined
       ? { id: SERVER, name: 'Shop', organizationId: ORG, isActive: true }
@@ -110,6 +110,7 @@ function setup(opts: { allowedToolIds?: string[] | null; server?: any } = {}) {
     roles as any,
     registry as any,
     executor as any,
+    opts.sessions,
   );
   return { controller, sandbox, scripts, servers, roles, registry, executor };
 }
@@ -153,7 +154,7 @@ describe('SandboxApiController', () => {
       const { controller, scripts } = setup();
       scripts.list.mockResolvedValue([{ id: 's1', createdById: 'u-editor', uses: [] }]);
       await expect(controller.listScripts(asReq(VIEWER), SERVER, {})).resolves.toEqual([
-        { id: 's1', createdById: 'u-editor', uses: [], ownedByYou: false, availableOnServer: true, missingConnectors: [] },
+        { id: 's1', createdById: 'u-editor', uses: [], ownedByYou: false, availableOnServer: true, missingConnectors: [], exposedAsTool: false },
       ]);
       await expect(controller.runs(asReq(VIEWER), SERVER, {})).resolves.toEqual([]);
     });
@@ -492,6 +493,48 @@ describe('SandboxApiController', () => {
       expect(scripts.list).toHaveBeenCalledWith(ORG, { includeCode: false });
     });
 
+    it('passes parameters on when saving, and tells live sessions the tool list may have changed', async () => {
+      const sessions = { notifyToolsChanged: jest.fn().mockResolvedValue(undefined) };
+      const { controller, scripts } = setup({ sessions });
+      const parameters = { type: 'object', properties: { days: { type: 'number' } }, required: ['days'] };
+      scripts.create.mockResolvedValue({ script: savedScript({ parameters }), added: [], warnings: [] });
+      scripts.updateByIdAsAuthor.mockResolvedValue({ script: savedScript({ parameters }), added: [], warnings: [] });
+      await controller.createScript(asReq(EDITOR), SERVER, { name: 'monthly', code: 'x', parameters });
+      expect(scripts.create.mock.calls[0][2]).toMatchObject({ parameters });
+      await controller.updateScript(asReq(EDITOR), 's1', { parameters });
+      expect(scripts.updateByIdAsAuthor.mock.calls[0][2]).toMatchObject({ parameters });
+      await controller.deleteScript(asReq(EDITOR), 's1');
+      expect(sessions.notifyToolsChanged).toHaveBeenCalledTimes(3);
+    });
+
+    it('does not fail a save when the session notification fails', async () => {
+      const sessions = { notifyToolsChanged: jest.fn().mockRejectedValue(new Error('down')) };
+      const { controller, scripts } = setup({ sessions });
+      scripts.create.mockResolvedValue({ script: savedScript(), added: [], warnings: [] });
+      await expect(
+        controller.createScript(asReq(EDITOR), SERVER, { name: 'monthly', code: 'x' }),
+      ).resolves.toMatchObject({ name: 'monthly' });
+    });
+
+    it('says which scripts this server offers as tools: those with parameters it can run', async () => {
+      const { controller, scripts } = setup();
+      const parameters = { type: 'object', properties: { days: { type: 'number' } }, required: ['days'] };
+      const needs = (connectorId: string) => [{ connectorId, connectorName: 'X', connectorExists: true, tools: ['t'] }];
+      scripts.list.mockResolvedValue([
+        { id: 'a', createdById: 'u-admin', uses: needs('conn-1'), parameters, inferredParameters: ['days'] },
+        { id: 'b', createdById: 'u-admin', uses: needs('conn-1'), parameters: null, inferredParameters: [] },
+        { id: 'c', createdById: 'u-admin', uses: needs('conn-crm'), parameters, inferredParameters: ['days'] },
+      ]);
+      const rows: any[] = await controller.listScripts(asReq(EDITOR), SERVER, {});
+      expect(rows.map((r) => [r.id, r.exposedAsTool])).toEqual([
+        ['a', true],
+        ['b', false],
+        ['c', false],
+      ]);
+      expect(rows[0].parameters).toEqual(parameters);
+      expect(rows[0].inferredParameters).toEqual(['days']);
+    });
+
     it('returns a script with its code from the right server only', async () => {
       const { controller, scripts } = setup();
       scripts.get.mockResolvedValue({ id: 's1', code: 'return 1', createdById: 'u-editor' });
@@ -567,6 +610,8 @@ describe('SandboxApiController', () => {
         's1',
         { code: 'return 2' },
         'u-editor',
+        {},
+        { isAdmin: false },
       );
       expect(body.syntax).toEqual({ ok: true });
     });

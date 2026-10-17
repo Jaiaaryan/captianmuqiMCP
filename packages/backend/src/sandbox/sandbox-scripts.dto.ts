@@ -3,6 +3,7 @@ import { Type } from 'class-transformer';
 import {
   ArrayMaxSize,
   IsArray,
+  IsBoolean,
   IsIn,
   IsInt,
   IsObject,
@@ -46,6 +47,32 @@ export class ScriptUseDto {
   tools!: string[];
 }
 
+/** Level 3 switches of a saved script. Inline code never gets them. */
+export class ScriptCapabilitiesDto {
+  @ApiPropertyOptional({
+    description:
+      'The run gets a read-only `env` object with the variables of the connectors the script declares ' +
+      '(and no others). Secrets are masked as *** in everything the run returns.',
+  })
+  @IsOptional()
+  @IsBoolean()
+  env?: boolean;
+
+  @ApiPropertyOptional({
+    description:
+      'The run gets `http.fetch(url, { method, headers, body })`, limited to the base URLs (scheme, host, ' +
+      'port) of the connectors the script declares, behind the SSRF guard; GET and HEAD only unless ' +
+      'SANDBOX_ALLOW_WRITES=true.',
+  })
+  @IsOptional()
+  @IsBoolean()
+  http?: boolean;
+}
+
+const CAPABILITIES_DOC =
+  'Level 3: `{ env?: boolean, http?: boolean }`. Only the script\'s author or an administrator can set ' +
+  'it. Omit to keep the current value; null (or both false) for tools only.';
+
 export class CreateSandboxScriptDto {
   @ApiProperty({ example: 'delayed_orders_last_month' })
   @IsString()
@@ -76,6 +103,25 @@ export class CreateSandboxScriptDto {
   @ValidateNested({ each: true })
   @Type(() => ScriptUseDto)
   uses?: ScriptUseDto[];
+
+  @ApiPropertyOptional({
+    nullable: true,
+    description:
+      'JSON Schema object of the arguments the script reads (`args.<name>`): ' +
+      '`{ type: "object", properties: { <name>: { type, description?, enum?, items? } }, required: [...] }`. ' +
+      'Names found in the code are added (as required strings) and names no longer read are dropped, ' +
+      'unless a property has `"x-keep": true`. A script with parameters is offered as an MCP tool of its ' +
+      'own name. Omit to keep the current ones; null to start over from the code.',
+  })
+  @IsOptional()
+  @IsObject()
+  parameters?: Record<string, unknown> | null;
+
+  @ApiPropertyOptional({ type: ScriptCapabilitiesDto, nullable: true, description: CAPABILITIES_DOC })
+  @IsOptional()
+  @ValidateNested()
+  @Type(() => ScriptCapabilitiesDto)
+  capabilities?: ScriptCapabilitiesDto | null;
 }
 
 export class UpdateSandboxScriptDto {
@@ -104,6 +150,25 @@ export class UpdateSandboxScriptDto {
   @ValidateNested({ each: true })
   @Type(() => ScriptUseDto)
   uses?: ScriptUseDto[];
+
+  @ApiPropertyOptional({
+    nullable: true,
+    description:
+      'JSON Schema object of the arguments the script reads (`args.<name>`): ' +
+      '`{ type: "object", properties: { <name>: { type, description?, enum?, items? } }, required: [...] }`. ' +
+      'Names found in the code are added (as required strings) and names no longer read are dropped, ' +
+      'unless a property has `"x-keep": true`. A script with parameters is offered as an MCP tool of its ' +
+      'own name. Omit to keep the current ones; null to start over from the code.',
+  })
+  @IsOptional()
+  @IsObject()
+  parameters?: Record<string, unknown> | null;
+
+  @ApiPropertyOptional({ type: ScriptCapabilitiesDto, nullable: true, description: CAPABILITIES_DOC })
+  @IsOptional()
+  @ValidateNested()
+  @Type(() => ScriptCapabilitiesDto)
+  capabilities?: ScriptCapabilitiesDto | null;
 }
 
 /** Exactly one of `code` / `scriptId` is required; the controller checks. */

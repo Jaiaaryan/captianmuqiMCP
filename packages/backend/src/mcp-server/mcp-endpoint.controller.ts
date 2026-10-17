@@ -78,7 +78,7 @@ import {
 } from './mcp-resources';
 import { jsonSchemaToZodShape, stripEnvVarParams } from './tool-schema.util';
 import { SandboxService } from '../sandbox/sandbox.service';
-import { SandboxScriptsService } from '../sandbox/sandbox-scripts.service';
+import { SandboxScriptsService, type ExposedScript } from '../sandbox/sandbox-scripts.service';
 import {
   SANDBOX_RUN_TOOL,
   buildSandboxToolEntries,
@@ -192,6 +192,11 @@ interface ToolSetParams {
    * and never get a code-execution tool by omission.
    */
   sandboxOrganizationId?: string;
+  /**
+   * Saved sandbox scripts this server offers as tools of their own (read by the
+   * caller with SandboxScriptsService.listExposed, as planning is synchronous).
+   */
+  sandboxScripts?: ExposedScript[];
 }
 
 interface InvocationContext {
@@ -250,6 +255,20 @@ export class McpEndpointController {
     const assigned = new Set(connectorIds);
     const serverTools = this.toolRegistry.getAllTools().filter((t) => assigned.has(t.connectorId));
     return toSandboxTools(visibleServerTools(serverTools, allowedToolIds));
+  }
+
+  /** Saved scripts to offer as tools; none if code mode is off or the read fails (the rest of the tools still serve). */
+  private async exposedSandboxScripts(
+    organizationId: string,
+    connectorIds: string[],
+  ): Promise<ExposedScript[]> {
+    if (!this.sandboxScripts || !isSandboxEnabled()) return [];
+    try {
+      return await this.sandboxScripts.listExposed(organizationId, connectorIds);
+    } catch (err: any) {
+      this.logger.warn(`Could not read the saved sandbox scripts: ${err?.message ?? err}`);
+      return [];
+    }
   }
 
   private shouldWarnDuplicate(key: string, now = Date.now()): boolean {
@@ -1149,11 +1168,19 @@ export class McpEndpointController {
       kgEnabled,
       invocationContext,
       sandboxOrganizationId: mcpServerConfig.organizationId,
+      sandboxScripts: await this.exposedSandboxScripts(
+        mcpServerConfig.organizationId,
+        connectorIds,
+      ),
     };
 
     // Register this server's tool surface onto the per-request McpServer.
     const entries = this.planToolSet(params);
     const handles = this.registerAll(mcpServer, entries, serverId);
+    // A `tools/call` for a name that is not on this surface (another
+    // workspace's tool, a tool the caller's role hides, or an internal id) is
+    // refused by the SDK below; record the refusal in the caller's audit log.
+    this.toolExecutor.auditRefusedCall?.(body, handles, invocationContext);
     const signature = this.aggregateSig(entries);
     this.registerKgResource(mcpServer, params);
     this.registerServerResources(
@@ -1492,6 +1519,7 @@ export class McpEndpointController {
         kgEnabled,
         invocationContext,
         sandboxOrganizationId: serverOrganizationId,
+        sandboxScripts: await this.exposedSandboxScripts(serverOrganizationId, connectorIds),
       });
       const signature = this.aggregateSig(entries);
       if (signature === session.signature) return; // nothing changed here
@@ -1697,11 +1725,19 @@ export class McpEndpointController {
         },
         // Exactly what a script may call: the tools that survived every filter above.
         toSandboxTools(visibleTools),
+        params.sandboxScripts,
       );
       // A connector that happens to use one of these names keeps it: a duplicate
       // registration would make the SDK throw and fail the whole request.
       for (const entry of sandboxEntries) {
-        if (registeredNames.has(entry.name)) continue;
+        if (registeredNames.has(entry.name)) {
+          if (this.shouldWarnDuplicate(`${invocationContext.mcpServerId}:${entry.name}`)) {
+            this.logger.warn(
+              `Sandbox tool "${entry.name}" on server ${invocationContext.mcpServerId} shares its name with another tool — skipping it (rename the saved script).`,
+            );
+          }
+          continue;
+        }
         registeredNames.add(entry.name);
         entries.push(entry);
       }

@@ -580,13 +580,15 @@ describe('buildSandboxToolEntries', () => {
           name: 'delayed_orders',
           description: 'Delayed orders last month',
           version: 3,
+          parameters: null,
+          capabilities: null,
           ownedByYou: true,
           uses: [{ connector: 'ERP', tools: ['erp_orders_list'] }],
           lastRunAt: lastRunAt.toISOString(),
           lastRunOk: true,
           lastRunMeta: { ms: 40, bytesReturned: 80 },
         },
-        { name: 'new_one', description: null, version: 1, ownedByYou: false, uses: [], lastRunAt: null, lastRunOk: null, lastRunMeta: null },
+        { name: 'new_one', description: null, version: 1, parameters: null, capabilities: null, ownedByYou: false, uses: [], lastRunAt: null, lastRunOk: null, lastRunMeta: null },
       ]);
     });
 

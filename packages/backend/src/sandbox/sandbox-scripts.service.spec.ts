@@ -174,10 +174,14 @@ describe('SandboxScriptsService', () => {
 
   describe('list', () => {
     it('leaves the code out unless asked', async () => {
-      await service.list(ORG);
-      await service.list(ORG, { includeCode: true });
-      expect(prisma.sandboxScript.findMany.mock.calls[0][0].select.code).toBe(false);
-      expect(prisma.sandboxScript.findMany.mock.calls[1][0].select.code).toBe(true);
+      prisma.sandboxScript.findMany.mockResolvedValue([stored({ code: 'return args.days' })]);
+      const [plain] = await service.list(ORG);
+      const [withCode] = await service.list(ORG, { includeCode: true });
+      expect(plain).not.toHaveProperty('code');
+      expect(withCode).toHaveProperty('code', 'return args.days');
+      // The code is read either way, to tell which arguments it reads.
+      expect(plain.inferredParameters).toEqual(['days']);
+      expect(withCode.inferredParameters).toEqual(['days']);
     });
 
     it('groups what a script uses by connector, with the connectors\' current names', async () => {
@@ -644,6 +648,195 @@ describe('SandboxScriptsService', () => {
         service.removeAsUser('org-b', 'sc-1', { userId: 'u-admin', isAdmin: true }),
       ).rejects.toBeInstanceOf(NotFoundException);
       expect(prisma.sandboxScript.deleteMany).not.toHaveBeenCalled();
+    });
+  });
+});
+
+describe('SandboxScriptsService parameters', () => {
+  let prisma: ReturnType<typeof makePrisma>;
+  let service: SandboxScriptsService;
+
+  const schema = (properties: Record<string, any>, required: string[]) => ({
+    type: 'object',
+    properties,
+    required,
+  });
+  const savedParameters = (call = 0, kind: 'create' | 'update' = 'create') =>
+    prisma.sandboxScript[kind].mock.calls[call][0].data.parameters;
+
+  beforeEach(() => {
+    prisma = makePrisma();
+    service = new SandboxScriptsService(prisma as any);
+  });
+
+  describe('create', () => {
+    it('stores each argument the code reads as a required string, and reports what it found', async () => {
+      const { script } = await service.create(ORG, 'u1', {
+        name: 'stuck_orders',
+        code: 'const { days } = args; return args.as_of;',
+      });
+      expect(savedParameters()).toEqual(
+        schema({ days: { type: 'string' }, as_of: { type: 'string' } }, ['days', 'as_of']),
+      );
+      expect(script.inferredParameters).toEqual(['days', 'as_of']);
+    });
+
+    it('stores SQL NULL, not a JSON null, when the code reads no arguments', async () => {
+      await service.create(ORG, 'u1', { name: 'plain', code: 'return 1' });
+      expect(savedParameters()).toBe(Prisma.DbNull);
+    });
+
+    it('keeps the types, requirements and descriptions the author sends', async () => {
+      await service.create(ORG, 'u1', {
+        name: 'stuck_orders',
+        code: 'return [args.days, args.as_of]',
+        parameters: schema(
+          { days: { type: 'number', description: 'Look-back window' }, as_of: { type: 'string' } },
+          ['days'],
+        ),
+      });
+      expect(savedParameters()).toEqual(
+        schema({ days: { type: 'number', description: 'Look-back window' }, as_of: { type: 'string' } }, ['days']),
+      );
+    });
+
+    it('merges the author\'s parameters with names the code reads that they left out', async () => {
+      await service.create(ORG, 'u1', {
+        name: 'abc',
+        code: 'return [args.days, args.extra]',
+        parameters: schema({ days: { type: 'number' } }, []),
+      });
+      expect(savedParameters()).toEqual(
+        schema({ days: { type: 'number' }, extra: { type: 'string' } }, ['extra']),
+      );
+    });
+
+    it('refuses a bad schema with the problem, and stores nothing', async () => {
+      await expect(
+        service.create(ORG, 'u1', {
+          name: 'abc',
+          code: 'return args.a',
+          parameters: schema({ a: { type: 'date' } }, []),
+        }),
+      ).rejects.toThrow(/needs a type/);
+      expect(prisma.sandboxScript.create).not.toHaveBeenCalled();
+    });
+
+    it('saves the script without parameters, and says so, when the code reads too many names', async () => {
+      const code = Array.from({ length: 21 }, (_, i) => `args.p${i}`).join(';');
+      const { warnings } = await service.create(ORG, 'u1', { name: 'abc', code });
+      expect(savedParameters()).toBe(Prisma.DbNull);
+      expect(warnings.join(' ')).toMatch(/not offered as a tool.*at most 20/);
+    });
+  });
+
+  describe('update', () => {
+    const current = (parameters: unknown, code = 'return [args.days, args.as_of]') =>
+      stored({ code, parameters });
+
+    it('keeps what the author set when only the code changes', async () => {
+      prisma.sandboxScript.findFirst.mockResolvedValueOnce(
+        current(schema({ days: { type: 'number', description: 'D' }, as_of: { type: 'string' } }, ['days'])),
+      );
+      await service.update(ORG, 'sc-1', { code: 'return [args.days, args.as_of, args.limit]' });
+      expect(savedParameters(0, 'update')).toEqual(
+        schema(
+          { days: { type: 'number', description: 'D' }, as_of: { type: 'string' }, limit: { type: 'string' } },
+          ['days', 'limit'],
+        ),
+      );
+    });
+
+    it('drops a parameter the new code no longer reads, unless it is marked x-keep', async () => {
+      prisma.sandboxScript.findFirst.mockResolvedValueOnce(
+        current(
+          schema(
+            { days: { type: 'number' }, as_of: { type: 'string' }, legacy: { type: 'string', 'x-keep': true } },
+            ['days', 'as_of', 'legacy'],
+          ),
+        ),
+      );
+      await service.update(ORG, 'sc-1', { code: 'return args.days' });
+      expect(savedParameters(0, 'update')).toEqual(
+        schema({ days: { type: 'number' }, legacy: { type: 'string', 'x-keep': true } }, ['days', 'legacy']),
+      );
+    });
+
+    it('replaces the parameters when the author sends them, without touching the code', async () => {
+      prisma.sandboxScript.findFirst.mockResolvedValueOnce(
+        current(schema({ days: { type: 'string' }, as_of: { type: 'string' } }, ['days', 'as_of'])),
+      );
+      await service.update(ORG, 'sc-1', {
+        parameters: schema({ days: { type: 'integer' }, as_of: { type: 'string' } }, ['days']),
+      });
+      const data = prisma.sandboxScript.update.mock.calls[0][0].data;
+      expect(data.parameters).toEqual(
+        schema({ days: { type: 'integer' }, as_of: { type: 'string' } }, ['days']),
+      );
+      expect(data).not.toHaveProperty('code');
+      expect(data).not.toHaveProperty('version');
+    });
+
+    it('starts over from the code when the author sends null', async () => {
+      prisma.sandboxScript.findFirst.mockResolvedValueOnce(
+        current(schema({ days: { type: 'number' }, as_of: { type: 'string' } }, [])),
+      );
+      await service.update(ORG, 'sc-1', { parameters: null });
+      expect(savedParameters(0, 'update')).toEqual(
+        schema({ days: { type: 'string' }, as_of: { type: 'string' } }, ['days', 'as_of']),
+      );
+    });
+
+    it('leaves the parameters alone on a description edit', async () => {
+      prisma.sandboxScript.findFirst.mockResolvedValueOnce(current(schema({ days: { type: 'number' } }, [])));
+      await service.update(ORG, 'sc-1', { description: 'new text' });
+      expect(prisma.sandboxScript.update.mock.calls[0][0].data).not.toHaveProperty('parameters');
+    });
+
+    it('refuses a bad schema without writing', async () => {
+      prisma.sandboxScript.findFirst.mockResolvedValueOnce(current(null));
+      await expect(
+        service.update(ORG, 'sc-1', { parameters: schema({ 'bad name': { type: 'string' } }, []) }),
+      ).rejects.toBeInstanceOf(BadRequestException);
+      expect(prisma.sandboxScript.update).not.toHaveBeenCalled();
+    });
+  });
+
+  describe('listExposed', () => {
+    const exposedRow = (name: string, uses: ReturnType<typeof row>[], parameters: unknown = schema({ a: { type: 'string' } }, ['a'])) => ({
+      id: `id-${name}`,
+      name,
+      description: null,
+      version: 2,
+      parameters,
+      uses,
+    });
+
+    it('asks for the organization\'s scripts that have parameters, and nobody else\'s', async () => {
+      await service.listExposed(ORG, ['c-erp']);
+      expect(prisma.sandboxScript.findMany.mock.calls[0][0].where).toEqual({
+        organizationId: ORG,
+        parameters: { not: Prisma.DbNull },
+      });
+    });
+
+    it('offers a script only on a server that has every connector it uses', async () => {
+      prisma.sandboxScript.findMany.mockResolvedValueOnce([
+        exposedRow('only_erp', [row('c-erp', 'ERP', 'erp_orders_list')]),
+        exposedRow('erp_and_shop', [
+          row('c-erp', 'ERP', 'erp_orders_list'),
+          row('c-shop', 'Shop', 'shop_orders_list'),
+        ]),
+        exposedRow('pure_compute', []),
+      ]);
+      const offered = await service.listExposed(ORG, ['c-erp']);
+      expect(offered.map((s) => s.name)).toEqual(['only_erp', 'pure_compute']);
+      expect(offered[0]).toMatchObject({ id: 'id-only_erp', version: 2, parameters: schema({ a: { type: 'string' } }, ['a']) });
+    });
+
+    it('skips a script whose stored parameters are a JSON null', async () => {
+      prisma.sandboxScript.findMany.mockResolvedValueOnce([exposedRow('legacy', [], null)]);
+      expect(await service.listExposed(ORG, [])).toEqual([]);
     });
   });
 });

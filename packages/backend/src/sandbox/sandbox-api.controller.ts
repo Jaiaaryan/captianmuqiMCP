@@ -12,6 +12,7 @@ import {
   HttpStatus,
   Logger,
   NotFoundException,
+  Optional,
   Param,
   Patch,
   Post,
@@ -28,6 +29,7 @@ import { deriveToolAnnotations } from '../mcp-server/tool-annotations';
 import { ToolRegistry } from '../mcp-server/tool-registry';
 import { toSandboxTools, visibleServerTools } from '../mcp-server/visible-tools';
 import { McpServersService } from '../mcp-servers/mcp-servers.service';
+import { McpSessionManager } from '../mcp-servers/mcp-session.manager';
 import { RolesService } from '../roles/roles.service';
 import { runIsolationSuite } from './isolation-suite';
 import { areSandboxWritesAllowed, isSandboxEnabled } from './limits';
@@ -40,6 +42,7 @@ import {
   UpdateSandboxScriptDto,
 } from './sandbox-scripts.dto';
 import { SandboxScriptsService } from './sandbox-scripts.service';
+import { runWithCapabilities } from './script-http';
 import { declaredOnly, missingConnectors } from './script-uses.util';
 import { SandboxService } from './sandbox.service';
 import type {
@@ -96,6 +99,7 @@ export class SandboxApiController {
     private readonly roles: RolesService,
     private readonly registry: ToolRegistry,
     private readonly executor: DynamicMcpTools,
+    @Optional() private readonly sessions?: McpSessionManager,
   ) {}
 
   // ---- run ---------------------------------------------------------------
@@ -140,10 +144,17 @@ export class SandboxApiController {
     }
     // A saved script can call only the tools it declared.
     const callable = toSandboxTools(scope.visible);
+    // Level 3 (`env`, `http.fetch`) only for a saved script that has it; inline code never.
+    const capabilities = saved?.capabilities
+      ? await this.scripts.runCapabilities(server.organizationId, saved, callable, {
+          allowWrites: areSandboxWritesAllowed(),
+        })
+      : null;
     // One id for the run: its row in sandbox_runs and the mark on the audit row
     // of each connector call it makes.
     const runId = randomUUID();
-    const result = await this.sandbox.run({
+    // Secrets of the declared connectors are masked in the result before it is stored or returned.
+    const result = await runWithCapabilities(this.sandbox, {
       code,
       args: dto.args,
       allowedTools: saved ? declaredOnly(callable, saved.uses) : callable,
@@ -152,7 +163,7 @@ export class SandboxApiController {
       invocationContext: { ...scope.invocationContext, sandboxRunId: runId },
       executeTool: this.executeTool,
       limits: dto.timeoutMs ? { timeoutMs: dto.timeoutMs } : undefined,
-    });
+    }, capabilities);
     if (saved && result.error?.code === 'TOOL_NOT_ALLOWED') {
       result.error.hint = (
         `${result.error.hint ?? ''} A saved script can call only the tools it declares: add the tool ` +
@@ -334,7 +345,9 @@ export class SandboxApiController {
     description:
       'Scripts belong to the organization. Each one lists the connectors and tools it uses and ' +
       'whether this server has all of those connectors (`availableOnServer`), which is what decides ' +
-      'if an agent on the server is offered it. Without code unless `includeCode=1`.',
+      'if an agent on the server is offered it. `parameters` is the schema of the arguments the script ' +
+      'reads, `inferredParameters` the names its code reads now, and `exposedAsTool` whether this server ' +
+      'offers it as a tool of its own name. Without code unless `includeCode=1`.',
   })
   async listScripts(
     @Req() req: DashboardRequest,
@@ -349,11 +362,14 @@ export class SandboxApiController {
     ]);
     return rows.map((row) => {
       const missing = missingConnectors(row.uses, serverConnectorIds);
+      const availableOnServer = missing.length === 0;
       return {
         ...row,
         ownedByYou: row.createdById === req.user.sub,
-        availableOnServer: missing.length === 0,
+        availableOnServer,
         missingConnectors: missing,
+        // Offered to agents on this server as a tool of its own name.
+        exposedAsTool: Boolean(row.parameters) && availableOnServer,
       };
     });
   }
@@ -375,10 +391,18 @@ export class SandboxApiController {
     const { script, added, warnings } = await this.scripts.create(
       server.organizationId,
       req.user.sub,
-      { name: dto.name, code: dto.code, description: dto.description, uses: dto.uses },
+      {
+        name: dto.name,
+        code: dto.code,
+        description: dto.description,
+        uses: dto.uses,
+        parameters: dto.parameters,
+        capabilities: dto.capabilities,
+      },
       { preferConnectorIds: await this.servers.getConnectorIds(server.id) },
     );
     const syntax = await this.sandbox.checkSyntax(script.code);
+    this.toolsMayHaveChanged();
     return { ...script, ownedByYou: true, syntax: formatSyntax(syntax), added, warnings };
   }
 
@@ -396,7 +420,10 @@ export class SandboxApiController {
     description:
       'Only the script\'s author can change it, because a saved script runs with the authority ' +
       'of whoever runs it. To change someone else\'s script, save your own copy under a new name. ' +
-      '`uses`, when sent, replaces the list of connectors and tools the script declares.',
+      '`uses`, when sent, replaces the list of connectors and tools the script declares. ' +
+      '`parameters`, when sent, replaces the schema of the arguments the script reads; names found ' +
+      'in the code are merged in. `capabilities` (Level 3: `env`, `http`) can be set by the author, ' +
+      'or by an administrator in a request that changes nothing else.',
   })
   async updateScript(
     @Req() req: DashboardRequest,
@@ -409,9 +436,18 @@ export class SandboxApiController {
       scriptId,
       dto,
       req.user.sub,
+      {},
+      { isAdmin: req.user.role === 'ADMIN' },
     );
     const syntax = await this.sandbox.checkSyntax(script.code);
-    return { ...script, ownedByYou: true, syntax: formatSyntax(syntax), added, warnings };
+    this.toolsMayHaveChanged();
+    return {
+      ...script,
+      ownedByYou: script.createdById === req.user.sub,
+      syntax: formatSyntax(syntax),
+      added,
+      warnings,
+    };
   }
 
   @Delete('scripts/:scriptId')
@@ -426,6 +462,7 @@ export class SandboxApiController {
       userId: req.user.sub,
       isAdmin: req.user.role === 'ADMIN',
     });
+    this.toolsMayHaveChanged();
   }
 
   // ---- helpers -----------------------------------------------------------
@@ -436,6 +473,17 @@ export class SandboxApiController {
     args: Record<string, unknown>,
     context: SandboxInvocationContext,
   ) => this.executor.executeTool(name, args, context);
+
+  /**
+   * Saved scripts with parameters are MCP tools, so a save or delete can change the
+   * tool list of live stateful sessions: ask them to reconcile (each does nothing
+   * unless its own list changed). Fire and forget; a failure never fails the save.
+   */
+  private toolsMayHaveChanged(): void {
+    this.sessions
+      ?.notifyToolsChanged()
+      .catch((err: Error) => this.logger.warn(`MCP session notify failed: ${err.message}`));
+  }
 
   private requireEnabled(): void {
     if (!isSandboxEnabled()) {

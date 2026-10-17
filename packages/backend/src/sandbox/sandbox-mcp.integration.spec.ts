@@ -597,3 +597,97 @@ describe('code mode through planToolSet', () => {
     });
   });
 });
+
+describe('saved scripts as tools through planToolSet', () => {
+  beforeAll(() => Logger.overrideLogger(false));
+  afterAll(() => Logger.overrideLogger(['log', 'error', 'warn', 'debug']));
+
+  const uses = [
+    { connectorId: 'conn-t1', connectorName: 'ERP', connectorExists: true, tools: ['erp_orders_list'] },
+  ];
+  const exposed = (over: Record<string, unknown> = {}) => ({
+    id: 'sc-9',
+    name: 'delayed_count',
+    description: 'Count delayed orders',
+    version: 2,
+    parameters: {
+      type: 'object',
+      properties: { status: { type: 'string', enum: ['delayed', 'ok'], description: 'Order status' } },
+      required: ['status'],
+    },
+    uses,
+    ...over,
+  });
+  const saved = {
+    id: 'sc-9',
+    name: 'delayed_count',
+    version: 2,
+    code: 'const rows = await tools.erp_orders_list({}); return { n: rows.filter((r) => r.status === args.status).length };',
+    createdById: 'u1',
+    uses,
+  };
+
+  it('lists the script as a tool with its parameters, next to the sandbox tools', async () => {
+    const { controller } = makeController();
+    const entries = (controller as any).planToolSet(baseParams({ sandboxScripts: [exposed()] }));
+    expect(names(entries)).toEqual([
+      'erp_orders_list',
+      'erp_customers_list',
+      ...SANDBOX_TOOL_NAMES,
+      'delayed_count',
+    ]);
+    const listed = (await (await connect(entries)).listTools()).tools;
+    const script = listed.find((t) => t.name === 'delayed_count')!;
+    expect(script.description).toBe('Count delayed orders');
+    expect(script.inputSchema.required).toEqual(['status']);
+    expect((script.inputSchema.properties as any).status).toMatchObject({
+      type: 'string',
+      enum: ['delayed', 'ok'],
+      description: 'Order status',
+    });
+    expect(script.annotations).toMatchObject({ readOnlyHint: true, openWorldHint: true });
+  });
+
+  it('runs the script with the arguments and returns its result as it is', async () => {
+    const { controller, scripts } = makeController();
+    scripts.getByName.mockResolvedValue(saved);
+    const client = await connect((controller as any).planToolSet(baseParams({ sandboxScripts: [exposed()] })));
+    const res: any = await client.callTool({ name: 'delayed_count', arguments: { status: 'delayed' } });
+    expect(res.isError).toBeFalsy();
+    expect(JSON.parse(res.content[0].text)).toEqual({ n: 750 });
+    expect(res.structuredContent).toEqual({ n: 750 });
+    expect(scripts.recordRun).toHaveBeenCalledTimes(1);
+  });
+
+  it('refuses arguments that break the schema before the script runs', async () => {
+    const { controller, scripts } = makeController();
+    scripts.getByName.mockResolvedValue(saved);
+    const client = await connect((controller as any).planToolSet(baseParams({ sandboxScripts: [exposed()] })));
+    const res: any = await client.callTool({ name: 'delayed_count', arguments: { status: 'lost' } }).catch((e) => ({ thrown: e }));
+    expect(res.thrown || res.isError).toBeTruthy();
+    expect(scripts.getByName).not.toHaveBeenCalled();
+  });
+
+  it('keeps a connector tool of the same name and skips the script', async () => {
+    const { controller } = makeController();
+    const clash = tool('t9', 'delayed_count');
+    const entries = (controller as any).planToolSet(
+      baseParams({ serverTools: [ORDERS, clash], sandboxScripts: [exposed()] }),
+    );
+    expect(names(entries).filter((n) => n === 'delayed_count')).toHaveLength(1);
+    // Registering every entry on a real server must not throw on a duplicate.
+    const listed = (await (await connect(entries)).listTools()).tools;
+    expect(listed.filter((t) => t.name === 'delayed_count')).toHaveLength(1);
+  });
+
+  it('offers no script tool when the kill switch is on', () => {
+    process.env.SANDBOX_ENABLED = 'false';
+    try {
+      const { controller } = makeController();
+      const entries = (controller as any).planToolSet(baseParams({ sandboxScripts: [exposed()] }));
+      expect(names(entries)).not.toContain('delayed_count');
+    } finally {
+      delete process.env.SANDBOX_ENABLED;
+    }
+  });
+});

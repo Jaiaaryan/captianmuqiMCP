@@ -1412,6 +1412,13 @@ model SandboxScript {
   description String? @db.Text
   code        String  @db.Text
   version     Int     @default(1)
+  /// JSON Schema object of the arguments the script reads (`args.<name>`), or
+  /// null. Non-null: the script is also offered as an MCP tool of its own name.
+  parameters  Json?   @map("parameters")
+  /// Level 3 switches, `{ env?: boolean, http?: boolean }`, or null (Level 2:
+  /// tools only). `env`: the run gets the variables of the declared connectors;
+  /// `http`: it gets `http.fetch`, limited to those connectors' base URLs.
+  capabilities Json?  @map("capabilities")
 
   lastRunAt   DateTime? @map("last_run_at")
   lastRunOk   Boolean?  @map("last_run_ok")

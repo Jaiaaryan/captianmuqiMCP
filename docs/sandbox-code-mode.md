@@ -18,6 +18,7 @@ caller has authenticated to. The shared `/mcp` endpoint and the public
 - [Read-only by default](#read-only-by-default)
 - [Saved scripts](#saved-scripts)
 - [Connectors and tools of a saved script](#connectors-and-tools-of-a-saved-script)
+- [Scripts as tools](#scripts-as-tools)
 - [Dashboard and REST API](#dashboard-and-rest-api)
 - [Limits and configuration](#limits-and-configuration)
 - [Errors](#errors)
@@ -29,7 +30,8 @@ caller has authenticated to. The shared `/mcp` endpoint and the public
 
 ## Tools
 
-Four tools are added to the server's tool list, after the connector tools. A
+Four tools are added to the server's tool list, after the connector tools, and
+then one more for each [saved script with parameters](#scripts-as-tools). A
 connector tool that already uses one of these names keeps its name and the code
 mode tool of that name is not registered.
 
@@ -187,6 +189,54 @@ Limits: 20 connectors and 100 tools per script. When two connectors of one serve
 have a tool of the same name, only the first can be called from a script (the same
 rule as for every script), so a saved script that needs the other one cannot use it.
 
+## Scripts as tools
+
+A saved script that reads its arguments becomes a tool of its own, so an agent can
+call `stuck_orders { days: 30 }` directly instead of
+`sandbox_run_script { scriptName: "stuck_orders", args: { days: 30 } }`.
+
+- **The parameters come from the code.** A script that reads `args.days`,
+  `args['as_of']` or `const { days, as_of = 'today' } = args` gets a parameter of
+  that name for each. Comments and strings are ignored. On every save the host reads
+  the code again: a newly found name is added as a required `string`, and a name the
+  code no longer reads is dropped.
+- **You set what they are.** In the editor, under the code, one table lists the
+  parameters. Set each one's **type** (`string`, `number`, `integer`, `boolean`,
+  `array`, `object`), whether it is **required** and a **description** the agent
+  reads. What you set is kept when the code changes, as long as the code still reads
+  the name. To keep a parameter the code does not read (for example one it reads
+  through `args[name]`), mark it `"x-keep": true` in the REST `parameters`.
+- **Where it is offered.** The script is listed as a tool **of its own name**, next
+  to `sandbox_run_script`, on every server that has all the connectors the script
+  uses (the same rule as `sandbox_list_scripts`). Its description is the script's
+  description, or `Saved script <name> v<version>`. A connector tool or a
+  `sandbox_*` tool of the same name keeps the name and the script is not listed as
+  a tool (it can still be run with `sandbox_run_script`); rename the script.
+- **Same authority, same policy.** A call runs exactly like
+  `sandbox_run_script { scriptName, args }`: with the authority of the caller, with
+  access checked again for that call, able to call only the tools the script
+  declares, and recorded in the run history and the audit log with the run's id. The
+  tool is labelled read-only while writes are off (the default), as the run tool is.
+  The agent's arguments are checked against the parameters before the script runs.
+- **The result is the script's own.** The tool returns what the script returns, as
+  JSON text (and as structured content when it is an object), not the run's wrapper.
+  A failed script comes back as a tool error with its `code` and `hint`.
+- **Fresh on the next tool list.** The set is read from the database whenever a
+  tool list is built, so a script saved a moment ago is in the next request's list
+  (the default, stateless mode). With `MCP_STATEFUL_SESSIONS=true`, a session keeps
+  the list it was created with until it reconciles: saving or deleting a script in
+  the dashboard makes every live session reconcile and send
+  `notifications/tools/list_changed`; a script saved by an agent with
+  `sandbox_create_script` appears in other live sessions the next time one
+  reconciles (a connector reload or a server's connector change does it) or when the
+  client reconnects. Each tool's signature covers its description and parameters, so
+  a changed script is registered again, and a deleted one is removed.
+
+A script that reads no argument has no parameters and is run only by name. Saving
+parameters or code that cannot be exposed (more than 20 parameters, for instance)
+saves the script anyway and says why it is not offered as a tool. In the REST API,
+`parameters: null` starts the parameters over from the code.
+
 ### Upgrading
 
 The migration `sandbox_script_connectors` moves existing scripts to the
@@ -217,10 +267,10 @@ another organization answers `404`, never `403`.
 | Route | Does |
 |-------|------|
 | `POST /servers/:serverId/run` | Run `code` or a saved `scriptId` (exactly one), with optional `args` and `timeoutMs`. A failing script still answers `200` with `ok: false`; `409` means the server lacks a connector the saved script uses; `429` means the organization is at `SANDBOX_MAX_CONCURRENT`. Needs ADMIN or EDITOR. |
-| `GET /servers/:serverId/scripts` | The organization's saved scripts (without code unless `includeCode=1`), each with `uses` (connectors and tools) and, for this server, `availableOnServer` and `missingConnectors`. Any role. |
-| `POST /servers/:serverId/scripts` | Save a script, optionally with `uses: [{ connectorId, tools }]`. Tools called in the code are added; the answer has `added` and `warnings`. The code is syntax-checked, not run. The server only settles ambiguous tool names. Needs ADMIN or EDITOR. |
-| `GET /scripts/:scriptId` | One script, with its code and `uses`. |
-| `PATCH /scripts/:scriptId` | Change code, description and/or `uses` (a new list replaces the old). Author only. Needs ADMIN or EDITOR. |
+| `GET /servers/:serverId/scripts` | The organization's saved scripts (without code unless `includeCode=1`), each with `uses` (connectors and tools), `parameters` (the schema of the arguments it reads, or `null`), `inferredParameters` (the names its code reads now) and, for this server, `availableOnServer`, `missingConnectors` and `exposedAsTool` (it has parameters and the server can run it, so agents get it as a tool of its own name). Any role. |
+| `POST /servers/:serverId/scripts` | Save a script, optionally with `uses: [{ connectorId, tools }]` and `parameters`. Tools called in the code are added; the answer has `added` and `warnings`. The code is syntax-checked, not run. The server only settles ambiguous tool names. Needs ADMIN or EDITOR. |
+| `GET /scripts/:scriptId` | One script, with its code, `uses`, `parameters` and `inferredParameters`. |
+| `PATCH /scripts/:scriptId` | Change code, description, `uses` (a new list replaces the old) and/or `parameters` (replaces the schema; the names the code reads are merged in; `null` starts over from the code). Author only. Needs ADMIN or EDITOR. |
 | `DELETE /scripts/:scriptId` | Delete. Its author or an ADMIN. Answers `204`. |
 | `GET /servers/:serverId/runs?limit=` | Recent runs. An ADMIN sees all of them; anyone else sees their own, because a run keeps a preview of what the connectors returned. |
 | `POST /servers/:serverId/isolation-tests` | Runs the fixed negative-test suite against the live sandbox with synthetic tools. Touches no connector. Needs ADMIN or EDITOR. |
@@ -295,11 +345,29 @@ that come from environment variables are redacted from the stored previews, as f
 any tool call; a token written literally into a connector's configuration is not
 (the same limitation as in the existing audit log).
 
+**Audit of refusals.** A call the bridge refuses before anything runs
+(`TOOL_NOT_ALLOWED`, `WRITE_NOT_ALLOWED`) is recorded in the audit log of the
+caller's workspace, with the run's ID, the tool name, the code and the reason,
+never the arguments. When the name resolves to a tool of the caller's own
+workspace (for example a tool that the caller's role hides), it is a
+`tool_invocations` row with status `ERROR`, an error starting with
+`REFUSED <code>:` and a duration of 0, so it appears on the Audit Log page.
+Otherwise, for a name that belongs to another workspace or to none, it is a
+`TOOL_REFUSED` security event in the caller's workspace, because
+`tool_invocations` needs a tool of that workspace. `GET /api/audit/refusals`
+lists both kinds. A cross-workspace attempt is recorded only in the caller's
+workspace, never in the workspace that owns the tool, and the log does not
+say whether the name exists elsewhere. A refusal repeated within a minute is
+not stored again (a `tool_invocations` row counts it in `repeat_count`), and one
+caller can add at most 20 refusal rows per run, or per minute outside a run
+(`REFUSAL_AUDIT_ROWS_PER_MINUTE`). The same behaviour applies in Cloud and
+self-hosted deployments.
+
 Runs are not pruned automatically; they are removed together with their MCP
 server or organization. A failure to store a run is logged and never turns a
 finished run into an error for the caller.
 
-Saved scripts are stored in `sandbox_scripts`, and the tools each declares in `sandbox_script_tools` (one row per connector and tool; the connector is kept by id and name, not as a foreign key, so that deleting a connector does not erase the dependency). Every query on these tables is
+Saved scripts are stored in `sandbox_scripts` (with their `parameters` schema, a JSON column that is `NULL` when the script reads no argument), and the tools each declares in `sandbox_script_tools` (one row per connector and tool; the connector is kept by id and name, not as a foreign key, so that deleting a connector does not erase the dependency). Every query on these tables is
 filtered by `organizationId`, and all three tables are in the optional row-level
 security script, which is off by default (see
 [Row-level security](operations/row-level-security.md)).
@@ -383,3 +451,97 @@ scaling it.
 Code mode behaves the same in both deployment modes: the same tools, the same
 limits, the same storage. Nothing in it depends on `DEPLOYMENT_MODE`, and it needs
 no extra service, because the isolate runs inside the backend.
+
+## Level 3: scripts with secrets
+
+By default a script reaches the outside world only through the tools of its
+connectors and never sees a credential. A **saved** script can opt in to two
+more things, for the cases a tool does not cover (an endpoint no tool exposes,
+a header the tool does not send):
+
+```json
+"capabilities": { "env": true, "http": true }
+```
+
+Set `capabilities` when saving the script (`POST /api/sandbox/servers/:serverId/scripts`)
+or later (`PATCH /api/sandbox/scripts/:scriptId`). Only the script's author can
+set it, like any other change, and an administrator can switch it on or off on
+anyone's script in a request that changes nothing else. `null`, or both
+switches off, is the default. **Inline code never gets either**: neither
+`sandbox_run_script { code }`, nor the REST run with `code`, nor the benchmark.
+In those runs, and in saved scripts without the capability,
+`typeof env === 'undefined'` and `typeof http === 'undefined'`.
+
+### `env`
+
+A frozen object with the variables of the connectors the script declares under
+*Connectors & tools*, by name, as stored on each connector (decrypted on the
+server for the run). The variables of every other connector of the workspace
+are not there at all. When two declared connectors have a variable of the same
+name, the one of the connector that comes first by name wins.
+
+```js
+const r = await http.fetch(`${env.MOCK_SUPPLIER_URL}/v1/account`, {
+  headers: { 'X-Api-Key': env.MOCK_SUPPLIER_API_KEY },
+});
+if (r.status !== 200) throw new Error(`account: HTTP ${r.status}`);
+return { accountName: r.json.accountName, customerNo: r.json.customerNo };
+```
+
+### `http.fetch(url, { method, headers, body })`
+
+Makes one request from the server and resolves to
+`{ status, headers, text, json? }` (header names lower-cased, `set-cookie`
+removed; `json` when the body parses). A request is refused, in this order, when:
+
+1. the URL is not an absolute `http://` or `https://` URL, or carries user info
+   (`HTTP_NOT_ALLOWED`);
+2. its origin (scheme, host and port) is not the origin of the base URL of one of
+   the declared connectors, with its `{{VAR}}` placeholders filled in
+   (`HTTP_NOT_ALLOWED`, naming the origin). This is decided on the URL alone,
+   before any DNS lookup or connection;
+3. the method is not `GET` or `HEAD` and the instance does not allow writes
+   (`SANDBOX_ALLOW_WRITES=true`, the same policy as write tools;
+   `WRITE_NOT_ALLOWED`);
+4. the run has used up its connector calls (`CONNECTOR_CALL_LIMIT`);
+5. the outbound address policy refuses the host: private, loopback and
+   link-local addresses, `169.254.169.254` among them, unless the host is in
+   `SSRF_ALLOWED_HOSTS` or the administrator's allowlist (`HTTP_NOT_ALLOWED`).
+
+The request then goes through the same SSRF-guarded client as connector calls,
+which checks the address it actually connects to. Redirects are **not** followed:
+a `3xx` comes back to the script with its `location` header, so a redirect cannot
+lead it to another origin. Each request counts as a connector call, waits at most
+`SANDBOX_CONNECTOR_TIMEOUT_MS` (and never past the run's own deadline), may
+return at most `SANDBOX_MAX_CONNECTOR_RESPONSE_BYTES`, and its bytes count toward
+`SANDBOX_MAX_CONNECTOR_BYTES`. The request body may be a string or a JSON value
+(sent as `application/json`), up to 1 MB. A connector the caller's role does not
+fully grant (any of the tools the script declares on it is withheld) gives the
+run neither its variables nor its origin.
+
+The run's `meta.httpCalls` lists each request as `{ origin, path, status, bytes }`,
+never with its query string or headers; `status` is `0` when no answer came back.
+These requests are not tool invocations, so they are recorded in the run (the
+*Runs* tab, `sandbox_runs.meta`) and not in the audit log of tool calls.
+
+### Masking
+
+Every secret value of every declared connector, used by the script or not, is
+replaced by `***` in everything the run hands back: the result, `console.log`
+output, the error message, the run history (`sandbox_runs`) and the MCP tool's
+answer. The URL-encoded, JSON-escaped and base64 forms of each secret are masked
+too. A variable is a secret when its name says so (`*_KEY`, `*_TOKEN`,
+`*PASSWORD*`, ...), when its value looks like a credential, when the adapter uses
+it in a credential slot, or when the connector's authentication settings
+reference it; base URLs are not. Values shorter than six characters are not
+masked.
+
+Masking guards against accidents (`return env.API_KEY`, an API that echoes the
+key), not against a script written to smuggle a secret out by splitting or
+transforming it. That is why only the script's author or an administrator can
+give a script its connectors' secrets, and why the script then runs only the
+code its author saved.
+
+A Level 3 script with parameters is offered as a tool of its own name like any
+other saved script (see [Scripts as tools](#scripts-as-tools)); its description
+and schema are the script's own and contain no secret.
