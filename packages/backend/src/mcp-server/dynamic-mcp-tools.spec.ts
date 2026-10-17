@@ -278,7 +278,10 @@ describe('DynamicMcpTools — tool resolution is scoped to the caller', () => {
     const restEngine = { execute: jest.fn().mockResolvedValue(RAW) };
     const executor = new DynamicMcpTools(
       reg as any,
-      { logInvocation: jest.fn().mockResolvedValue(undefined) } as any,
+      {
+        logInvocation: jest.fn().mockResolvedValue(undefined),
+        logRefusal: jest.fn().mockResolvedValue(undefined),
+      } as any,
       { get: jest.fn().mockResolvedValue(null), set: jest.fn(), incr: jest.fn(), expire: jest.fn(), ttl: jest.fn() } as any,
       { checkLicenseActive: jest.fn().mockResolvedValue(undefined) } as any,
       { isCloud: () => true } as any,
@@ -644,5 +647,95 @@ describe('DynamicMcpTools: the connector id reaches the engine', () => {
     );
     await executor.executeTool('cloudinary_list_images', {});
     expect(mcpClientEngine.execute.mock.calls[0][0].connectorId).toBeUndefined();
+  });
+});
+
+describe('DynamicMcpTools — refusals and processing errors', () => {
+  function withRegistry(tools: RegisteredTool[], audit: Record<string, jest.Mock>) {
+    return new DynamicMcpTools(
+      {
+        getTool: (name: string) => tools.find((t) => t.name === name),
+        getToolForOrg: (name: string) => tools.find((t) => t.name === name),
+        getAllTools: () => tools,
+      } as any,
+      audit as any,
+      { get: jest.fn(), set: jest.fn() } as any,
+      { checkLicenseActive: jest.fn().mockResolvedValue(undefined) } as any,
+      { isCloud: () => false } as any,
+      {} as any,
+      {} as any,
+      {} as any,
+      {} as any,
+      {} as any,
+      {} as any,
+      { scheduleObservationalIngest: jest.fn() } as any,
+    );
+  }
+
+  it('does not prefix a processing failure with "Response mapping failed"', async () => {
+    const { executor } = build(makeTool({ responseProcessing: { version: 9 } }));
+    const res = await executor.executeTool('list_devices', {});
+    expect(res.isError).toBe(true);
+    expect(JSON.parse(res.content[0].text).error).toBe(
+      'Response processing failed: version must be 1',
+    );
+  });
+
+  it('audits a call to an unknown tool as a NOT_FOUND refusal, without its arguments', async () => {
+    const audit = { logInvocation: jest.fn(), logRefusal: jest.fn().mockResolvedValue(undefined) };
+    const executor = withRegistry([], audit);
+    const res = await executor.executeTool('mock_payroll_list_salaries', { secret: 'x' }, {
+      organizationId: 'org-b',
+      userId: 'bob',
+      mcpServerId: 'srv-b',
+      connectorIds: ['conn-b'],
+      sandboxRunId: 'run-1',
+    });
+    expect(res.isError).toBe(true);
+    expect(audit.logRefusal).toHaveBeenCalledWith(
+      expect.objectContaining({
+        organizationId: 'org-b',
+        userId: 'bob',
+        toolName: 'mock_payroll_list_salaries',
+        code: 'NOT_FOUND',
+        sandboxRunId: 'run-1',
+      }),
+    );
+    expect(JSON.stringify(audit.logRefusal.mock.calls[0][0])).not.toContain('secret');
+    expect(audit.logInvocation).not.toHaveBeenCalled();
+  });
+
+  describe('auditRefusedCall', () => {
+    const payroll = { ...makeTool(), id: 'tool-payroll', name: 'mock_payroll_list_salaries', connectorId: 'conn-a' };
+    const ctx = { organizationId: 'org-a', userId: 'carol', mcpServerId: 'srv-a', connectorIds: ['conn-a'] };
+    const call = (name: string) => ({ jsonrpc: '2.0', id: 1, method: 'tools/call', params: { name } });
+
+    it('records ROLE_FORBIDDEN for a server tool the role filter hid, with its id', () => {
+      const audit = { logRefusal: jest.fn().mockResolvedValue(undefined) };
+      const executor = withRegistry([payroll], audit);
+      expect(executor.auditRefusedCall(call('mock_payroll_list_salaries'), new Set(), ctx)).toBe(true);
+      expect(audit.logRefusal).toHaveBeenCalledWith(
+        expect.objectContaining({ code: 'ROLE_FORBIDDEN', requestedToolId: 'tool-payroll', organizationId: 'org-a' }),
+      );
+    });
+
+    it('records NOT_FOUND for a name outside the server, even if another workspace has it', () => {
+      const audit = { logRefusal: jest.fn().mockResolvedValue(undefined) };
+      const executor = withRegistry([payroll], audit);
+      const bobCtx = { organizationId: 'org-b', userId: 'bob', mcpServerId: 'srv-b', connectorIds: ['conn-b'] };
+      expect(executor.auditRefusedCall(call('tool-payroll'), new Set(), bobCtx)).toBe(true);
+      expect(audit.logRefusal).toHaveBeenCalledWith(
+        expect.objectContaining({ code: 'NOT_FOUND', organizationId: 'org-b', requestedToolId: undefined }),
+      );
+    });
+
+    it('ignores registered tools, other methods and batches', () => {
+      const audit = { logRefusal: jest.fn() };
+      const executor = withRegistry([payroll], audit);
+      expect(executor.auditRefusedCall(call('mock_erp_ping'), new Set(['mock_erp_ping']), ctx)).toBe(false);
+      expect(executor.auditRefusedCall({ method: 'tools/list' }, new Set(), ctx)).toBe(false);
+      expect(executor.auditRefusedCall([call('x')], new Set(), ctx)).toBe(false);
+      expect(audit.logRefusal).not.toHaveBeenCalled();
+    });
   });
 });

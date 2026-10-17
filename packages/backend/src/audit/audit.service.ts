@@ -30,12 +30,48 @@ import { InvocationStatus, Prisma } from '../generated/prisma/client';
 import { AdsActivationService } from './ads-activation.service';
 import { FirstSuccessService } from './first-success.service';
 import { AlertsService } from '../alerts/alerts.service';
+import { SecurityEventService, SecurityEvents } from './security-event.service';
+
+/** Why a tool call was refused before anything ran. See AuditService.logRefusal. */
+export type RefusalCode =
+  | 'TOOL_NOT_ALLOWED'
+  | 'WRITE_NOT_ALLOWED'
+  | 'ROLE_FORBIDDEN'
+  | 'NOT_FOUND'
+  | 'CROSS_ORG';
+
+export interface RefusalInput {
+  /** The CALLER's organization: the refusal is recorded in its log. */
+  organizationId?: string;
+  userId?: string;
+  userEmail?: string;
+  mcpServerId?: string;
+  /** The name the caller asked for, as given (it may be a tool id). */
+  toolName: string;
+  /** A tool id the caller passed explicitly, if any. Only used when it is in organizationId. */
+  requestedToolId?: string;
+  code: RefusalCode;
+  reason: string;
+  sandboxRunId?: string;
+  /** JSON, same shape as tool_invocations.client_info. */
+  clientInfo?: string;
+}
+
+const REFUSAL_PREFIX = 'REFUSED ';
+const REFUSAL_REASON_CHARS = 500;
+const REFUSAL_NAME_CHARS = 200;
+/** Refusal rows one caller may add per run (or per minute, outside a run). */
+const REFUSAL_ROWS_PER_WINDOW = envInt('REFUSAL_AUDIT_ROWS_PER_MINUTE', 20);
 
 @Injectable()
 export class AuditService implements OnModuleDestroy {
   private readonly logger = new Logger(AuditService.name);
   /** Recent failures by signature: the row they were stored as, and how many repeats since. */
   private readonly repeats = new Map<string, { rowId: string; since: number; extra: number }>();
+  /** Refusal rows per caller and run (or minute), so a looping script cannot flood the log. */
+  private readonly refusalBudget = new Map<string, { since: number; n: number }>();
+  /** Refusals recorded as security events recently, by signature (they have no repeat counter). */
+  private readonly refusalEvents = new Map<string, number>();
   /** Rows per organisation in the current hour, for the full-payload budget. */
   private volume = { hour: -1, perOrg: new Map<string, number>() };
   private readonly flushTimer: NodeJS.Timeout;
@@ -45,6 +81,7 @@ export class AuditService implements OnModuleDestroy {
     @Optional() private readonly adsActivation?: AdsActivationService,
     @Optional() private readonly alerts?: AlertsService,
     @Optional() private readonly firstSuccess?: FirstSuccessService,
+    @Optional() private readonly securityEvents?: SecurityEventService,
   ) {
     this.flushTimer = setInterval(() => void this.flushRepeats(false), 30_000);
     this.flushTimer.unref?.();
@@ -180,6 +217,215 @@ export class AuditService implements OnModuleDestroy {
     this.logger.debug(
       `Tool invocation: ${data.toolId} [${data.status}] ${data.durationMs ?? 0}ms`,
     );
+  }
+
+  /**
+   * Record a tool call that was refused before anything ran: a sandbox script
+   * asking for a tool outside its allow-list or a write tool in a read-only
+   * run, or a direct call to a tool the caller's role hides or that does not
+   * exist for them. "Refused, audited": the refusal lands in the CALLER's
+   * workspace log, never in the log of the workspace that owns the tool.
+   *
+   * Where it is written:
+   *  - `tool_invocations`, status ERROR, error `REFUSED <code>: <reason>`,
+   *    duration 0, when the tool resolves to a tool of the caller's own
+   *    organization (by `requestedToolId`, else by name or id). This is the
+   *    Audit Log page's table, so a role refusal (carol and payroll in her own
+   *    workspace) shows up there next to the calls that ran. `tool_id` is NOT
+   *    NULL, so this needs such a tool.
+   *  - `security_events`, event TOOL_REFUSED, otherwise: the name is unknown
+   *    in the caller's organization (it belongs to another workspace, or to
+   *    none). Listed with the others by `GET /api/audit/refusals`.
+   *
+   * Only the tool name, the code and the reason are stored, never the
+   * arguments. The code is the caller's: whether a name exists in another
+   * workspace is not looked up, so the log cannot disclose it either.
+   *
+   * Repeats of one refusal (same caller, tool, code and run) inside the
+   * repeat window are counted on the first row (`repeat_count`) or, for
+   * security events, not stored again; and one caller adds at most
+   * REFUSAL_ROWS_PER_WINDOW rows per run or minute. Never throws.
+   */
+  async logRefusal(data: RefusalInput): Promise<void> {
+    try {
+      const toolName = String(data.toolName ?? '').slice(0, REFUSAL_NAME_CHARS);
+      const reason = boundText(String(data.reason ?? '').replace(/\s+/g, ' ').trim(), REFUSAL_REASON_CHARS);
+      const message = `${REFUSAL_PREFIX}${data.code}: ${reason}`;
+      const who = data.userId ?? data.userEmail ?? 'anonymous';
+      const key = `refusal|${data.organizationId ?? ''}|${who}|${toolName}|${data.code}|${data.sandboxRunId ?? ''}`;
+
+      const tool = data.organizationId
+        ? await this.findOrgTool(data.organizationId, toolName, data.requestedToolId)
+        : null;
+
+      if (tool) {
+        if (this.countRepeat(key)) return;
+        if (!this.takeRefusalBudget(data, who)) return;
+        const userId = await this.resolveUserId(data.userId, data.userEmail);
+        const row = await this.prisma.toolInvocation.create({
+          select: { id: true },
+          data: {
+            toolId: tool.id,
+            userId,
+            mcpServerId: data.mcpServerId,
+            organizationId: data.organizationId,
+            connectorId: tool.connectorId,
+            input: { refused: true, toolName } as any,
+            status: 'ERROR' as InvocationStatus,
+            durationMs: 0,
+            error: message,
+            clientInfo: data.clientInfo,
+          },
+        });
+        if (row?.id) await this.startRepeat(key, row.id);
+        return;
+      }
+
+      const seen = this.refusalEvents.get(key);
+      if (seen !== undefined && Date.now() - seen < INVOCATION_REPEAT_WINDOW_MS) return;
+      if (!this.takeRefusalBudget(data, who)) return;
+      this.refusalEvents.set(key, Date.now());
+      if (this.refusalEvents.size > REPEAT_KEYS_MAX) this.refusalEvents.clear();
+      if (!this.securityEvents) {
+        this.logger.warn(`Refusal not recorded (no security event store): ${data.code} ${toolName}`);
+        return;
+      }
+      const userId = await this.resolveUserId(data.userId, data.userEmail);
+      await this.securityEvents.log({
+        event: SecurityEvents.TOOL_REFUSED,
+        actorType: userId ? 'USER' : 'ANONYMOUS',
+        organizationId: data.organizationId ?? null,
+        actorUserId: userId ?? null,
+        metadata: {
+          toolName,
+          code: data.code,
+          reason,
+          error: message,
+          requestedToolId: data.requestedToolId,
+          mcpServerId: data.mcpServerId,
+          sandboxRunId: data.sandboxRunId,
+          userEmail: userId ? undefined : data.userEmail,
+        },
+      });
+    } catch (err: any) {
+      this.logger.warn(`Failed to record refusal ${data?.code} for ${data?.toolName}: ${err?.message ?? err}`);
+    }
+  }
+
+  /** A tool of this organization, by explicit id, else by name or id. Never another org's. */
+  private async findOrgTool(
+    organizationId: string,
+    toolName: string,
+    requestedToolId?: string,
+  ): Promise<{ id: string; connectorId: string } | null> {
+    const select = { id: true, connectorId: true } as const;
+    const inOrg = { connector: { organizationId } };
+    if (requestedToolId) {
+      const byId = await this.prisma.mcpTool.findFirst({ where: { id: requestedToolId, ...inOrg }, select });
+      if (byId) return byId;
+    }
+    if (!toolName) return null;
+    return this.prisma.mcpTool.findFirst({
+      where: { OR: [{ name: toolName }, { id: toolName }], ...inOrg },
+      select,
+    });
+  }
+
+  /** False once this caller has added its share of refusal rows for this run or minute. */
+  private takeRefusalBudget(data: RefusalInput, who: string): boolean {
+    const now = Date.now();
+    const scope = data.sandboxRunId ?? `minute:${Math.floor(now / 60_000)}`;
+    const key = `${data.organizationId ?? ''}|${who}|${scope}`;
+    const entry = this.refusalBudget.get(key);
+    if (!entry || now - entry.since >= 5 * 60_000) {
+      if (this.refusalBudget.size > REPEAT_KEYS_MAX) this.refusalBudget.clear();
+      this.refusalBudget.set(key, { since: now, n: 1 });
+      return true;
+    }
+    entry.n += 1;
+    if (entry.n === REFUSAL_ROWS_PER_WINDOW + 1) {
+      this.logger.warn(
+        `Refusal audit budget reached for one caller (${REFUSAL_ROWS_PER_WINDOW} rows); further refusals in this ${data.sandboxRunId ? 'run' : 'minute'} are not stored.`,
+      );
+    }
+    return entry.n <= REFUSAL_ROWS_PER_WINDOW;
+  }
+
+  /**
+   * The refusals recorded for one organization, newest first: both the
+   * tool_invocations rows and the TOOL_REFUSED security events.
+   */
+  async getRecentRefusals(organizationId: string, limit = 50) {
+    const take = Math.min(Math.max(limit || 50, 1), 200);
+    const [rows, events] = await Promise.all([
+      this.prisma.toolInvocation.findMany({
+        where: { organizationId, status: 'ERROR', error: { startsWith: REFUSAL_PREFIX } },
+        orderBy: { createdAt: 'desc' },
+        take,
+        select: {
+          id: true,
+          createdAt: true,
+          error: true,
+          repeatCount: true,
+          clientInfo: true,
+          mcpServerId: true,
+          tool: { select: { name: true } },
+          user: { select: { email: true } },
+        },
+      }),
+      this.prisma.securityEvent.findMany({
+        where: { organizationId, event: SecurityEvents.TOOL_REFUSED },
+        orderBy: { createdAt: 'desc' },
+        take,
+        select: {
+          id: true,
+          createdAt: true,
+          metadata: true,
+          actorUser: { select: { email: true } },
+        },
+      }),
+    ]);
+    const codeOf = (error: string | null) =>
+      /^REFUSED ([A-Z_]+):/.exec(error ?? '')?.[1] ?? null;
+    const runOf = (clientInfo: string | null) => {
+      try {
+        return (JSON.parse(clientInfo ?? '{}') as { sandboxRunId?: string }).sandboxRunId ?? null;
+      } catch {
+        return null;
+      }
+    };
+    const merged = [
+      ...rows.map((r) => ({
+        id: r.id,
+        source: 'tool_invocation' as const,
+        createdAt: r.createdAt,
+        toolName: r.tool?.name ?? null,
+        code: codeOf(r.error),
+        error: r.error,
+        userEmail: r.user?.email ?? null,
+        mcpServerId: r.mcpServerId,
+        sandboxRunId: runOf(r.clientInfo),
+        repeatCount: r.repeatCount,
+      })),
+      ...events.map((e) => {
+        const m = (e.metadata ?? {}) as Record<string, any>;
+        return {
+          id: e.id,
+          source: 'security_event' as const,
+          createdAt: e.createdAt,
+          toolName: (m.toolName as string) ?? null,
+          code: (m.code as string) ?? null,
+          error: (m.error as string) ?? null,
+          userEmail: e.actorUser?.email ?? (m.userEmail as string) ?? null,
+          mcpServerId: (m.mcpServerId as string) ?? null,
+          sandboxRunId: (m.sandboxRunId as string) ?? null,
+          repeatCount: 1,
+        };
+      }),
+    ];
+    return merged
+      .sort((a, b) => b.createdAt.getTime() - a.createdAt.getTime())
+      .slice(0, take);
   }
 
   /**

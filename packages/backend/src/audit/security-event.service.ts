@@ -74,6 +74,12 @@ export const SecurityEvents = {
    */
   WORKSPACE_SESSIONS_REVOKED: 'WORKSPACE_SESSIONS_REVOKED',
   API_KEY_DEACTIVATED: 'API_KEY_DEACTIVATED',
+  /**
+   * A tool call refused before anything ran, for a tool that does not resolve
+   * in the caller's organization (so no tool_invocations row can hold it).
+   * Written by AuditService.logRefusal into the CALLER's organization.
+   */
+  TOOL_REFUSED: 'TOOL_REFUSED',
 
   // ── Consent plane: which AI client was authorized, by whom ──────────────
   CONSENT_GRANTED: 'CONSENT_GRANTED',

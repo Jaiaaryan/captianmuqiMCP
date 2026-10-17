@@ -205,6 +205,64 @@ export class DynamicMcpTools {
   }
 
   /**
+   * Audits a single `tools/call` that the MCP SDK is about to refuse because
+   * the name is not registered on this caller's per-request server: hidden by
+   * the caller's role (ROLE_FORBIDDEN: a tool of this server's connectors the
+   * role filter removed) or unknown here (NOT_FOUND: another workspace's tool,
+   * or no tool at all; which of the two is deliberately not recorded, so the
+   * caller's own log cannot confirm that a name exists elsewhere).
+   *
+   * Those refusals happen inside the SDK, before executeTool is reached, so
+   * the endpoint controller calls this right after registering the tool set:
+   *   this.toolExecutor.auditRefusedCall(body, handles, invocationContext);
+   * Returns true when a refusal was recorded. Never throws.
+   */
+  auditRefusedCall(
+    body: unknown,
+    registered: { has(name: string): boolean },
+    context: {
+      userId?: string;
+      userEmail?: string;
+      organizationId?: string;
+      authMethod?: string;
+      apiKeyName?: string;
+      mcpServerId?: string;
+      mcpServerName?: string;
+      connectorIds?: string[];
+    },
+  ): boolean {
+    try {
+      const call = body as { method?: unknown; params?: { name?: unknown } } | null;
+      if (!call || Array.isArray(call) || call.method !== 'tools/call') return false;
+      const name = call.params?.name;
+      if (typeof name !== 'string' || registered.has(name)) return false;
+      const connectorIds = context.connectorIds ?? [];
+      const onServer = this.toolRegistry
+        .getAllTools()
+        .find(
+          (t) => connectorIds.includes(t.connectorId) && (t.name === name || t.id === name),
+        );
+      void this.auditService.logRefusal({
+        organizationId: context.organizationId,
+        userId: context.userId,
+        userEmail: context.userEmail,
+        mcpServerId: context.mcpServerId,
+        toolName: name,
+        requestedToolId: onServer?.id,
+        code: onServer ? 'ROLE_FORBIDDEN' : 'NOT_FOUND',
+        reason: onServer
+          ? `Tool '${name}' is not granted by the caller's MCP role.`
+          : `Tool '${name}' is not available on this MCP server.`,
+        clientInfo: refusalClientInfo(context),
+      });
+      return true;
+    } catch (err: any) {
+      this.logger.warn(`Could not audit a refused tool call: ${err?.message ?? err}`);
+      return false;
+    }
+  }
+
+  /**
    * Execute a tool by name with the given parameters.
    * Handles caching, audit logging, env interpolation, and engine dispatch.
    */
@@ -279,6 +337,18 @@ export class DynamicMcpTools {
       tool = this.toolRegistry.getTool(toolName);
     }
     if (!tool) {
+      // Refused before anything ran: recorded in the caller's workspace log.
+      void this.auditService.logRefusal({
+        organizationId: context?.organizationId,
+        userId: context?.userId,
+        userEmail: context?.userEmail,
+        mcpServerId: context?.mcpServerId,
+        toolName,
+        code: 'NOT_FOUND',
+        reason: `Tool '${toolName}' not found in the caller's scope.`,
+        sandboxRunId: context?.sandboxRunId,
+        clientInfo: refusalClientInfo(context),
+      });
       return {
         content: [
           {
@@ -628,7 +698,13 @@ export class DynamicMcpTools {
             {
               type: 'text' as const,
               text: JSON.stringify(
-                { error: `Response mapping failed: ${outcome.error}` },
+                {
+                  // A processing step already names itself; prefixing it again
+                  // read "Response mapping failed: Response processing failed: …".
+                  error: outcome.error.startsWith('Response processing failed:')
+                    ? outcome.error
+                    : `Response mapping failed: ${outcome.error}`,
+                },
                 null,
                 2,
               ),
@@ -891,4 +967,26 @@ export class DynamicMcpTools {
 /** The text of a tool result, which is always its first item. */
 function textOf(content: ToolResultContent | undefined): string | undefined {
   return content?.[0]?.text;
+}
+
+/** client_info for a refusal row: the same fields a call that ran records. */
+function refusalClientInfo(
+  context:
+    | {
+        authMethod?: string;
+        apiKeyName?: string;
+        userEmail?: string;
+        mcpServerName?: string;
+        sandboxRunId?: string;
+      }
+    | undefined,
+): string | undefined {
+  if (!context) return undefined;
+  return JSON.stringify({
+    authMethod: context.authMethod,
+    apiKeyName: context.apiKeyName,
+    userEmail: context.userEmail,
+    mcpServerName: context.mcpServerName,
+    sandboxRunId: context.sandboxRunId,
+  });
 }

@@ -1,7 +1,9 @@
-import { Injectable, Logger } from '@nestjs/common';
+import { Injectable, Logger, Optional } from '@nestjs/common';
 import ivm from 'isolated-vm';
+import { AuditService } from '../audit/audit.service';
 import { SANDBOX_LIMITS, type SandboxLimits } from './limits';
 import { countLines, HINTS, parseSyntaxError, toSandboxError } from './sandbox-errors';
+import { createHttpBridge } from './script-http';
 import {
   RUNTIME_FILE,
   RUNTIME_SOURCE,
@@ -40,6 +42,44 @@ export class SandboxService {
   private readonly logger = new Logger(SandboxService.name);
   /** Runs in flight per organization (the BUSY guard). */
   private readonly active = new Map<string, number>();
+
+  /**
+   * Optional so the service still unit-tests with `new SandboxService()`.
+   * AuditModule is global, so Nest injects it without a module import.
+   */
+  constructor(@Optional() private readonly audit?: AuditService) {}
+
+  /**
+   * Records a bridge refusal in the caller's workspace audit log. Fire and
+   * forget: logRefusal never rejects, and the script's answer never waits on it.
+   */
+  private auditRefusal(
+    req: SandboxRunRequest,
+    code: 'TOOL_NOT_ALLOWED' | 'WRITE_NOT_ALLOWED',
+    toolName: string,
+    reason: string,
+  ): void {
+    const ctx = req.invocationContext;
+    void this.audit
+      ?.logRefusal({
+        organizationId: ctx.organizationId,
+        userId: ctx.userId,
+        userEmail: ctx.userEmail,
+        mcpServerId: ctx.mcpServerId,
+        toolName,
+        code,
+        reason,
+        sandboxRunId: ctx.sandboxRunId,
+        clientInfo: JSON.stringify({
+          authMethod: ctx.authMethod,
+          apiKeyName: ctx.apiKeyName,
+          userEmail: ctx.userEmail,
+          mcpServerName: ctx.mcpServerName,
+          sandboxRunId: ctx.sandboxRunId,
+        }),
+      })
+      .catch(() => undefined);
+  }
 
   async run(req: SandboxRunRequest): Promise<SandboxRunResult> {
     const started = Date.now();
@@ -182,10 +222,14 @@ export class SandboxService {
         if (done) return refuse('TOOL_ERROR', 'The sandbox run has already finished.');
         const name = String(nameArg);
         const tool = allowed.get(name);
-        if (!tool) return refuse('TOOL_NOT_ALLOWED', notAvailable(name, names));
+        if (!tool) {
+          this.auditRefusal(req, 'TOOL_NOT_ALLOWED', name, `Tool '${name}' is not available in this sandbox.`);
+          return refuse('TOOL_NOT_ALLOWED', notAvailable(name, names));
+        }
         // Checked on every call, before anything runs: a tool that may change
         // data is refused unless the trusted policy allows writes.
         if (!tool.readOnly && !allowWrites) {
+          this.auditRefusal(req, 'WRITE_NOT_ALLOWED', name, `Tool '${name}' can change data, and sandbox scripts are read-only.`);
           return refuse(
             'WRITE_NOT_ALLOWED',
             `Tool '${name}' can change data, and sandbox scripts are read-only.`,
@@ -299,8 +343,12 @@ export class SandboxService {
       try {
         const name = String(nameArg);
         const tool = allowed.get(name);
-        if (!tool) return refuse('TOOL_NOT_ALLOWED', notAvailable(name, names));
+        if (!tool) {
+          this.auditRefusal(req, 'TOOL_NOT_ALLOWED', name, `Tool '${name}' is not available in this sandbox (describe).`);
+          return refuse('TOOL_NOT_ALLOWED', notAvailable(name, names));
+        }
         if (!tool.readOnly && !allowWrites) {
+          this.auditRefusal(req, 'WRITE_NOT_ALLOWED', name, `Tool '${name}' can change data, and sandbox scripts are read-only (describe).`);
           return refuse(
             'WRITE_NOT_ALLOWED',
             `Tool '${name}' can change data, and sandbox scripts are read-only.`,
@@ -333,6 +381,19 @@ export class SandboxService {
       await jail.set('__argsJson', argsJson);
       await jail.set('__maxOut', limits.maxOutputBytes);
       await jail.set('__maxLog', limits.maxLogLines);
+      // ---- Level 3 capabilities (saved scripts that opt in; see script-http.ts) ----
+      if (req.env) await jail.set('__envJson', JSON.stringify(req.env));
+      if (req.http) {
+        const httpBridge = createHttpBridge(req.http, {
+          limits,
+          meta,
+          started,
+          isDone: () => done,
+          live: liveCalls,
+        });
+        await jail.set('__http', new ivm.Reference(httpBridge));
+      }
+      // ---- end Level 3 ----
       const runtime = await isolate.compileScript(RUNTIME_SOURCE, { filename: RUNTIME_FILE });
       await runtime.run(context);
 

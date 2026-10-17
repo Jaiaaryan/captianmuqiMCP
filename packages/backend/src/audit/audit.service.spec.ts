@@ -252,4 +252,150 @@ describe('AuditService', () => {
       expect(calls[1000][0].data.status).toBe('SUCCESS');
     });
   });
+
+  describe('logRefusal', () => {
+    let securityEvents: { log: jest.Mock };
+    let svc: AuditService;
+
+    beforeEach(() => {
+      mockPrisma.toolInvocation.create = jest.fn().mockResolvedValue({ id: 'row-1' });
+      mockPrisma.mcpTool = { findFirst: jest.fn().mockResolvedValue(null) };
+      securityEvents = { log: jest.fn().mockResolvedValue(undefined) };
+      svc = new AuditService(mockPrisma, undefined, undefined, undefined, securityEvents as any);
+    });
+
+    afterEach(async () => {
+      await svc.onModuleDestroy();
+    });
+
+    const refusal = {
+      organizationId: 'org-a',
+      userId: 'user-1',
+      mcpServerId: 'srv-a',
+      toolName: 'mock_payroll_list_salaries',
+      code: 'ROLE_FORBIDDEN' as const,
+      reason: 'not granted   by\nrole',
+      sandboxRunId: 'run-1',
+    };
+
+    it('writes a tool_invocations ERROR row when the tool is in the caller org', async () => {
+      mockPrisma.mcpTool.findFirst.mockResolvedValue({ id: 'tool-payroll', connectorId: 'conn-payroll' });
+      await svc.logRefusal(refusal);
+
+      expect(mockPrisma.mcpTool.findFirst).toHaveBeenCalledWith(
+        expect.objectContaining({
+          where: expect.objectContaining({ connector: { organizationId: 'org-a' } }),
+        }),
+      );
+      expect(mockPrisma.toolInvocation.create).toHaveBeenCalledWith(
+        expect.objectContaining({
+          data: expect.objectContaining({
+            toolId: 'tool-payroll',
+            connectorId: 'conn-payroll',
+            organizationId: 'org-a',
+            userId: 'user-1',
+            status: 'ERROR',
+            durationMs: 0,
+            error: 'REFUSED ROLE_FORBIDDEN: not granted by role',
+            input: { refused: true, toolName: 'mock_payroll_list_salaries' },
+          }),
+        }),
+      );
+      expect(securityEvents.log).not.toHaveBeenCalled();
+    });
+
+    it('writes a TOOL_REFUSED security event in the caller org when no org tool matches', async () => {
+      await svc.logRefusal({ ...refusal, organizationId: 'org-b', code: 'TOOL_NOT_ALLOWED', requestedToolId: 'tool-of-a' });
+
+      expect(mockPrisma.toolInvocation.create).not.toHaveBeenCalled();
+      expect(securityEvents.log).toHaveBeenCalledWith(
+        expect.objectContaining({
+          event: 'TOOL_REFUSED',
+          actorType: 'USER',
+          organizationId: 'org-b',
+          actorUserId: 'user-1',
+          metadata: expect.objectContaining({
+            toolName: 'mock_payroll_list_salaries',
+            code: 'TOOL_NOT_ALLOWED',
+            error: 'REFUSED TOOL_NOT_ALLOWED: not granted by role',
+            sandboxRunId: 'run-1',
+          }),
+        }),
+      );
+    });
+
+    it('never stores more than the tool name, code and reason', async () => {
+      mockPrisma.mcpTool.findFirst.mockResolvedValue({ id: 't', connectorId: 'c' });
+      await svc.logRefusal({ ...refusal, args: { password: 'hunter2' } } as any);
+      expect(JSON.stringify(mockPrisma.toolInvocation.create.mock.calls)).not.toContain('hunter2');
+    });
+
+    it('counts a repeat on the first row instead of writing another', async () => {
+      mockPrisma.mcpTool.findFirst.mockResolvedValue({ id: 't', connectorId: 'c' });
+      await svc.logRefusal(refusal);
+      await svc.logRefusal(refusal);
+      expect(mockPrisma.toolInvocation.create).toHaveBeenCalledTimes(1);
+      await svc.flushRepeats(true);
+      expect(mockPrisma.toolInvocation.update).toHaveBeenCalledWith({
+        where: { id: 'row-1' },
+        data: { repeatCount: { increment: 1 } },
+      });
+    });
+
+    it('caps the rows one caller can add in a run', async () => {
+      for (let i = 0; i < 50; i++) {
+        await svc.logRefusal({ ...refusal, toolName: `tool_${i}`, code: 'TOOL_NOT_ALLOWED' });
+      }
+      expect(securityEvents.log).toHaveBeenCalledTimes(20);
+    });
+
+    it('never throws, whatever fails', async () => {
+      mockPrisma.mcpTool.findFirst.mockRejectedValue(new Error('DB down'));
+      await expect(svc.logRefusal(refusal)).resolves.toBeUndefined();
+      mockPrisma.mcpTool.findFirst.mockResolvedValue({ id: 't', connectorId: 'c' });
+      mockPrisma.toolInvocation.create.mockRejectedValue(new Error('DB down'));
+      await expect(svc.logRefusal({ ...refusal, toolName: 'other' })).resolves.toBeUndefined();
+      await expect(svc.logRefusal(null as any)).resolves.toBeUndefined();
+    });
+  });
+
+  describe('getRecentRefusals', () => {
+    it('merges both row types of the org, newest first', async () => {
+      mockPrisma.toolInvocation.findMany.mockResolvedValue([
+        {
+          id: 'i1',
+          createdAt: new Date('2026-10-17T10:00:00Z'),
+          error: 'REFUSED ROLE_FORBIDDEN: no',
+          repeatCount: 2,
+          clientInfo: JSON.stringify({ sandboxRunId: 'run-9' }),
+          mcpServerId: 'srv',
+          tool: { name: 'payroll' },
+          user: { email: 'carol@a' },
+        },
+      ]);
+      mockPrisma.securityEvent = {
+        findMany: jest.fn().mockResolvedValue([
+          {
+            id: 'e1',
+            createdAt: new Date('2026-10-17T11:00:00Z'),
+            metadata: { toolName: 'payroll', code: 'TOOL_NOT_ALLOWED', error: 'REFUSED TOOL_NOT_ALLOWED: x' },
+            actorUser: { email: 'bob@b' },
+          },
+        ]),
+      };
+      const rows = await service.getRecentRefusals('org-a');
+      expect(mockPrisma.toolInvocation.findMany).toHaveBeenCalledWith(
+        expect.objectContaining({
+          where: { organizationId: 'org-a', status: 'ERROR', error: { startsWith: 'REFUSED ' } },
+        }),
+      );
+      expect(mockPrisma.securityEvent.findMany).toHaveBeenCalledWith(
+        expect.objectContaining({ where: { organizationId: 'org-a', event: 'TOOL_REFUSED' } }),
+      );
+      expect(rows.map((r) => [r.source, r.code, r.userEmail, r.sandboxRunId])).toEqual([
+        ['security_event', 'TOOL_NOT_ALLOWED', 'bob@b', null],
+        ['tool_invocation', 'ROLE_FORBIDDEN', 'carol@a', 'run-9'],
+      ]);
+    });
+  });
 });

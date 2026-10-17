@@ -514,4 +514,60 @@ describe('SandboxService', () => {
       }
     });
   });
+
+  describe('audit of refusals', () => {
+    const ctx = { ...baseContext, userEmail: 'u@a', sandboxRunId: 'run-42' };
+
+    it('records a TOOL_NOT_ALLOWED refusal with the run id, and no tool runs', async () => {
+      const audit = { logRefusal: jest.fn().mockResolvedValue(undefined) };
+      const audited = new SandboxService(audit as any);
+      const exec = makeExecuteTool();
+      const res = await audited.run({
+        code: `return await tools.mock_payroll_list_salaries({})`,
+        allowedTools: TOOLS,
+        invocationContext: ctx,
+        executeTool: exec.fn,
+      });
+      expect(res.error?.code).toBe('TOOL_NOT_ALLOWED');
+      expect(exec.calls).toHaveLength(0);
+      expect(audit.logRefusal).toHaveBeenCalledWith(
+        expect.objectContaining({
+          organizationId: ORG_A,
+          userId: 'user-1',
+          userEmail: 'u@a',
+          mcpServerId: 'server-1',
+          toolName: 'mock_payroll_list_salaries',
+          code: 'TOOL_NOT_ALLOWED',
+          sandboxRunId: 'run-42',
+        }),
+      );
+    });
+
+    it('records a WRITE_NOT_ALLOWED refusal for a write tool in a read-only run', async () => {
+      const audit = { logRefusal: jest.fn().mockResolvedValue(undefined) };
+      const audited = new SandboxService(audit as any);
+      const res = await audited.run({
+        code: `return await tools.erp_orders_delete({})`,
+        allowedTools: [...TOOLS, tool('erp_orders_delete', 'conn-1', false)],
+        invocationContext: ctx,
+        executeTool: makeExecuteTool().fn,
+      });
+      expect(res.error?.code).toBe('WRITE_NOT_ALLOWED');
+      expect(audit.logRefusal).toHaveBeenCalledWith(
+        expect.objectContaining({ code: 'WRITE_NOT_ALLOWED', toolName: 'erp_orders_delete', sandboxRunId: 'run-42' }),
+      );
+    });
+
+    it('still refuses when the audit write fails', async () => {
+      const audit = { logRefusal: jest.fn().mockRejectedValue(new Error('db down')) };
+      const audited = new SandboxService(audit as any);
+      const res = await audited.run({
+        code: `return await tools.nope({})`,
+        allowedTools: TOOLS,
+        invocationContext: ctx,
+        executeTool: makeExecuteTool().fn,
+      });
+      expect(res.error?.code).toBe('TOOL_NOT_ALLOWED');
+    });
+  });
 });

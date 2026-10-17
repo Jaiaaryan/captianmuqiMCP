@@ -36,6 +36,22 @@ export class AuditController {
     );
   }
 
+  @Get('refusals')
+  @ApiOperation({
+    summary: 'List refused tool calls of this workspace',
+    description:
+      'Tool calls refused before anything ran (sandbox allow-list, read-only ' +
+      'runs, role and unknown-tool refusals), recorded in the caller\'s ' +
+      'workspace: tool_invocations rows and TOOL_REFUSED security events, newest first.',
+  })
+  @ApiQuery({ name: 'limit', required: false, type: Number })
+  async listRefusals(@Req() req: any, @Query('limit') limit?: string) {
+    return this.auditService.getRecentRefusals(
+      req.user.organizationId,
+      limit ? parseInt(limit, 10) : 50,
+    );
+  }
+
   @Get('stats')
   @ApiOperation({ summary: 'Get invocation statistics' })
   async getStats(@Req() req: any) {
