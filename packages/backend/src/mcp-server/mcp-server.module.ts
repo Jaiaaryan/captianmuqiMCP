@@ -34,6 +34,6 @@ const ENGINES = [
   imports: [McpServersModule, LicenseModule, SandboxModule],
   controllers: [McpEndpointController, WellKnownOAuthController, RegistryCatchUpController],
   providers: [SharedSetupRegistry, McpServerService, ToolRegistry, DynamicMcpTools, McpCombinedAuthGuard, McpPrincipalRateLimitGuard, OAuth2TokenService, LoginTokenService, GraphqlSchemaService, ...ENGINES],
-  exports: [McpServerService, ToolRegistry, SharedSetupRegistry, OAuth2TokenService],
+  exports: [McpServerService, ToolRegistry, DynamicMcpTools, SharedSetupRegistry, OAuth2TokenService],
 })
 export class McpServerModule {}

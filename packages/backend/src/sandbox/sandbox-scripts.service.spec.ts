@@ -318,5 +318,91 @@ describe('SandboxScriptsService', () => {
       await service.listRuns(ORG, SERVER, Number.NaN);
       expect(prisma.sandboxRun.findMany.mock.calls.map((c) => c[0].take)).toEqual([200, 1, 50]);
     });
+
+    it('lists every run of the server unless narrowed to one user', async () => {
+      await service.listRuns(ORG, SERVER);
+      await service.listRuns(ORG, SERVER, 10, 'u1');
+      expect(prisma.sandboxRun.findMany.mock.calls[0][0].where).toEqual({
+        organizationId: ORG,
+        mcpServerId: SERVER,
+      });
+      expect(prisma.sandboxRun.findMany.mock.calls[1][0].where).toEqual({
+        organizationId: ORG,
+        mcpServerId: SERVER,
+        userId: 'u1',
+      });
+    });
+  });
+
+  describe('dashboard access (by id)', () => {
+    it('finds a script only on the server it belongs to', async () => {
+      prisma.sandboxScript.findFirst.mockResolvedValueOnce({ id: 'sc-1', mcpServerId: SERVER });
+      await service.getForServer(ORG, SERVER, 'sc-1');
+      expect(prisma.sandboxScript.findFirst.mock.calls[0][0].where).toEqual({
+        id: 'sc-1',
+        organizationId: ORG,
+        mcpServerId: SERVER,
+      });
+      await expect(service.getForServer(ORG, 'srv-2', 'sc-1')).rejects.toBeInstanceOf(
+        NotFoundException,
+      );
+    });
+
+    it('lets the author edit by id', async () => {
+      prisma.sandboxScript.findFirst.mockResolvedValueOnce({ id: 'sc-1', name: 'abc', createdById: 'u1' });
+      await service.updateByIdAsAuthor(ORG, 'sc-1', { code: 'return 2' }, 'u1');
+      expect(prisma.sandboxScript.findFirst.mock.calls[0][0].where).toEqual({
+        id: 'sc-1',
+        organizationId: ORG,
+      });
+      expect(prisma.sandboxScript.update.mock.calls[0][0]).toMatchObject({
+        where: { id: 'sc-1', organizationId: ORG },
+        data: { code: 'return 2', version: { increment: 1 } },
+      });
+    });
+
+    it('refuses an edit by anyone but the author, administrators included', async () => {
+      prisma.sandboxScript.findFirst.mockResolvedValueOnce({ id: 'sc-1', name: 'abc', createdById: 'u-low' });
+      await expect(
+        service.updateByIdAsAuthor(ORG, 'sc-1', { code: 'await tools.x({})' }, 'u-admin'),
+      ).rejects.toBeInstanceOf(ForbiddenException);
+      expect(prisma.sandboxScript.update).not.toHaveBeenCalled();
+    });
+
+    it('does not edit a script of another organization', async () => {
+      await expect(
+        service.updateByIdAsAuthor('org-b', 'sc-1', { code: 'x' }, 'u1'),
+      ).rejects.toBeInstanceOf(NotFoundException);
+      expect(prisma.sandboxScript.update).not.toHaveBeenCalled();
+    });
+
+    it('lets the author delete their script', async () => {
+      prisma.sandboxScript.findFirst.mockResolvedValueOnce({ id: 'sc-1', createdById: 'u1' });
+      await service.removeAsUser(ORG, 'sc-1', { userId: 'u1', isAdmin: false });
+      expect(prisma.sandboxScript.deleteMany).toHaveBeenCalledWith({
+        where: { id: 'sc-1', organizationId: ORG },
+      });
+    });
+
+    it('lets an administrator delete anyone\'s script', async () => {
+      prisma.sandboxScript.findFirst.mockResolvedValueOnce({ id: 'sc-1', createdById: 'u-low' });
+      await service.removeAsUser(ORG, 'sc-1', { userId: 'u-admin', isAdmin: true });
+      expect(prisma.sandboxScript.deleteMany).toHaveBeenCalledTimes(1);
+    });
+
+    it('refuses a delete by someone who is neither the author nor an administrator', async () => {
+      prisma.sandboxScript.findFirst.mockResolvedValueOnce({ id: 'sc-1', createdById: 'u1' });
+      await expect(
+        service.removeAsUser(ORG, 'sc-1', { userId: 'u2', isAdmin: false }),
+      ).rejects.toBeInstanceOf(ForbiddenException);
+      expect(prisma.sandboxScript.deleteMany).not.toHaveBeenCalled();
+    });
+
+    it('does not delete a script of another organization, even for an administrator', async () => {
+      await expect(
+        service.removeAsUser('org-b', 'sc-1', { userId: 'u-admin', isAdmin: true }),
+      ).rejects.toBeInstanceOf(NotFoundException);
+      expect(prisma.sandboxScript.deleteMany).not.toHaveBeenCalled();
+    });
   });
 });

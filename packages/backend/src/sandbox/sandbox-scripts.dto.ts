@@ -1,5 +1,7 @@
 import { ApiProperty, ApiPropertyOptional } from '@nestjs/swagger';
+import { Type } from 'class-transformer';
 import {
+  IsIn,
   IsInt,
   IsObject,
   IsOptional,
@@ -80,6 +82,23 @@ export class RunSandboxDto {
   @Min(SANDBOX_TIMEOUT_RANGE_MS.min)
   @Max(SANDBOX_TIMEOUT_RANGE_MS.max)
   timeoutMs?: number;
+}
+
+export class ListSandboxScriptsQueryDto {
+  @ApiPropertyOptional({ description: 'Set to 1 to include each script\'s code.', enum: ['1', 'true', '0', 'false'] })
+  @IsOptional()
+  @IsIn(['1', 'true', '0', 'false'])
+  includeCode?: string;
+}
+
+export class ListSandboxRunsQueryDto {
+  @ApiPropertyOptional({ minimum: 1, maximum: 200, default: 50 })
+  @IsOptional()
+  @Type(() => Number)
+  @IsInt()
+  @Min(1)
+  @Max(200)
+  limit?: number;
 }
 
 export class BenchmarkDto {

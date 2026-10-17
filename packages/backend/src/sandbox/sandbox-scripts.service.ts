@@ -72,6 +72,15 @@ export class SandboxScriptsService {
     return script;
   }
 
+  /** One script of one MCP server; a script id from another server is not found. */
+  async getForServer(organizationId: string, mcpServerId: string, id: string) {
+    const script = await this.prisma.sandboxScript.findFirst({
+      where: { id, organizationId, mcpServerId },
+    });
+    if (!script) throw new NotFoundException('Script not found');
+    return script;
+  }
+
   getByName(organizationId: string, mcpServerId: string, name: string) {
     return this.prisma.sandboxScript.findFirst({
       where: { organizationId, mcpServerId, name },
@@ -150,10 +159,27 @@ export class SandboxScriptsService {
   ) {
     const script = await this.getByName(organizationId, mcpServerId, name);
     if (!script) throw new NotFoundException(`Script '${name}' not found`);
-    if ((script.createdById ?? null) !== (editorUserId ?? null)) {
+    if (!isAuthor(script, editorUserId)) {
       throw new ForbiddenException(
         `Script '${name}' was created by someone else, so only they can edit it. ` +
           'Save your own copy under a new name with sandbox_create_script.',
+      );
+    }
+    return this.update(organizationId, script.id, patch);
+  }
+
+  /** `updateByName` for the dashboard API: same author-only rule, addressed by id. */
+  async updateByIdAsAuthor(
+    organizationId: string,
+    id: string,
+    patch: { code?: string; description?: string },
+    editorUserId: string | undefined,
+  ) {
+    const script = await this.get(organizationId, id);
+    if (!isAuthor(script, editorUserId)) {
+      throw new ForbiddenException(
+        `Script '${script.name}' was created by someone else, so only they can edit it. ` +
+          'Save your own copy under a new name.',
       );
     }
     return this.update(organizationId, script.id, patch);
@@ -166,9 +192,31 @@ export class SandboxScriptsService {
     if (count === 0) throw new NotFoundException('Script not found');
   }
 
-  listRuns(organizationId: string, mcpServerId: string, limit = 50) {
+  /**
+   * Delete for the dashboard API. The author may delete their script and an
+   * administrator may clear out anyone's; deleting plants no code, so unlike
+   * editing it needs no author-only rule for administrators.
+   */
+  async removeAsUser(
+    organizationId: string,
+    id: string,
+    actor: { userId: string | undefined; isAdmin: boolean },
+  ): Promise<void> {
+    const script = await this.get(organizationId, id);
+    if (!actor.isAdmin && !isAuthor(script, actor.userId)) {
+      throw new ForbiddenException('Only the script\'s author or an administrator can delete it');
+    }
+    await this.remove(organizationId, script.id);
+  }
+
+  /**
+   * Newest runs first. A run keeps a preview of what the connectors returned, so
+   * `onlyUserId` narrows the list to one caller's own runs; a caller whose tool
+   * access is narrower than another's must not read that other's results.
+   */
+  listRuns(organizationId: string, mcpServerId: string, limit = 50, onlyUserId?: string) {
     return this.prisma.sandboxRun.findMany({
-      where: { organizationId, mcpServerId },
+      where: { organizationId, mcpServerId, ...(onlyUserId !== undefined && { userId: onlyUserId }) },
       orderBy: { createdAt: 'desc' },
       take: Math.min(Math.max(Math.trunc(limit) || 50, 1), MAX_RUNS_PAGE),
     });
@@ -223,6 +271,11 @@ export class SandboxScriptsService {
       return null;
     }
   }
+}
+
+/** A script with no recorded author is editable only by a caller with no identity either. */
+function isAuthor(script: { createdById: string | null }, userId: string | undefined): boolean {
+  return (script.createdById ?? null) === (userId ?? null);
 }
 
 function isUniqueViolation(err: unknown): boolean {

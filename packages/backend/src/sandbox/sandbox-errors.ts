@@ -100,7 +100,9 @@ export function toSandboxError(err: unknown, ctx: ClassifyContext): SandboxError
     ...extra,
   });
 
-  if (/due to memory limit/.test(raw)) {
+  // The heap kill, and the allocation failures V8 reports when a script asks
+  // for more buffer or string memory than the isolate may hold.
+  if (/due to memory limit|Array buffer allocation failed|Invalid string length/.test(raw)) {
     return withHint('MEMORY_LIMIT', `Script exceeded the ${ctx.memoryMb} MB memory limit.`);
   }
   if (ctx.timedOut || /Script execution timed out/.test(raw)) {

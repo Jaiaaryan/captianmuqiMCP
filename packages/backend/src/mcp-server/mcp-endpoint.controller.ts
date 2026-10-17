@@ -83,7 +83,8 @@ import {
   SANDBOX_RUN_TOOL,
   buildSandboxToolEntries,
 } from '../sandbox/sandbox-tools';
-import type { SandboxTool } from '../sandbox/types';
+import { isSandboxEnabled } from '../sandbox/limits';
+import { toSandboxTools, visibleServerTools } from './visible-tools';
 import { readFileSync } from 'node:fs';
 import { dirname, join } from 'node:path';
 
@@ -1519,40 +1520,29 @@ export class McpEndpointController {
     } = params;
     const entries: ToolEntry[] = [];
     const registeredNames = new Set<string>();
-    // Tools that survive every filter below: exactly what a sandbox script may call.
-    const sandboxVisible: SandboxTool[] = [];
 
-    for (const tool of serverTools) {
-      // A connector that is not set up yet would only produce errors.
-      if (!isListable(tool)) continue;
-      // Skip tools not allowed by role
-      if (allowedToolIds !== null && !allowedToolIds.includes(tool.id)) continue;
-      // Dedupe by tool name. Two connectors can expose the same name (same
-      // connector assigned twice, or two configs of one provider); the SDK
-      // throws on the second registration, which would 500 the whole request.
-      if (registeredNames.has(tool.name)) {
-        // Once an hour per server and name: the tool set is planned on every
-        // request, and one polling client turned this into 1,880 lines in 16 h.
-        if (this.shouldWarnDuplicate(`${invocationContext.mcpServerId}:${tool.name}`)) {
-          this.logger.warn(
-            `Duplicate tool name "${tool.name}" on server ${invocationContext.mcpServerId} — skipping the extra copy (check for duplicate connector assignments).`,
-          );
-        }
-        continue;
+    // Connector set up, allowed by role, first of each name. Two connectors can
+    // expose the same name (same connector assigned twice, or two configs of one
+    // provider); the SDK throws on the second registration, which would 500 the
+    // whole request. The sandbox REST API selects with the same function, so a
+    // script can only reach tools that this list shows the caller.
+    const visibleTools = visibleServerTools(serverTools, allowedToolIds, (tool) => {
+      // Once an hour per server and name: the tool set is planned on every
+      // request, and one polling client turned this into 1,880 lines in 16 h.
+      if (this.shouldWarnDuplicate(`${invocationContext.mcpServerId}:${tool.name}`)) {
+        this.logger.warn(
+          `Duplicate tool name "${tool.name}" on server ${invocationContext.mcpServerId} — skipping the extra copy (check for duplicate connector assignments).`,
+        );
       }
+    });
+
+    for (const tool of visibleTools) {
       registeredNames.add(tool.name);
 
       const schema = this.stripEnvVarParams(
         tool.parameters,
         tool.connectorConfig.envVars,
       );
-      sandboxVisible.push({
-        name: tool.name,
-        connectorId: tool.connectorId,
-        description: tool.description,
-        parameters: schema,
-        outputSchema: tool.outputSchema,
-      });
       const zodShape = this.jsonSchemaToZodShape(schema);
       if (captureIntent) {
         zodShape._intent = z
@@ -1662,7 +1652,7 @@ export class McpEndpointController {
       this.sandbox &&
       this.sandboxScripts &&
       params.sandboxOrganizationId &&
-      process.env.SANDBOX_ENABLED !== 'false' &&
+      isSandboxEnabled() &&
       invocationContext.mcpServerId &&
       !registeredNames.has(SANDBOX_RUN_TOOL)
     ) {
@@ -1676,7 +1666,8 @@ export class McpEndpointController {
           storageOrganizationId: params.sandboxOrganizationId,
           invocationContext,
         },
-        sandboxVisible,
+        // Exactly what a script may call: the tools that survived every filter above.
+        toSandboxTools(visibleTools),
       );
       // A connector that happens to use one of these names keeps it: a duplicate
       // registration would make the SDK throw and fail the whole request.

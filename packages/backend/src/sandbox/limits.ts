@@ -12,6 +12,11 @@ function envNumber(name: string, fallback: number): number {
   return Number.isFinite(n) && n > 0 ? n : fallback;
 }
 
+/** Code mode is on unless an operator sets SANDBOX_ENABLED to exactly "false". */
+export function isSandboxEnabled(): boolean {
+  return process.env.SANDBOX_ENABLED !== 'false';
+}
+
 export const SANDBOX_LIMITS = {
   /** V8 heap cap of the isolate. */
   memoryMb: envNumber('SANDBOX_MEMORY_MB', 128),
