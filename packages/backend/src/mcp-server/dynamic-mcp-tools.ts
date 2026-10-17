@@ -878,6 +878,7 @@ export class DynamicMcpTools {
           body: await this.databaseEngine.execute(config, endpointMapping, params, {
             readOnly,
             deniedTables: connectorConfig?.deniedTables,
+            maxRows: connectorConfig?.maxRows,
           }),
         };
       }
