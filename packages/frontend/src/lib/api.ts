@@ -1558,6 +1558,16 @@ export interface SandboxRunResponse {
   script?: { id: string; name: string; version: number; ownedByYou: boolean };
 }
 
+/** One connector a saved script uses, and the tools of it the script calls. */
+export interface SandboxScriptUse {
+  connectorId: string;
+  /** The connector's current name, or the name it had when the script was saved. */
+  connectorName: string;
+  /** False once the connector has been deleted: the script still needs it. */
+  connectorExists: boolean;
+  tools: string[];
+}
+
 export interface SandboxScriptSummary {
   id: string;
   name: string;
@@ -1565,6 +1575,14 @@ export interface SandboxScriptSummary {
   version: number;
   createdById: string | null;
   ownedByYou: boolean;
+  /** The connectors and tools the script declares. A saved script can call only these. */
+  uses: SandboxScriptUse[];
+  /**
+   * Whether the MCP server the list was asked about has every connector the script uses,
+   * which is what decides if an agent on that server is offered the script. Only the list has it.
+   */
+  availableOnServer?: boolean;
+  missingConnectors?: { id: string; name: string }[];
   lastRunAt: string | null;
   lastRunOk: boolean | null;
   lastRunMeta: { ms?: number; connectorCalls?: number; bytesFromConnectors?: number; bytesReturned?: number } | null;
@@ -1574,6 +1592,20 @@ export interface SandboxScriptSummary {
 
 export interface SandboxScript extends SandboxScriptSummary {
   code: string;
+}
+
+/** The connectors and tools a person picked for a script. */
+export interface SandboxScriptUseInput {
+  connectorId: string;
+  tools: string[];
+}
+
+/** What saving told us beyond the saved script. */
+export interface SandboxSaveNotes {
+  /** Tools found in the code and added to what was picked, as "Connector / tool". */
+  added: string[];
+  /** Calls in the code that could not be matched to one tool. */
+  warnings: string[];
 }
 
 export interface SandboxSyntax {
@@ -1630,10 +1662,18 @@ export const sandbox = {
     request<SandboxScriptSummary[]>(`/api/sandbox/servers/${serverId}/scripts`, { token }),
   script: (id: string, token: string) =>
     request<SandboxScript>(`/api/sandbox/scripts/${id}`, { token }),
-  createScript: (serverId: string, data: { name: string; code: string; description?: string }, token: string) =>
-    request<SandboxScript & { syntax: SandboxSyntax }>(`/api/sandbox/servers/${serverId}/scripts`, { method: 'POST', body: data, token }),
-  updateScript: (id: string, data: { code?: string; description?: string }, token: string) =>
-    request<SandboxScript & { syntax: SandboxSyntax }>(`/api/sandbox/scripts/${id}`, { method: 'PATCH', body: data, token }),
+  createScript: (
+    serverId: string,
+    data: { name: string; code: string; description?: string; uses?: SandboxScriptUseInput[] },
+    token: string,
+  ) =>
+    request<SandboxScript & { syntax: SandboxSyntax } & SandboxSaveNotes>(`/api/sandbox/servers/${serverId}/scripts`, { method: 'POST', body: data, token }),
+  updateScript: (
+    id: string,
+    data: { code?: string; description?: string; uses?: SandboxScriptUseInput[] },
+    token: string,
+  ) =>
+    request<SandboxScript & { syntax: SandboxSyntax } & SandboxSaveNotes>(`/api/sandbox/scripts/${id}`, { method: 'PATCH', body: data, token }),
   deleteScript: (id: string, token: string) =>
     request<void>(`/api/sandbox/scripts/${id}`, { method: 'DELETE', token }),
   run: (

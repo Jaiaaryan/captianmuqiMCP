@@ -1,5 +1,6 @@
 import {
   BadRequestException,
+  ConflictException,
   ForbiddenException,
   HttpException,
   NotFoundException,
@@ -56,6 +57,17 @@ const failResult = (code: string): SandboxRunResult =>
     meta: { ms: 3, connectorCalls: 0, bytesFromConnectors: 0, bytesReturned: 0, logs: [], toolsCalled: [] },
   }) as SandboxRunResult;
 
+/** A saved script as the service returns it: it declares shop_list_orders of conn-1. */
+const savedScript = (over: Record<string, unknown> = {}) => ({
+  id: 's1',
+  name: 'monthly',
+  version: 3,
+  code: 'return 42',
+  createdById: 'u-admin',
+  uses: [{ connectorId: 'conn-1', connectorName: 'Shop', connectorExists: true, tools: ['shop_list_orders'] }],
+  ...over,
+});
+
 function setup(opts: { allowedToolIds?: string[] | null; server?: any } = {}) {
   const server =
     opts.server === undefined
@@ -66,7 +78,6 @@ function setup(opts: { allowedToolIds?: string[] | null; server?: any } = {}) {
     checkSyntax: jest.fn().mockResolvedValue({ ok: true }),
   };
   const scripts = {
-    getForServer: jest.fn(),
     get: jest.fn(),
     list: jest.fn().mockResolvedValue([]),
     create: jest.fn(),
@@ -140,9 +151,9 @@ describe('SandboxApiController', () => {
   describe('viewers', () => {
     it('can read scripts and runs', async () => {
       const { controller, scripts } = setup();
-      scripts.list.mockResolvedValue([{ id: 's1', createdById: 'u-editor' }]);
+      scripts.list.mockResolvedValue([{ id: 's1', createdById: 'u-editor', uses: [] }]);
       await expect(controller.listScripts(asReq(VIEWER), SERVER, {})).resolves.toEqual([
-        { id: 's1', createdById: 'u-editor', ownedByYou: false },
+        { id: 's1', createdById: 'u-editor', uses: [], ownedByYou: false, availableOnServer: true, missingConnectors: [] },
       ]);
       await expect(controller.runs(asReq(VIEWER), SERVER, {})).resolves.toEqual([]);
     });
@@ -252,16 +263,10 @@ describe('SandboxApiController', () => {
 
     it('runs a saved script by id, shows whose code it was, and records the run against it', async () => {
       const { controller, sandbox, scripts } = setup();
-      scripts.getForServer.mockResolvedValue({
-        id: 's1',
-        name: 'monthly',
-        version: 3,
-        code: 'return 42',
-        createdById: 'u-admin',
-      });
+      scripts.get.mockResolvedValue(savedScript());
       const body: any = await controller.run(asReq(EDITOR), SERVER, { scriptId: 's1' });
 
-      expect(scripts.getForServer).toHaveBeenCalledWith(ORG, SERVER, 's1');
+      expect(scripts.get).toHaveBeenCalledWith(ORG, 's1');
       expect(sandbox.run.mock.calls[0][0].code).toBe('return 42');
       expect(scripts.recordRun).toHaveBeenCalledWith(
         expect.objectContaining({ scriptId: 's1', userId: 'u-editor', code: 'return 42' }),
@@ -269,12 +274,66 @@ describe('SandboxApiController', () => {
       expect(body.script).toEqual({ id: 's1', name: 'monthly', version: 3, ownedByYou: false });
     });
 
-    it('does not find a script that belongs to another server', async () => {
+    it('does not find a script of another organization', async () => {
       const { controller, scripts } = setup();
-      scripts.getForServer.mockRejectedValue(new NotFoundException('Script not found'));
+      scripts.get.mockRejectedValue(new NotFoundException('Script not found'));
       await expect(
-        controller.run(asReq(EDITOR), SERVER, { scriptId: 'other-servers-script' }),
+        controller.run(asReq(EDITOR), 'srv-1', { scriptId: 'other-orgs-script' }),
       ).rejects.toThrow(NotFoundException);
+    });
+
+    describe('the connectors a saved script uses', () => {
+      it('lets the script call only the tools it declared, though the caller may call more', async () => {
+        const { controller, sandbox, scripts } = setup({ allowedToolIds: null });
+        scripts.get.mockResolvedValue(savedScript());
+        await controller.run(asReq(EDITOR), SERVER, { scriptId: 's1' });
+        const names = sandbox.run.mock.calls[0][0].allowedTools.map((t: any) => t.name);
+        expect(names).toEqual(['shop_list_orders']);
+      });
+
+      it('leaves inline code with every tool the caller may call', async () => {
+        const { controller, sandbox } = setup({ allowedToolIds: null });
+        await controller.run(asReq(EDITOR), SERVER, { code: 'return 1' });
+        expect(sandbox.run.mock.calls[0][0].allowedTools).toHaveLength(3);
+      });
+
+      it('refuses, with 409, to run a script on a server that lacks one of its connectors', async () => {
+        const { controller, sandbox, scripts } = setup();
+        scripts.get.mockResolvedValue(
+          savedScript({
+            uses: [
+              { connectorId: 'conn-1', connectorName: 'Shop', connectorExists: true, tools: ['shop_list_orders'] },
+              { connectorId: 'conn-crm', connectorName: 'CRM', connectorExists: true, tools: ['crm_list_leads'] },
+            ],
+          }),
+        );
+        const error = await controller.run(asReq(EDITOR), SERVER, { scriptId: 's1' }).catch((e) => e);
+        expect(error).toBeInstanceOf(ConflictException);
+        expect(error.message).toContain("'CRM'");
+        expect(error.message).toContain("'monthly'");
+        expect(sandbox.run).not.toHaveBeenCalled();
+        expect(scripts.recordRun).not.toHaveBeenCalled();
+      });
+
+      it('refuses a script whose connector has been deleted', async () => {
+        const { controller, scripts } = setup();
+        scripts.get.mockResolvedValue(
+          savedScript({ uses: [{ connectorId: 'gone', connectorName: 'Old CRM', connectorExists: false, tools: ['x'] }] }),
+        );
+        await expect(controller.run(asReq(EDITOR), SERVER, { scriptId: 's1' })).rejects.toThrow(ConflictException);
+      });
+
+      it('tells the user how to declare a tool the saved script tried to call', async () => {
+        const { controller, sandbox, scripts } = setup();
+        scripts.get.mockResolvedValue(savedScript());
+        sandbox.run.mockResolvedValue({
+          ...failResult('TOOL_NOT_ALLOWED'),
+          error: { code: 'TOOL_NOT_ALLOWED', message: 'no', hint: 'Check tools.list().' },
+        });
+        const body: any = await controller.run(asReq(EDITOR), SERVER, { scriptId: 's1' });
+        expect(body.error.hint).toContain('Check tools.list().');
+        expect(body.error.hint).toContain('Connectors & tools');
+      });
     });
 
     it('returns a failed script as a 200 body with the error', async () => {
@@ -407,11 +466,30 @@ describe('SandboxApiController', () => {
     it('marks which scripts the caller wrote', async () => {
       const { controller, scripts } = setup();
       scripts.list.mockResolvedValue([
-        { id: 'a', createdById: 'u-editor' },
-        { id: 'b', createdById: 'u-admin' },
+        { id: 'a', createdById: 'u-editor', uses: [] },
+        { id: 'b', createdById: 'u-admin', uses: [] },
       ]);
       const rows: any[] = await controller.listScripts(asReq(EDITOR), SERVER, {});
       expect(rows.map((r) => r.ownedByYou)).toEqual([true, false]);
+    });
+
+    it('lists every script of the organization and says which ones this server can run', async () => {
+      const { controller, scripts } = setup();
+      const uses = (...c: [string, string][]) =>
+        c.map(([connectorId, connectorName]) => ({ connectorId, connectorName, connectorExists: true, tools: ['t'] }));
+      scripts.list.mockResolvedValue([
+        { id: 'a', createdById: 'u-admin', uses: uses(['conn-1', 'Shop']) },
+        { id: 'b', createdById: 'u-admin', uses: uses(['conn-1', 'Shop'], ['conn-crm', 'CRM']) },
+        { id: 'c', createdById: 'u-admin', uses: [] },
+      ]);
+      const rows: any[] = await controller.listScripts(asReq(EDITOR), SERVER, {});
+      expect(rows.map((r) => [r.id, r.availableOnServer, r.missingConnectors])).toEqual([
+        ['a', true, []],
+        ['b', false, [{ id: 'conn-crm', name: 'CRM' }]],
+        ['c', true, []],
+      ]);
+      // The scripts are the organization's, whichever server is asked about.
+      expect(scripts.list).toHaveBeenCalledWith(ORG, { includeCode: false });
     });
 
     it('returns a script with its code from the right server only', async () => {
@@ -427,7 +505,11 @@ describe('SandboxApiController', () => {
 
     it('creates a script under the caller and reports whether it parses', async () => {
       const { controller, scripts, sandbox } = setup();
-      scripts.create.mockResolvedValue({ id: 's1', name: 'monthly', code: 'return (', version: 1 });
+      scripts.create.mockResolvedValue({
+        script: { id: 's1', name: 'monthly', code: 'return (', version: 1, uses: [] },
+        added: [],
+        warnings: [],
+      });
       sandbox.checkSyntax.mockResolvedValue({ ok: false, line: 1, column: 9, message: 'Unexpected end' });
 
       const body: any = await controller.createScript(asReq(EDITOR), SERVER, {
@@ -435,17 +517,50 @@ describe('SandboxApiController', () => {
         code: 'return (',
       });
 
-      expect(scripts.create).toHaveBeenCalledWith(ORG, SERVER, 'u-editor', {
-        name: 'monthly',
-        code: 'return (',
-      });
+      // Saved for the organization; the server's connectors only settle ambiguous tool names.
+      expect(scripts.create).toHaveBeenCalledWith(
+        ORG,
+        'u-editor',
+        { name: 'monthly', code: 'return (', description: undefined, uses: undefined },
+        { preferConnectorIds: ['conn-1'] },
+      );
       expect(body.syntax).toEqual({ ok: false, line: 1, column: 9, message: 'Unexpected end' });
       expect(body.ownedByYou).toBe(true);
     });
 
+    it('saves the connectors and tools a person picked, and reports what was added from the code', async () => {
+      const { controller, scripts } = setup();
+      scripts.create.mockResolvedValue({
+        script: { id: 's1', name: 'monthly', code: 'x', version: 1, uses: [] },
+        added: ['Shop / shop_list_customers'],
+        warnings: ['tools.nope is not a tool of any connector in this organization.'],
+      });
+      const uses = [{ connectorId: 'conn-1', tools: ['shop_list_orders'] }];
+      const body: any = await controller.createScript(asReq(EDITOR), SERVER, { name: 'monthly', code: 'x', uses });
+      expect(scripts.create.mock.calls[0][2].uses).toEqual(uses);
+      expect(body.added).toEqual(['Shop / shop_list_customers']);
+      expect(body.warnings).toHaveLength(1);
+    });
+
+    it('passes a refused connector or tool through as the service\'s error', async () => {
+      const { controller, scripts } = setup();
+      scripts.create.mockRejectedValue(new BadRequestException("Unknown connector 'c-of-another-org'"));
+      await expect(
+        controller.createScript(asReq(EDITOR), SERVER, {
+          name: 'monthly',
+          code: 'x',
+          uses: [{ connectorId: 'c-of-another-org', tools: ['t'] }],
+        }),
+      ).rejects.toThrow(BadRequestException);
+    });
+
     it('edits through the author-only rule', async () => {
       const { controller, scripts } = setup();
-      scripts.updateByIdAsAuthor.mockResolvedValue({ id: 's1', code: 'return 2', version: 2 });
+      scripts.updateByIdAsAuthor.mockResolvedValue({
+        script: { id: 's1', code: 'return 2', version: 2, uses: [] },
+        added: [],
+        warnings: [],
+      });
       const body: any = await controller.updateScript(asReq(EDITOR), 's1', { code: 'return 2' });
       expect(scripts.updateByIdAsAuthor).toHaveBeenCalledWith(
         ORG,
@@ -523,11 +638,11 @@ describe('SandboxApiController', () => {
     it('leaves the code out unless asked for it', async () => {
       const { controller, scripts } = setup();
       await controller.listScripts(asReq(EDITOR), SERVER, {});
-      expect(scripts.list).toHaveBeenLastCalledWith(ORG, SERVER, { includeCode: false });
+      expect(scripts.list).toHaveBeenLastCalledWith(ORG, { includeCode: false });
       await controller.listScripts(asReq(EDITOR), SERVER, { includeCode: '1' });
-      expect(scripts.list).toHaveBeenLastCalledWith(ORG, SERVER, { includeCode: true });
+      expect(scripts.list).toHaveBeenLastCalledWith(ORG, { includeCode: true });
       await controller.listScripts(asReq(EDITOR), SERVER, { includeCode: '0' });
-      expect(scripts.list).toHaveBeenLastCalledWith(ORG, SERVER, { includeCode: false });
+      expect(scripts.list).toHaveBeenLastCalledWith(ORG, { includeCode: false });
     });
   });
 

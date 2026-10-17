@@ -2,6 +2,7 @@ import { randomUUID } from 'node:crypto';
 import {
   BadRequestException,
   Body,
+  ConflictException,
   Controller,
   Delete,
   ForbiddenException,
@@ -39,6 +40,7 @@ import {
   UpdateSandboxScriptDto,
 } from './sandbox-scripts.dto';
 import { SandboxScriptsService } from './sandbox-scripts.service';
+import { declaredOnly, missingConnectors } from './script-uses.util';
 import { SandboxService } from './sandbox.service';
 import type {
   SandboxInvocationContext,
@@ -121,25 +123,42 @@ export class SandboxApiController {
     }
 
     let code = dto.code as string;
-    const saved = hasId
-      ? await this.scripts.getForServer(server.organizationId, server.id, dto.scriptId as string)
-      : undefined;
+    const saved = hasId ? await this.scripts.get(server.organizationId, dto.scriptId as string) : undefined;
     if (saved) code = saved.code;
 
     const scope = await this.toolScope(req, server);
+    // Scripts are shared by the whole organization, but a server runs one only if
+    // it has every connector the script uses.
+    if (saved) {
+      const missing = missingConnectors(saved.uses, scope.invocationContext.connectorIds);
+      if (missing.length > 0) {
+        throw new ConflictException(
+          `This MCP server does not have ${missing.map((m) => `'${m.name}'`).join(', ')}, ` +
+            `which '${saved.name}' uses. Add the connector to the server or run the script on another one.`,
+        );
+      }
+    }
+    // A saved script can call only the tools it declared.
+    const callable = toSandboxTools(scope.visible);
     // One id for the run: its row in sandbox_runs and the mark on the audit row
     // of each connector call it makes.
     const runId = randomUUID();
     const result = await this.sandbox.run({
       code,
       args: dto.args,
-      allowedTools: toSandboxTools(scope.visible),
+      allowedTools: saved ? declaredOnly(callable, saved.uses) : callable,
       allowWrites: areSandboxWritesAllowed(),
       signal: abortOnDisconnect(res),
       invocationContext: { ...scope.invocationContext, sandboxRunId: runId },
       executeTool: this.executeTool,
       limits: dto.timeoutMs ? { timeoutMs: dto.timeoutMs } : undefined,
     });
+    if (saved && result.error?.code === 'TOOL_NOT_ALLOWED') {
+      result.error.hint = (
+        `${result.error.hint ?? ''} A saved script can call only the tools it declares: add the tool ` +
+        'under Connectors & tools, or run the code directly.'
+      ).trim();
+    }
     await this.scripts.recordRun({
       id: runId,
       organizationId: server.organizationId,
@@ -311,8 +330,11 @@ export class SandboxApiController {
 
   @Get('servers/:serverId/scripts')
   @ApiOperation({
-    summary: 'Saved scripts of this MCP server',
-    description: 'Without their code unless `includeCode=1`.',
+    summary: 'Saved scripts of the organization, as seen from this MCP server',
+    description:
+      'Scripts belong to the organization. Each one lists the connectors and tools it uses and ' +
+      'whether this server has all of those connectors (`availableOnServer`), which is what decides ' +
+      'if an agent on the server is offered it. Without code unless `includeCode=1`.',
   })
   async listScripts(
     @Req() req: DashboardRequest,
@@ -321,14 +343,28 @@ export class SandboxApiController {
   ) {
     const server = await this.serverFor(req, serverId);
     const includeCode = query.includeCode === '1' || query.includeCode === 'true';
-    const rows = await this.scripts.list(server.organizationId, server.id, { includeCode });
-    return rows.map((row) => ({ ...row, ownedByYou: row.createdById === req.user.sub }));
+    const [rows, serverConnectorIds] = await Promise.all([
+      this.scripts.list(server.organizationId, { includeCode }),
+      this.servers.getConnectorIds(server.id),
+    ]);
+    return rows.map((row) => {
+      const missing = missingConnectors(row.uses, serverConnectorIds);
+      return {
+        ...row,
+        ownedByYou: row.createdById === req.user.sub,
+        availableOnServer: missing.length === 0,
+        missingConnectors: missing,
+      };
+    });
   }
 
   @Post('servers/:serverId/scripts')
   @ApiOperation({
     summary: 'Save a script',
-    description: 'The code is syntax-checked, not executed; the result says whether it parses.',
+    description:
+      'The code is syntax-checked, not executed; the result says whether it parses. `uses` lists ' +
+      'the connectors and tools the script calls; tools called as `tools.name(...)` in the code are ' +
+      'added to it, and `added` / `warnings` in the answer say what was found or could not be matched.',
   })
   async createScript(
     @Req() req: DashboardRequest,
@@ -336,13 +372,18 @@ export class SandboxApiController {
     @Body() dto: CreateSandboxScriptDto,
   ) {
     const server = await this.serverFor(req, serverId, { write: true });
-    const script = await this.scripts.create(server.organizationId, server.id, req.user.sub, dto);
+    const { script, added, warnings } = await this.scripts.create(
+      server.organizationId,
+      req.user.sub,
+      { name: dto.name, code: dto.code, description: dto.description, uses: dto.uses },
+      { preferConnectorIds: await this.servers.getConnectorIds(server.id) },
+    );
     const syntax = await this.sandbox.checkSyntax(script.code);
-    return { ...script, ownedByYou: true, syntax: formatSyntax(syntax) };
+    return { ...script, ownedByYou: true, syntax: formatSyntax(syntax), added, warnings };
   }
 
   @Get('scripts/:scriptId')
-  @ApiOperation({ summary: 'One saved script, with its code' })
+  @ApiOperation({ summary: 'One saved script, with its code and the connectors and tools it uses' })
   async getScript(@Req() req: DashboardRequest, @Param('scriptId') scriptId: string) {
     this.requireEnabled();
     const script = await this.scripts.get(req.user.organizationId, scriptId);
@@ -354,7 +395,8 @@ export class SandboxApiController {
     summary: 'Change a saved script',
     description:
       'Only the script\'s author can change it, because a saved script runs with the authority ' +
-      'of whoever runs it. To change someone else\'s script, save your own copy under a new name.',
+      'of whoever runs it. To change someone else\'s script, save your own copy under a new name. ' +
+      '`uses`, when sent, replaces the list of connectors and tools the script declares.',
   })
   async updateScript(
     @Req() req: DashboardRequest,
@@ -362,14 +404,14 @@ export class SandboxApiController {
     @Body() dto: UpdateSandboxScriptDto,
   ) {
     this.requireWriter(req);
-    const script = await this.scripts.updateByIdAsAuthor(
+    const { script, added, warnings } = await this.scripts.updateByIdAsAuthor(
       req.user.organizationId,
       scriptId,
       dto,
       req.user.sub,
     );
     const syntax = await this.sandbox.checkSyntax(script.code);
-    return { ...script, ownedByYou: true, syntax: formatSyntax(syntax) };
+    return { ...script, ownedByYou: true, syntax: formatSyntax(syntax), added, warnings };
   }
 
   @Delete('scripts/:scriptId')

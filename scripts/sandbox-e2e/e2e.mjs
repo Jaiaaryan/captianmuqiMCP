@@ -160,6 +160,114 @@ await check('scripts', 'create, edit and run by name through MCP tools', async (
 });
 
 // ===========================================================================
+// 2b. Scripts declare the connectors and tools they use; servers offer a script only if they have them all
+// ===========================================================================
+const C = S.connectors;
+const mcpJson = (r) => JSON.parse(r.payload.result.content[0].text);
+const offeredOn = async (server) =>
+  mcpJson(await mcp(server, T.admin, 'tools/call', { name: 'sandbox_list_scripts', arguments: {} }, 40)).scripts.map((x) => x.name).sort();
+const cleanup = [];
+await check('connectors', 'a script records the connectors and tools it uses: picked by a person, plus what the code calls', async () => {
+  const c = await http('POST', `${sb(SA)}/scripts`, T.admin, {
+    name: 'uses_both',
+    code: 'const o = await tools.shop_list_orders({ limit: 1 }); const e = await tools.shop_echo({}); return [o.length, typeof e];',
+    uses: [{ connectorId: C.shop, tools: ['shop_list_orders'] }],
+  });
+  expect(c.status === 201, `create: ${c.status} ${JSON.stringify(c.body).slice(0, 200)}`);
+  cleanup.push(c.body.id);
+  const uses = c.body.uses.map((u) => `${u.connectorName}: ${u.tools.join(',')}`).sort();
+  eq(uses, ['Shop API (A): shop_list_orders', 'Shop API (A, authenticated): shop_echo'], 'declared uses');
+  eq(c.body.added, ['Shop API (A, authenticated) / shop_echo'], 'added from the code');
+  const stored = sql(`SELECT count(*) FROM sandbox_script_tools WHERE script_id='${c.body.id}'`);
+  expect(stored === '2', `rows stored: ${stored}`);
+  return { uses };
+});
+await check('connectors', 'a connector of another customer, or a tool the connector lacks, cannot be declared', async () => {
+  const other = await http('POST', `${sb(SA)}/scripts`, T.admin, { name: 'cross_tenant', code: 'return 1', uses: [{ connectorId: C.b, tools: ['shop_list_orders'] }] });
+  const lacking = await http('POST', `${sb(SA)}/scripts`, T.admin, { name: 'wrong_tool', code: 'return 1', uses: [{ connectorId: C.shop, tools: ['shop_echo'] }] });
+  const empty = await http('POST', `${sb(SA)}/scripts`, T.admin, { name: 'no_tools', code: 'return 1', uses: [{ connectorId: C.shop, tools: [] }] });
+  expect(other.status === 400 && /Unknown connector/.test(JSON.stringify(other.body)), `other customer's connector: ${other.status} ${JSON.stringify(other.body)}`);
+  expect(lacking.status === 400 && /has no tool/.test(JSON.stringify(lacking.body)), `tool the connector lacks: ${lacking.status} ${JSON.stringify(lacking.body)}`);
+  expect(empty.status === 400, `connector without tools: ${empty.status}`);
+  const stored = sql(`SELECT count(*) FROM sandbox_scripts WHERE name IN ('cross_tenant','wrong_tool','no_tools')`);
+  expect(stored === '0', `${stored} script(s) were saved anyway`);
+  return { statuses: [other.status, lacking.status, empty.status] };
+});
+await check('connectors', 'a saved script can call only the tools it declared; the same code run inline is not so limited', async () => {
+  const code = "const name = 'shop_' + 'echo'; const e = await tools[name]({}); return typeof e;";
+  const c = await http('POST', `${sb(SA)}/scripts`, T.admin, { name: 'computed_name', code, uses: [{ connectorId: C.shop, tools: ['shop_list_orders'] }] });
+  cleanup.push(c.body.id);
+  expect(c.body.warnings.some((w) => /computed name/.test(w)), `expected a warning about the computed name: ${JSON.stringify(c.body.warnings)}`);
+  const saved = await http('POST', `${sb(SA)}/run`, T.admin, { scriptId: c.body.id });
+  expect(saved.body.ok === false && saved.body.error.code === 'TOOL_NOT_ALLOWED', `saved: ${JSON.stringify(saved.body).slice(0, 300)}`);
+  expect(/Connectors & tools/.test(saved.body.error.hint), `hint: ${saved.body.error.hint}`);
+  const inline = await run(T.admin, SA, code);
+  expect(inline.body.ok === true, `inline: ${JSON.stringify(inline.body).slice(0, 300)}`);
+  // Declaring the tool in the dashboard is what makes the saved script work.
+  const fixed = await http('PATCH', `/api/sandbox/scripts/${c.body.id}`, T.admin, { uses: [{ connectorId: C.shop, tools: ['shop_list_orders'] }, { connectorId: C.auth, tools: ['shop_echo'] }] });
+  expect(fixed.status === 200, `declare: ${fixed.status}`);
+  const again = await http('POST', `${sb(SA)}/run`, T.admin, { scriptId: c.body.id });
+  expect(again.body.ok === true, `after declaring: ${JSON.stringify(again.body).slice(0, 300)}`);
+  return { before: saved.body.error.code, after: 'ok' };
+});
+await check('connectors', 'a server is offered a script only if it has every connector the script uses', async () => {
+  const mk = await http('POST', '/api/mcp-servers', T.admin, { name: 'Auth only' });
+  expect(mk.status === 201, `create server: ${mk.status} ${JSON.stringify(mk.body).slice(0, 200)}`);
+  const authOnly = mk.body.id;
+  cleanup.push({ server: authOnly });
+  await http('PUT', `/api/mcp-servers/${authOnly}/connectors`, T.admin, { connectorIds: [C.auth] });
+  const mkAuth = await http('POST', `${sb(SA)}/scripts`, T.admin, { name: 'auth_only', code: 'return typeof (await tools.shop_echo({}));' });
+  const mkPure = await http('POST', `${sb(SA)}/scripts`, T.admin, { name: 'pure_compute', code: 'return args.n * 2;' });
+  cleanup.push(mkAuth.body.id, mkPure.body.id);
+  const onAuth = await offeredOn(authOnly);
+  const onShop = await offeredOn(SA);
+  for (const n of ['auth_only', 'pure_compute', 'mcp_script']) expect(onAuth.includes(n), `${n} needs only the authenticated connector or none: ${onAuth}`);
+  for (const n of ['uses_both', 'computed_name', 'delayed_orders']) expect(!onAuth.includes(n), `${n} needs a connector this server lacks: ${onAuth}`);
+  for (const n of ['uses_both', 'auth_only', 'pure_compute']) expect(onShop.includes(n), `${n} should be offered on the server that has all connectors: ${onShop}`);
+  // Not offered means not runnable and not editable by an agent either, and the dashboard says so.
+  const hidden = await mcp(authOnly, T.admin, 'tools/call', { name: 'sandbox_run_script', arguments: { scriptName: 'uses_both' } }, 41);
+  expect(hidden.payload.result.isError === true && /not found/.test(hidden.payload.result.content[0].text), `run by name: ${JSON.stringify(hidden.payload).slice(0, 200)}`);
+  const list = await http('GET', `${sb(authOnly)}/scripts`, T.admin);
+  const flags = Object.fromEntries(list.body.map((x) => [x.name, x.availableOnServer]));
+  expect(flags.uses_both === false && flags.auth_only === true && flags.pure_compute === true, `availableOnServer: ${JSON.stringify(flags)}`);
+  const missing = list.body.find((x) => x.name === 'uses_both').missingConnectors.map((m) => m.name);
+  eq(missing, ['Shop API (A)'], 'missing connectors');
+  const rest = await http('POST', `${sb(authOnly)}/run`, T.admin, { scriptId: list.body.find((x) => x.name === 'uses_both').id });
+  expect(rest.status === 409 && /Shop API \(A\)/.test(JSON.stringify(rest.body)), `REST run: ${rest.status} ${JSON.stringify(rest.body).slice(0, 200)}`);
+  return { onAuth, flags };
+});
+await check('connectors', 'a script whose connector was deleted is never offered, and says which connector is gone', async () => {
+  const mk = await http('POST', '/api/connectors', T.admin, { name: 'Temporary CRM', type: 'REST', baseUrl: 'http://127.0.0.1:9101', authType: 'NONE' });
+  await http('POST', `/api/connectors/${mk.body.id}/import`, T.admin, { source: 'json', content: JSON.stringify([{ name: 'crm_list', description: 'x', parameters: { type: 'object', properties: {} }, endpointMapping: { method: 'GET', path: '/orders' } }]) });
+  const c = await http('POST', `${sb(SA)}/scripts`, T.admin, { name: 'needs_crm', code: 'return 1', uses: [{ connectorId: mk.body.id, tools: ['crm_list'] }] });
+  expect(c.status === 201, `create: ${c.status} ${JSON.stringify(c.body).slice(0, 200)}`);
+  cleanup.push(c.body.id);
+  const del = await http('DELETE', `/api/connectors/${mk.body.id}`, T.admin);
+  expect(del.status < 300, `delete connector: ${del.status}`);
+  const row = (await http('GET', `${sb(SA)}/scripts`, T.admin)).body.find((x) => x.name === 'needs_crm');
+  expect(row, 'the script must survive its connector');
+  expect(row.uses[0].connectorExists === false && row.uses[0].connectorName === 'Temporary CRM', `uses: ${JSON.stringify(row.uses)}`);
+  expect(row.availableOnServer === false, 'must not be available on any server');
+  expect(!(await offeredOn(SA)).includes('needs_crm'), 'an agent must not be offered it');
+  return { uses: row.uses };
+});
+await check('connectors', 'scripts are the organization\'s: customer B sees none of A\'s, and may reuse a name', async () => {
+  const list = await http('GET', `${sb(SB)}/scripts`, T.bob);
+  expect(list.status === 200 && list.body.length === 0, `B's list: ${JSON.stringify(list.body).slice(0, 200)}`);
+  const same = await http('POST', `${sb(SB)}/scripts`, T.bob, { name: 'uses_both', code: 'return 1' });
+  expect(same.status === 201, `B reusing the name: ${same.status} ${JSON.stringify(same.body).slice(0, 200)}`);
+  cleanup.push({ bob: same.body.id });
+  const aStill = await http('GET', `${sb(SA)}/scripts`, T.admin);
+  expect(aStill.body.filter((x) => x.name === 'uses_both').length === 1, 'A must still have exactly its own');
+  return { bobScript: same.body.id };
+});
+for (const item of cleanup.reverse()) {
+  if (typeof item === 'string') await http('DELETE', `/api/sandbox/scripts/${item}`, T.admin);
+  else if (item.server) await http('DELETE', `/api/mcp-servers/${item.server}`, T.admin);
+  else if (item.bob) await http('DELETE', `/api/sandbox/scripts/${item.bob}`, T.bob);
+}
+
+// ===========================================================================
 // 3. Read-only by default
 // ===========================================================================
 const refundsBefore = (await upstreamStats()).refunds;
@@ -399,8 +507,9 @@ await check('tenant', 'run history of A and B are separate', async () => {
 });
 await check('tenant', 'in the database every sandbox row carries the right organization', async () => {
   const bad = sql(`SELECT count(*) FROM sandbox_runs r JOIN mcp_server_configs s ON s.id=r.mcp_server_id WHERE s.organization_id <> r.organization_id`);
-  const badScripts = sql(`SELECT count(*) FROM sandbox_scripts r JOIN mcp_server_configs s ON s.id=r.mcp_server_id WHERE s.organization_id <> r.organization_id`);
-  expect(bad === '0' && badScripts === '0', `mismatched rows: ${bad} runs, ${badScripts} scripts`);
+  // Scripts belong to the organization; each declared tool must name a connector of that same organization.
+  const badUses = sql(`SELECT count(*) FROM sandbox_script_tools t JOIN sandbox_scripts s ON s.id=t.script_id LEFT JOIN connectors c ON c.id=t.connector_id WHERE t.organization_id <> s.organization_id OR (c.id IS NOT NULL AND c.organization_id <> t.organization_id)`);
+  expect(bad === '0' && badUses === '0', `mismatched rows: ${bad} runs, ${badUses} declared tools`);
   return { runsOfB: sql(`SELECT count(*) FROM sandbox_runs WHERE organization_id='${S.orgB}'`) };
 });
 

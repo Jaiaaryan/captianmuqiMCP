@@ -5,9 +5,10 @@ roles, Postgres, and connectors that call real (local) upstream servers. The uni
 tests prove the parts; this proves the assembled product, including the claims of
 the Codebound brief: no other customer's data, no internet, no host access.
 
-75 checks in 11 groups: `core`, `scripts`, `read-only`, `isolation` (18 attempts to
-leave the sandbox), `limits`, `deadlines`, `tenant` (two customers), `roles`,
-`secrets`, `audit`, `big` (up to 44 MB). Each check records its evidence;
+81 checks in 12 groups: `core`, `scripts`, `connectors` (the connectors and tools a script
+declares, and the rule that a server offers a script only if it has them all), `read-only`,
+`isolation` (18 attempts to leave the sandbox), `limits`, `deadlines`, `tenant` (two
+customers), `roles`, `secrets`, `audit`, `big` (up to 44 MB). Each check records its evidence;
 [`last-run.json`](last-run.json) is the result of the run described in the review notes.
 
 ## Run it

@@ -1,11 +1,13 @@
 'use client';
 
-import { useCallback, useEffect, useState } from 'react';
+import { useCallback, useEffect, useMemo, useState } from 'react';
 import {
   sandbox,
   type SandboxRunResponse,
+  type SandboxSaveNotes,
   type SandboxScript,
   type SandboxScriptSummary,
+  type SandboxScriptUseInput,
   type SandboxSyntax,
 } from '@/lib/api';
 import { Card } from '@/components/ui/card';
@@ -14,6 +16,9 @@ import { Badge } from '@/components/ui/badge';
 import { cn } from '@/lib/utils';
 import { errorText, formatBytes, formatMs, formatWhen, parseArgs } from './format';
 import { BlockTitle, Pre, RunResultPanel } from './result-panel';
+import { ConnectorFilter, type ConnectorOption } from './connector-filter';
+import { ConnectorPin, ScriptUsesSection } from './script-uses';
+import { UsesPicker } from './uses-picker';
 
 type Mode = 'idle' | 'view' | 'edit' | 'new';
 
@@ -29,6 +34,21 @@ const INPUT =
 
 function syntaxMessage(s: SandboxSyntax): string {
   return `line ${s.line ?? '?'}, column ${s.column ?? '?'}: ${s.message ?? 'syntax error'}`;
+}
+
+/** The message after a save: whether the code parses, what was added from it, what to look at. */
+function saveNotice(
+  saved: { name: string; version: number; syntax: SandboxSyntax },
+  notes: SandboxSaveNotes,
+): { tone: 'ok' | 'warn'; text: string } {
+  const parts = [
+    saved.syntax.ok
+      ? `Saved ${saved.name} (version ${saved.version}). The code parses.`
+      : `Saved ${saved.name}, but the code does not parse (${syntaxMessage(saved.syntax)}).`,
+  ];
+  if (notes.added.length > 0) parts.push(`Also added from the code: ${notes.added.join(', ')}.`);
+  parts.push(...notes.warnings);
+  return { tone: saved.syntax.ok && notes.warnings.length === 0 ? 'ok' : 'warn', text: parts.join(' ') };
 }
 
 export function ScriptsTab({
@@ -47,7 +67,13 @@ export function ScriptsTab({
   const [selectedId, setSelectedId] = useState<string | null>(null);
   const [detail, setDetail] = useState<SandboxScript | null>(null);
   const [mode, setMode] = useState<Mode>('idle');
-  const [draft, setDraft] = useState({ name: '', description: '', code: '' });
+  const [draft, setDraft] = useState<{
+    name: string;
+    description: string;
+    code: string;
+    uses: SandboxScriptUseInput[];
+  }>({ name: '', description: '', code: '', uses: [] });
+  const [filter, setFilter] = useState<string[]>([]);
   const [argsText, setArgsText] = useState('');
   const [running, setRunning] = useState(false);
   const [run, setRun] = useState<SandboxRunResponse | null>(null);
@@ -99,14 +125,19 @@ export function ScriptsTab({
     resetOutput();
     setSelectedId(null);
     setDetail(null);
-    setDraft({ name: '', description: '', code: NEW_SCRIPT_TEMPLATE });
+    setDraft({ name: '', description: '', code: NEW_SCRIPT_TEMPLATE, uses: [] });
     setMode('new');
   };
 
   const startEdit = () => {
     if (!detail) return;
     resetOutput();
-    setDraft({ name: detail.name, description: detail.description ?? '', code: detail.code });
+    setDraft({
+      name: detail.name,
+      description: detail.description ?? '',
+      code: detail.code,
+      uses: detail.uses.map((u) => ({ connectorId: u.connectorId, tools: [...u.tools] })),
+    });
     setMode('edit');
   };
 
@@ -123,19 +154,24 @@ export function ScriptsTab({
         mode === 'new'
           ? await sandbox.createScript(
               serverId,
-              { name: draft.name.trim(), code: draft.code, description: draft.description.trim() || undefined },
+              {
+                name: draft.name.trim(),
+                code: draft.code,
+                description: draft.description.trim() || undefined,
+                uses: draft.uses,
+              },
               token,
             )
-          : await sandbox.updateScript(detail!.id, { code: draft.code, description: draft.description }, token);
+          : await sandbox.updateScript(
+              detail!.id,
+              { code: draft.code, description: draft.description, uses: draft.uses },
+              token,
+            );
       await load();
       setSelectedId(saved.id);
       setDetail(saved);
       setMode('view');
-      setNotice(
-        saved.syntax.ok
-          ? { tone: 'ok', text: `Saved ${saved.name} (version ${saved.version}). The code parses.` }
-          : { tone: 'warn', text: `Saved ${saved.name}, but the code does not parse (${syntaxMessage(saved.syntax)}).` },
-      );
+      setNotice(saveNotice(saved, saved));
     } catch (err) {
       setNotice({ tone: 'error', text: errorText(err) });
     } finally {
@@ -186,18 +222,71 @@ export function ScriptsTab({
   const canEdit = canWrite && !!detail?.ownedByYou;
   const canDelete = canWrite && !!detail && (detail.ownedByYou || isAdmin);
 
+  // Scripts belong to the organization; the selected server decides which of them it can run.
+  const row = scripts?.find((s) => s.id === selectedId);
+  const missing = row?.missingConnectors ?? [];
+  const unavailable = mode === 'view' && !!row && row.availableOnServer === false;
+
+  const options = useMemo<ConnectorOption[]>(() => {
+    const byId = new Map<string, ConnectorOption>();
+    for (const script of scripts ?? []) {
+      for (const u of script.uses) {
+        const o = byId.get(u.connectorId);
+        if (o) o.count += 1;
+        else byId.set(u.connectorId, { id: u.connectorId, name: u.connectorName, count: 1, exists: u.connectorExists });
+      }
+    }
+    return [...byId.values()].sort((a, b) => a.name.localeCompare(b.name));
+  }, [scripts]);
+  // A ticked connector that no script uses any more (it was edited or deleted) filters nothing.
+  const applied = filter.filter((id) => options.some((o) => o.id === id));
+  const shown = scripts?.filter((s) => applied.length === 0 || s.uses.some((u) => applied.includes(u.connectorId)));
+
   return (
     <div className="grid gap-4 lg:grid-cols-[minmax(0,340px)_minmax(0,1fr)]">
       {/* ── List ── */}
       <Card className="self-start overflow-hidden">
-        <div className="flex items-center justify-between border-b border-[var(--border)] px-4 py-3">
-          <div className="text-[13px] font-semibold">Saved scripts</div>
-          {canWrite && (
-            <Button size="sm" variant="secondary" onClick={startNew}>
-              New script
-            </Button>
-          )}
+        <div className="flex items-center justify-between gap-2 border-b border-[var(--border)] px-4 py-3">
+          <div className="min-w-0">
+            <div className="text-[13px] font-semibold">Saved scripts</div>
+            <div className="text-[11px] text-[var(--text-3)]">Shared by your whole organization</div>
+          </div>
+          <div className="flex shrink-0 items-center gap-2">
+            <ConnectorFilter options={options} applied={applied} onApply={setFilter} />
+            {canWrite && (
+              <Button size="sm" variant="secondary" onClick={startNew}>
+                New script
+              </Button>
+            )}
+          </div>
         </div>
+        {applied.length > 0 && (
+          <div
+            data-testid="filter-chips"
+            className="flex flex-wrap items-center gap-1.5 border-b border-[var(--border)] bg-[var(--surface-2)] px-4 py-2"
+          >
+            <span className="text-[11.5px] text-[var(--text-3)]">Connector:</span>
+            {applied.map((id) => (
+              <button
+                key={id}
+                type="button"
+                aria-label={`Remove ${options.find((o) => o.id === id)?.name} from the filter`}
+                onClick={() => setFilter(applied.filter((x) => x !== id))}
+                className="inline-flex items-center gap-1 rounded-full bg-[var(--brand-tint)] px-2 py-[2px] text-[11.5px] font-semibold text-[var(--brand)]"
+              >
+                {options.find((o) => o.id === id)?.name}
+                <span aria-hidden="true">×</span>
+              </button>
+            ))}
+            <button
+              type="button"
+              className="ml-auto text-[11.5px] text-[var(--text-2)] underline hover:text-[var(--text)]"
+              onClick={() => setFilter([])}
+            >
+              Clear
+            </button>
+          </div>
+        )}
         {loadError && <div className="px-4 py-3 text-[12.5px] text-[var(--danger)]">{loadError}</div>}
         {scripts === null && !loadError && <div className="px-4 py-6 text-[12.5px] text-[var(--text-3)]">Loading…</div>}
         {scripts?.length === 0 && (
@@ -206,46 +295,75 @@ export function ScriptsTab({
             {canWrite ? ', or you can write one here.' : '.'}
           </div>
         )}
+        {scripts && scripts.length > 0 && shown?.length === 0 && (
+          <div className="px-4 py-6 text-[12.5px] text-[var(--text-3)]" data-testid="no-match">
+            No script uses the selected connectors.{' '}
+            <button type="button" className="underline" onClick={() => setFilter([])}>
+              Clear the filter
+            </button>
+          </div>
+        )}
+        {applied.length > 0 && scripts && (shown?.length ?? 0) > 0 && (
+          <div className="border-b border-[var(--border)] px-4 py-1.5 text-[11px] text-[var(--text-3)]">
+            Showing {shown?.length} of {scripts.length} scripts
+          </div>
+        )}
         <ul>
-          {scripts?.map((s) => (
-            <li key={s.id}>
-              <button
-                type="button"
-                data-testid="script-row"
-                aria-pressed={selectedId === s.id}
-                onClick={() => void select(s.id)}
-                className={cn(
-                  'flex w-full flex-col gap-1 border-b border-[var(--border)] px-4 py-3 text-left transition-colors hover:bg-[var(--surface-2)]',
-                  selectedId === s.id && 'bg-[var(--surface-2)]',
-                )}
-              >
-                <span className="flex items-center gap-2">
-                  <span className="truncate font-mono text-[12.5px] font-semibold">{s.name}</span>
-                  <Badge tone="neutral">v{s.version}</Badge>
-                  {s.lastRunOk !== null && (
-                    <span
-                      className="h-2 w-2 shrink-0 rounded-full"
-                      style={{ background: s.lastRunOk ? 'var(--ok)' : 'var(--danger)' }}
-                      title={s.lastRunOk ? 'Last run succeeded' : 'Last run failed'}
-                    />
+          {shown?.map((s) => {
+            const lacking = s.missingConnectors ?? [];
+            return (
+              <li key={s.id} className="relative border-b border-[var(--border)]">
+                <button
+                  type="button"
+                  data-testid="script-row"
+                  aria-pressed={selectedId === s.id}
+                  onClick={() => void select(s.id)}
+                  className={cn(
+                    'flex w-full flex-col gap-1 px-4 py-3 pr-16 text-left transition-colors hover:bg-[var(--surface-2)]',
+                    selectedId === s.id && 'bg-[var(--surface-2)]',
                   )}
+                >
+                  <span className="flex items-center gap-2">
+                    <span className="truncate font-mono text-[12.5px] font-semibold">{s.name}</span>
+                    <Badge tone="neutral">v{s.version}</Badge>
+                    {s.lastRunOk !== null && (
+                      <span
+                        className="h-2 w-2 shrink-0 rounded-full"
+                        style={{ background: s.lastRunOk ? 'var(--ok)' : 'var(--danger)' }}
+                        title={s.lastRunOk ? 'Last run succeeded' : 'Last run failed'}
+                      />
+                    )}
+                  </span>
+                  {s.description && <span className="line-clamp-2 text-[12px] text-[var(--text-2)]">{s.description}</span>}
+                  {s.availableOnServer === false && (
+                    <span className="text-[11.5px] font-medium text-[var(--t-warn-fg)]" data-testid="not-on-server">
+                      Not on this server: needs {lacking.map((m) => m.name).join(', ')}
+                    </span>
+                  )}
+                  <span className="text-[11px] text-[var(--text-3)]">
+                    {s.lastRunAt
+                      ? `Last run ${formatWhen(s.lastRunAt)}${
+                          s.lastRunMeta?.ms !== undefined ? ` · ${formatMs(s.lastRunMeta.ms)}` : ''
+                        }${
+                          s.lastRunMeta?.bytesReturned !== undefined
+                            ? ` · ${formatBytes(s.lastRunMeta.bytesReturned)} returned`
+                            : ''
+                        }`
+                      : 'Never run'}
+                    {s.ownedByYou ? ' · yours' : ''}
+                  </span>
+                </button>
+                {/* Its own button, beside the row's: hover or focus it for the connectors and tools. */}
+                <span className="absolute right-3 top-3">
+                  <ConnectorPin
+                    uses={s.uses}
+                    missing={lacking.map((m) => m.id)}
+                    onActivate={() => void select(s.id)}
+                  />
                 </span>
-                {s.description && <span className="line-clamp-2 text-[12px] text-[var(--text-2)]">{s.description}</span>}
-                <span className="text-[11px] text-[var(--text-3)]">
-                  {s.lastRunAt
-                    ? `Last run ${formatWhen(s.lastRunAt)}${
-                        s.lastRunMeta?.ms !== undefined ? ` · ${formatMs(s.lastRunMeta.ms)}` : ''
-                      }${
-                        s.lastRunMeta?.bytesReturned !== undefined
-                          ? ` · ${formatBytes(s.lastRunMeta.bytesReturned)} returned`
-                          : ''
-                      }`
-                    : 'Never run'}
-                  {s.ownedByYou ? ' · yours' : ''}
-                </span>
-              </button>
-            </li>
-          ))}
+              </li>
+            );
+          })}
         </ul>
       </Card>
 
@@ -312,6 +430,21 @@ export function ScriptsTab({
               detail?.description && <p className="text-[13px] text-[var(--text-2)]">{detail.description}</p>
             )}
 
+            {mode === 'view' && detail && <ScriptUsesSection uses={detail.uses} missing={missing.map((m) => m.id)} />}
+            {unavailable && (
+              <div
+                role="status"
+                data-testid="unavailable-notice"
+                className="rounded-lg px-3.5 py-2.5 text-[12.5px]"
+                style={{ background: 'var(--t-warn-bg)', color: 'var(--t-warn-fg)' }}
+              >
+                The selected MCP server does not have {missing.map((m) => `“${m.name}”`).join(', ')}. An agent connected
+                to it is not offered this script, and it cannot run here. Choose a server that has{' '}
+                {missing.length === 1 ? 'that connector' : 'those connectors'}, or add {missing.length === 1 ? 'it' : 'them'} to
+                this server.
+              </div>
+            )}
+
             {/* Code */}
             <div>
               <BlockTitle>Code</BlockTitle>
@@ -334,6 +467,15 @@ export function ScriptsTab({
               )}
             </div>
 
+            {editing && (
+              <UsesPicker
+                token={token}
+                value={draft.uses}
+                onChange={(uses) => setDraft({ ...draft, uses })}
+                names={Object.fromEntries((detail?.uses ?? []).map((u) => [u.connectorId, u.connectorName]))}
+              />
+            )}
+
             {/* Arguments + actions */}
             <div>
               <label className="mb-1.5 block text-[11.5px] font-semibold text-[var(--text-2)]" htmlFor="script-args">
@@ -351,7 +493,10 @@ export function ScriptsTab({
             </div>
 
             <div className="flex flex-wrap items-center gap-2">
-              <Button onClick={() => void execute()} disabled={running || (editing && !draft.code.trim()) || !canWrite}>
+              <Button
+                onClick={() => void execute()}
+                disabled={running || (editing && !draft.code.trim()) || !canWrite || unavailable}
+              >
                 {running ? 'Running…' : editing ? 'Run this code' : 'Run'}
               </Button>
               {!canWrite && (
@@ -397,6 +542,7 @@ export function ScriptsTab({
             {notice && (
               <div
                 role="status"
+                data-testid="notice"
                 className="rounded-lg border px-3.5 py-2.5 text-[12.5px]"
                 style={
                   notice.tone === 'ok'

@@ -248,11 +248,19 @@ const server = await api('POST', '/api/mcp-servers', token, {
 await api('PUT', `/api/mcp-servers/${server.id}/connectors`, token, { connectorIds: [connector.id] });
 const key = await api('POST', '/api/mcp-keys', token, { name: 'koch-demo client', mcpServerId: server.id });
 
+// Scripts belong to the organization and outlive the server, so a rerun starts by removing the
+// demo scripts of an earlier run (their connector was deleted above and is a new one now).
+const wanted = new Set(SCRIPTS.map((s) => s.name));
+for (const existing of await api('GET', `/api/sandbox/servers/${server.id}/scripts`, token)) {
+  if (wanted.has(existing.name)) await api('DELETE', `/api/sandbox/scripts/${existing.id}`, token);
+}
+
 const scripts = {};
 for (const s of SCRIPTS) {
   const created = await api('POST', `/api/sandbox/servers/${server.id}/scripts`, token, s);
   if (!created.syntax.ok) throw new Error(`Script ${s.name} does not parse: ${JSON.stringify(created.syntax)}`);
   scripts[s.name] = created.id;
+  console.log(`  ${s.name}: uses ${created.uses.map((u) => `${u.connectorName} (${u.tools.join(', ')})`).join('; ') || 'no connector'}`);
 }
 
 writeFileSync(

@@ -1,4 +1,10 @@
-import { ConflictException, ForbiddenException, Logger, NotFoundException } from '@nestjs/common';
+import {
+  BadRequestException,
+  ConflictException,
+  ForbiddenException,
+  Logger,
+  NotFoundException,
+} from '@nestjs/common';
 import { buildSandboxToolEntries, SANDBOX_TOOL_NAMES } from './sandbox-tools';
 import { SandboxService } from './sandbox.service';
 import type {
@@ -31,6 +37,17 @@ const TOOLS: SandboxTool[] = [
   },
 ];
 
+/** What the scripts service returns for a saved script: it declares erp_orders_list of conn-1. */
+const savedScript = (over: Record<string, unknown> = {}) => ({
+  id: 'sc-7',
+  name: 'delayed_orders',
+  version: 1,
+  code: 'return 1',
+  createdById: 'user-1',
+  uses: [{ connectorId: 'conn-1', connectorName: 'ERP', connectorExists: true, tools: ['erp_orders_list'] }],
+  ...over,
+});
+
 const okMeta = { ms: 5, connectorCalls: 1, bytesFromConnectors: 900, bytesReturned: 12, logs: [], toolsCalled: [] };
 
 type Handler = (input: any, handlerContext?: any) => Promise<any>;
@@ -51,16 +68,15 @@ function setup(
   };
   const scripts = {
     getByName: jest.fn(async (): Promise<any> => null),
-    create: jest.fn(async (_o: string, _s: string, _u: any, input: any) => ({
-      id: 'sc-1',
-      version: 1,
-      ...input,
+    create: jest.fn(async (_o: string, _u: any, input: any, _ctx?: any): Promise<any> => ({
+      script: { id: 'sc-1', version: 1, name: input.name, code: input.code, uses: [] },
+      added: [],
+      warnings: [],
     })),
-    updateByName: jest.fn(async (_o: string, _s: string, name: string, patch: any) => ({
-      id: 'sc-1',
-      name,
-      version: 2,
-      code: patch.code ?? 'return 1',
+    updateByName: jest.fn(async (_o: string, name: string, patch: any, _u?: any, _ctx?: any): Promise<any> => ({
+      script: { id: 'sc-1', name, version: 2, code: patch.code ?? 'return 1', uses: [] },
+      added: [],
+      warnings: [],
     })),
     list: jest.fn(async (): Promise<any[]> => []),
     recordRun: jest.fn(async () => 'run-1'),
@@ -187,7 +203,7 @@ describe('buildSandboxToolEntries', () => {
       it('runs a saved script with the runner\'s current tools, whoever wrote it', async () => {
         const reauthorize = jest.fn(async () => []);
         const { call, sandbox, scripts } = setup({ reauthorize });
-        scripts.getByName.mockResolvedValueOnce({ id: 'sc-9', name: 'monthly', version: 4, code: 'return 9', createdById: 'someone-else' });
+        scripts.getByName.mockResolvedValueOnce(savedScript({ id: 'sc-9', name: 'monthly', version: 4, code: 'return 9', createdById: 'someone-else' }));
         await call('sandbox_run_script', { scriptName: 'monthly' });
         expect(sandbox.run.mock.calls[0][0].allowedTools).toEqual([]);
       });
@@ -215,15 +231,11 @@ describe('buildSandboxToolEntries', () => {
 
     it('tells the caller which saved script ran and whether they wrote it', async () => {
       const { call, payload, scripts } = setup();
-      scripts.getByName.mockResolvedValueOnce({
-        id: 'sc-7', name: 'delayed_orders', version: 4, createdById: 'someone-else', code: 'return 1',
-      });
+      scripts.getByName.mockResolvedValueOnce(savedScript({ version: 4, createdById: 'someone-else' }));
       expect(payload(await call('sandbox_run_script', { scriptName: 'delayed_orders' })).script).toEqual({
         name: 'delayed_orders', version: 4, ownedByYou: false,
       });
-      scripts.getByName.mockResolvedValueOnce({
-        id: 'sc-7', name: 'delayed_orders', version: 5, createdById: 'user-1', code: 'return 1',
-      });
+      scripts.getByName.mockResolvedValueOnce(savedScript({ version: 5 }));
       expect(payload(await call('sandbox_run_script', { scriptName: 'delayed_orders' })).script.ownedByYou).toBe(true);
       // Inline code has no saved script to report.
       expect(payload(await call('sandbox_run_script', { code: 'return 1' })).script).toBeUndefined();
@@ -231,11 +243,93 @@ describe('buildSandboxToolEntries', () => {
 
     it('runs a saved script by name', async () => {
       const { call, sandbox, scripts } = setup();
-      scripts.getByName.mockResolvedValueOnce({ id: 'sc-7', code: 'return args.x' });
+      scripts.getByName.mockResolvedValueOnce(savedScript({ code: 'return args.x' }));
       await call('sandbox_run_script', { scriptName: 'delayed_orders', args: { x: 1 } });
-      expect(scripts.getByName).toHaveBeenCalledWith(SERVER_ORG, 'srv-1', 'delayed_orders');
+      expect(scripts.getByName).toHaveBeenCalledWith(SERVER_ORG, 'delayed_orders');
       expect(sandbox.run).toHaveBeenCalledWith(expect.objectContaining({ code: 'return args.x' }));
       expect((scripts.recordRun.mock.calls as any[][])[0][0].scriptId).toBe('sc-7');
+    });
+
+    describe('a saved script and the connectors it uses', () => {
+      const OTHER_CONNECTOR_TOOL: SandboxTool = { ...TOOLS[0], name: 'shop_orders_list', connectorId: 'conn-2' };
+
+      it('is not found on a server that lacks one of its connectors', async () => {
+        const { call, sandbox, scripts } = setup();
+        scripts.getByName.mockResolvedValueOnce(
+          savedScript({
+            uses: [
+              { connectorId: 'conn-1', connectorName: 'ERP', connectorExists: true, tools: ['erp_orders_list'] },
+              { connectorId: 'conn-2', connectorName: 'Shop', connectorExists: true, tools: ['shop_orders_list'] },
+            ],
+          }),
+        );
+        const res = await call('sandbox_run_script', { scriptName: 'delayed_orders' });
+        expect(res.isError).toBe(true);
+        expect(res.content[0].text).toContain("Script 'delayed_orders' not found");
+        expect(sandbox.run).not.toHaveBeenCalled();
+        expect(scripts.recordRun).not.toHaveBeenCalled();
+      });
+
+      it('is not found when a connector it used has been deleted', async () => {
+        const { call, sandbox, scripts } = setup();
+        scripts.getByName.mockResolvedValueOnce(
+          savedScript({
+            uses: [{ connectorId: 'conn-gone', connectorName: 'Old CRM', connectorExists: false, tools: ['crm_list'] }],
+          }),
+        );
+        const res = await call('sandbox_run_script', { scriptName: 'delayed_orders' });
+        expect(res.isError).toBe(true);
+        expect(sandbox.run).not.toHaveBeenCalled();
+      });
+
+      it('runs on a server that has all of its connectors, with only the tools it declared', async () => {
+        const both = [TOOLS[0], OTHER_CONNECTOR_TOOL];
+        const { call, sandbox, scripts } = setup({ tools: both, reauthorize: async () => both });
+        scripts.getByName.mockResolvedValueOnce(savedScript());
+        await call('sandbox_run_script', { scriptName: 'delayed_orders' });
+        // The caller can call both tools, but the script declared one.
+        expect(sandbox.run.mock.calls[0][0].allowedTools).toEqual([TOOLS[0]]);
+      });
+
+      it('matches the declared tool by connector, not by name alone', async () => {
+        const sameName: SandboxTool = { ...TOOLS[0], connectorId: 'conn-2' };
+        const { call, sandbox, scripts } = setup({ reauthorize: async () => [sameName] });
+        scripts.getByName.mockResolvedValueOnce(savedScript());
+        await call('sandbox_run_script', { scriptName: 'delayed_orders' });
+        expect(sandbox.run.mock.calls[0][0].allowedTools).toEqual([]);
+      });
+
+      it('gives a script that declares nothing no tools', async () => {
+        const { call, sandbox, scripts } = setup();
+        scripts.getByName.mockResolvedValueOnce(savedScript({ uses: [] }));
+        await call('sandbox_run_script', { scriptName: 'delayed_orders' });
+        expect(sandbox.run.mock.calls[0][0].allowedTools).toEqual([]);
+      });
+
+      it('leaves inline code with every tool the caller has', async () => {
+        const { call, sandbox } = setup();
+        await call('sandbox_run_script', { code: 'return 1' });
+        expect(sandbox.run.mock.calls[0][0].allowedTools).toEqual(TOOLS);
+      });
+
+      it('tells the agent how to declare a tool the saved script tried to call', async () => {
+        const { call, payload, scripts } = setup({
+          runResult: {
+            ok: false,
+            error: { code: 'TOOL_NOT_ALLOWED', message: "Tool 'x' is not available", hint: 'Call tools.list().' },
+            meta: okMeta,
+          },
+        });
+        scripts.getByName.mockResolvedValueOnce(savedScript());
+        const hint = payload(await call('sandbox_run_script', { scriptName: 'delayed_orders' })).error.hint;
+        expect(hint).toContain('Call tools.list().');
+        expect(hint).toContain('sandbox_edit_script');
+        // Inline code gets the plain hint.
+        const inline = setup({
+          runResult: { ok: false, error: { code: 'TOOL_NOT_ALLOWED', message: 'm', hint: 'Call tools.list().' }, meta: okMeta },
+        });
+        expect(inline.payload(await inline.call('sandbox_run_script', { code: 'x' })).error.hint).toBe('Call tools.list().');
+      });
     });
 
     it('reports an unknown script name without running anything', async () => {
@@ -302,12 +396,56 @@ describe('buildSandboxToolEntries', () => {
     it('saves under the server\'s organization and reports a clean syntax check', async () => {
       const { call, payload, scripts } = setup();
       const res = await call('sandbox_create_script', { name: 'delayed_orders', code: 'return 1', description: 'd' });
-      expect(scripts.create).toHaveBeenCalledWith(SERVER_ORG, 'srv-1', 'user-1', {
+      // Saved for the organization (not the server); the server's connectors settle ambiguous names.
+      expect(scripts.create).toHaveBeenCalledWith(
+        SERVER_ORG,
+        'user-1',
+        { name: 'delayed_orders', code: 'return 1', description: 'd', toolNames: undefined },
+        { preferConnectorIds: ['conn-1'] },
+      );
+      expect(payload(res)).toEqual({
+        ok: true,
+        scriptId: 'sc-1',
         name: 'delayed_orders',
-        code: 'return 1',
-        description: 'd',
+        version: 1,
+        syntax: 'ok',
+        uses: [],
       });
-      expect(payload(res)).toEqual({ ok: true, scriptId: 'sc-1', name: 'delayed_orders', version: 1, syntax: 'ok' });
+    });
+
+    it('takes the tools the script calls by name, and reports what it ended up with', async () => {
+      const { call, payload, scripts } = setup();
+      scripts.create.mockResolvedValueOnce({
+        script: {
+          id: 'sc-1', version: 1, name: 'abc', code: 'x',
+          uses: [{ connectorId: 'conn-1', connectorName: 'ERP', connectorExists: true, tools: ['erp_orders_list'] }],
+        },
+        added: ['ERP / erp_orders_list'],
+        warnings: ['tools.nope is not a tool of any connector in this organization.'],
+      });
+      const res = await call('sandbox_create_script', { name: 'abc', code: 'x', tools: ['erp_orders_list'] });
+      expect(scripts.create.mock.calls[0][2]).toMatchObject({ toolNames: ['erp_orders_list'] });
+      expect(payload(res)).toMatchObject({
+        uses: [{ connector: 'ERP', tools: ['erp_orders_list'] }],
+        addedFromCode: ['ERP / erp_orders_list'],
+        warnings: ['tools.nope is not a tool of any connector in this organization.'],
+      });
+    });
+
+    it('reports an unknown tool name as an error and saves nothing', async () => {
+      const { call, scripts } = setup();
+      scripts.create.mockRejectedValueOnce(new BadRequestException("Unknown tool 'nope'. Use the names in the tool list."));
+      const res = await call('sandbox_create_script', { name: 'abc', code: 'x', tools: ['nope'] });
+      expect(res.isError).toBe(true);
+      expect(res.content[0].text).toContain("Unknown tool 'nope'");
+    });
+
+    it('offers the tools field, as a bounded list of names', () => {
+      const { registered } = setup();
+      const { tools } = registered.get('sandbox_create_script')!.config.inputSchema;
+      expect(tools.safeParse(['a', 'b']).success).toBe(true);
+      expect(tools.safeParse(Array.from({ length: 101 }, () => 'x')).success).toBe(false);
+      expect(registered.get('sandbox_edit_script')!.config.inputSchema.tools).toBeDefined();
     });
 
     it('still saves a script with a syntax error and says where the error is', async () => {
@@ -356,16 +494,37 @@ describe('buildSandboxToolEntries', () => {
       const res = await call('sandbox_edit_script', { name: 'abc', code: 'return 2' });
       expect(scripts.updateByName).toHaveBeenCalledWith(
         SERVER_ORG,
-        'srv-1',
         'abc',
-        { code: 'return 2', description: undefined },
+        { code: 'return 2', description: undefined, toolNames: undefined },
         'user-1',
+        { preferConnectorIds: ['conn-1'] },
       );
       expect(sandbox.checkSyntax).toHaveBeenCalledWith('return 2');
-      expect(payload(res)).toEqual({ ok: true, name: 'abc', version: 2, syntax: 'ok' });
+      expect(payload(res)).toEqual({ ok: true, name: 'abc', version: 2, syntax: 'ok', uses: [] });
     });
 
-    it('requires code and/or description', async () => {
+    it('can replace the tools a script declares', async () => {
+      const { call, scripts } = setup();
+      await call('sandbox_edit_script', { name: 'abc', tools: ['erp_orders_list'] });
+      expect(scripts.updateByName.mock.calls[0][2]).toEqual({
+        code: undefined,
+        description: undefined,
+        toolNames: ['erp_orders_list'],
+      });
+    });
+
+    it('does not edit a script this server cannot offer, because it lacks one of its connectors', async () => {
+      const { call, scripts } = setup();
+      scripts.getByName.mockResolvedValueOnce(
+        savedScript({ uses: [{ connectorId: 'conn-2', connectorName: 'Shop', connectorExists: true, tools: ['x'] }] }),
+      );
+      const res = await call('sandbox_edit_script', { name: 'abc', code: 'return 2' });
+      expect(res.isError).toBe(true);
+      expect(res.content[0].text).toBe("Script 'abc' not found");
+      expect(scripts.updateByName).not.toHaveBeenCalled();
+    });
+
+    it('requires code, description and/or tools', async () => {
       const { call, scripts } = setup();
       const res = await call('sandbox_edit_script', { name: 'abc' });
       expect(res.isError).toBe(true);
@@ -399,11 +558,11 @@ describe('buildSandboxToolEntries', () => {
   });
 
   describe('sandbox_list_scripts', () => {
-    it('lists this server\'s scripts with a compact last-run summary', async () => {
+    it('lists the scripts, what they use, and a compact last-run summary', async () => {
       const { call, payload, scripts } = setup();
       const lastRunAt = new Date('2026-10-17T10:00:00Z');
       scripts.list.mockResolvedValueOnce([
-        {
+        savedScript({
           createdById: 'user-1',
           name: 'delayed_orders',
           description: 'Delayed orders last month',
@@ -411,23 +570,42 @@ describe('buildSandboxToolEntries', () => {
           lastRunAt,
           lastRunOk: true,
           lastRunMeta: { ms: 40, bytesReturned: 80, connectorCalls: 2, bytesFromConnectors: 5_000_000 },
-        },
-        { createdById: 'someone-else', name: 'new_one', description: null, version: 1, lastRunAt: null, lastRunOk: null, lastRunMeta: null },
+        }),
+        savedScript({ createdById: 'someone-else', name: 'new_one', description: null, version: 1, uses: [], lastRunAt: null, lastRunOk: null, lastRunMeta: null }),
       ]);
       const res = await call('sandbox_list_scripts');
-      expect(scripts.list).toHaveBeenCalledWith(SERVER_ORG, 'srv-1');
+      expect(scripts.list).toHaveBeenCalledWith(SERVER_ORG);
       expect(payload(res).scripts).toEqual([
         {
           name: 'delayed_orders',
           description: 'Delayed orders last month',
           version: 3,
           ownedByYou: true,
+          uses: [{ connector: 'ERP', tools: ['erp_orders_list'] }],
           lastRunAt: lastRunAt.toISOString(),
           lastRunOk: true,
           lastRunMeta: { ms: 40, bytesReturned: 80 },
         },
-        { name: 'new_one', description: null, version: 1, ownedByYou: false, lastRunAt: null, lastRunOk: null, lastRunMeta: null },
+        { name: 'new_one', description: null, version: 1, ownedByYou: false, uses: [], lastRunAt: null, lastRunOk: null, lastRunMeta: null },
       ]);
+    });
+
+    it('lists only the scripts whose connectors this server has, and every script that needs none', async () => {
+      const { call, payload, scripts } = setup();
+      scripts.list.mockResolvedValueOnce([
+        savedScript({ name: 'uses_erp' }),
+        savedScript({
+          name: 'needs_shop_too',
+          uses: [
+            { connectorId: 'conn-1', connectorName: 'ERP', connectorExists: true, tools: ['a'] },
+            { connectorId: 'conn-2', connectorName: 'Shop', connectorExists: true, tools: ['b'] },
+          ],
+        }),
+        savedScript({ name: 'needs_deleted', uses: [{ connectorId: 'gone', connectorName: 'Old', connectorExists: false, tools: ['c'] }] }),
+        savedScript({ name: 'pure_compute', uses: [] }),
+      ]);
+      const names = payload(await call('sandbox_list_scripts')).scripts.map((s: any) => s.name);
+      expect(names).toEqual(['uses_erp', 'pure_compute']);
     });
   });
 

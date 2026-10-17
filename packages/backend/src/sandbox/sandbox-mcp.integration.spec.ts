@@ -51,7 +51,11 @@ function makeController(
   }));
   const scripts = {
     getByName: jest.fn(async (): Promise<any> => null),
-    create: jest.fn(async (_o: string, _s: string, _u: any, input: any) => ({ id: 'sc-1', version: 1, ...input })),
+    create: jest.fn(async (_o: string, _u: any, input: any, _ctx?: any): Promise<any> => ({
+      script: { id: 'sc-1', version: 1, name: input.name, code: input.code, uses: [] },
+      added: [],
+      warnings: [],
+    })),
     updateByName: jest.fn(),
     list: jest.fn(async () => []),
     recordRun: jest.fn(async () => 'run-1'),
@@ -306,7 +310,12 @@ describe('code mode through planToolSet', () => {
         arguments: { name: 'delayed_orders', code: 'return { n: 1 }', description: 'Delayed orders' },
       });
       expect(JSON.parse(created.content[0].text)).toMatchObject({ ok: true, name: 'delayed_orders', syntax: 'ok' });
-      expect(scripts.create).toHaveBeenCalledWith(SERVER_ORG, 'srv-A', 'u1', expect.objectContaining({ name: 'delayed_orders' }));
+      expect(scripts.create).toHaveBeenCalledWith(
+        SERVER_ORG,
+        'u1',
+        expect.objectContaining({ name: 'delayed_orders' }),
+        { preferConnectorIds: ['conn-t1', 'conn-t2'] },
+      );
 
       const broken: any = await client.callTool({
         name: 'sandbox_create_script',
@@ -314,12 +323,122 @@ describe('code mode through planToolSet', () => {
       });
       expect(JSON.parse(broken.content[0].text).syntax).toMatchObject({ line: expect.any(Number) });
 
-      scripts.getByName.mockResolvedValueOnce({ id: 'sc-1', code: 'return { rerun: args.month }' });
+      scripts.getByName.mockResolvedValueOnce({ id: 'sc-1', code: 'return { rerun: args.month }', uses: [] });
       const rerun: any = await client.callTool({
         name: 'sandbox_run_script',
         arguments: { scriptName: 'delayed_orders', args: { month: 'previous' } },
       });
       expect(rerun.structuredContent.result).toEqual({ rerun: 'previous' });
+    });
+
+    describe('saved scripts and the connectors they use', () => {
+      const uses = (...pairs: Array<[string, string, string[]]>) =>
+        pairs.map(([connectorId, connectorName, tools]) => ({ connectorId, connectorName, connectorExists: true, tools }));
+      const script = (name: string, over: Record<string, unknown> = {}) => ({
+        id: `sc-${name}`,
+        name,
+        version: 1,
+        description: null,
+        createdById: 'u1',
+        lastRunAt: null,
+        lastRunOk: null,
+        lastRunMeta: null,
+        code: 'return 1',
+        uses: uses(['conn-t1', 'ERP', ['erp_orders_list']]),
+        ...over,
+      });
+
+      it('offers only the scripts whose connectors this server has, each with what it uses', async () => {
+        const { controller, scripts } = makeController();
+        scripts.list.mockResolvedValue([
+          script('orders_only'),
+          script('orders_and_customers', {
+            uses: uses(['conn-t1', 'ERP', ['erp_orders_list']], ['conn-t2', 'CRM', ['erp_customers_list']]),
+          }),
+          script('needs_a_connector_this_server_lacks', {
+            uses: uses(['conn-t1', 'ERP', ['erp_orders_list']], ['conn-elsewhere', 'Billing', ['bill_list']]),
+          }),
+          script('pure_compute', { uses: [] }),
+        ] as any);
+        const client = await connect((controller as any).planToolSet(baseParams()));
+
+        const listed: any = await client.callTool({ name: 'sandbox_list_scripts', arguments: {} });
+        const offered = JSON.parse(listed.content[0].text).scripts;
+        expect(offered.map((s: any) => s.name)).toEqual(['orders_only', 'orders_and_customers', 'pure_compute']);
+        expect(offered[1].uses).toEqual([
+          { connector: 'ERP', tools: ['erp_orders_list'] },
+          { connector: 'CRM', tools: ['erp_customers_list'] },
+        ]);
+      });
+
+      it('does not run, or even admit to, a script that needs a connector this server lacks', async () => {
+        const { controller, scripts, executeTool } = makeController();
+        scripts.getByName.mockResolvedValue(
+          script('billing_report', { uses: uses(['conn-elsewhere', 'Billing', ['bill_list']]) }) as any,
+        );
+        const client = await connect((controller as any).planToolSet(baseParams()));
+
+        const res: any = await client.callTool({ name: 'sandbox_run_script', arguments: { scriptName: 'billing_report' } });
+        expect(res.isError).toBe(true);
+        expect(res.content[0].text).toContain("Script 'billing_report' not found");
+        expect(executeTool).not.toHaveBeenCalled();
+        expect(scripts.recordRun).not.toHaveBeenCalled();
+      });
+
+      it('lets a saved script call the tools it declared', async () => {
+        const { controller, scripts, executeTool } = makeController();
+        scripts.getByName.mockResolvedValue(
+          script('count_orders', { code: 'const r = await tools.erp_orders_list({}); return r.length;' }) as any,
+        );
+        const client = await connect((controller as any).planToolSet(baseParams()));
+
+        const res: any = await client.callTool({ name: 'sandbox_run_script', arguments: { scriptName: 'count_orders' } });
+        expect(res.isError).toBeFalsy();
+        expect(res.structuredContent.result).toBe(3000);
+        expect(executeTool).toHaveBeenCalledTimes(1);
+      });
+
+      it('stops a saved script from calling a tool it did not declare, though its caller may', async () => {
+        const { controller, scripts, executeTool } = makeController();
+        scripts.getByName.mockResolvedValue(
+          script('sneaky', {
+            // Declares only the orders tool, but also reaches for the customers tool of the same server.
+            code: 'const o = await tools.erp_orders_list({}); const c = await tools.erp_customers_list({}); return [o.length, c.length];',
+          }) as any,
+        );
+        const client = await connect((controller as any).planToolSet(baseParams()));
+
+        const res: any = await client.callTool({ name: 'sandbox_run_script', arguments: { scriptName: 'sneaky' } });
+        expect(res.isError).toBe(true);
+        expect(res.structuredContent.error.code).toBe('TOOL_NOT_ALLOWED');
+        expect(res.structuredContent.error.hint).toContain('sandbox_edit_script');
+        expect(executeTool.mock.calls.map((c) => c[0])).toEqual(['erp_orders_list']);
+
+        // The same code run inline, which declares nothing, may use both tools.
+        executeTool.mockClear();
+        const inline: any = await client.callTool({
+          name: 'sandbox_run_script',
+          arguments: { code: 'const o = await tools.erp_orders_list({}); const c = await tools.erp_customers_list({}); return [o.length, c.length];' },
+        });
+        expect(inline.isError).toBeFalsy();
+        expect(executeTool).toHaveBeenCalledTimes(2);
+      });
+
+      it('lets an agent name the tools a new script calls', async () => {
+        const { controller, scripts } = makeController();
+        scripts.create.mockResolvedValueOnce({
+          script: { id: 'sc-1', version: 1, name: 'abc', code: 'x', uses: uses(['conn-t1', 'ERP', ['erp_orders_list']]) },
+          added: [],
+          warnings: [],
+        });
+        const client = await connect((controller as any).planToolSet(baseParams()));
+        const res: any = await client.callTool({
+          name: 'sandbox_create_script',
+          arguments: { name: 'abc', code: 'return 1', tools: ['erp_orders_list'] },
+        });
+        expect(scripts.create.mock.calls[0][2]).toMatchObject({ toolNames: ['erp_orders_list'] });
+        expect(JSON.parse(res.content[0].text).uses).toEqual([{ connector: 'ERP', tools: ['erp_orders_list'] }]);
+      });
     });
 
     describe('authorization at run time', () => {

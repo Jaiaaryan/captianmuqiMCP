@@ -9,9 +9,11 @@ import {
 import { z } from 'zod';
 import { SANDBOX_LIMITS, SANDBOX_TIMEOUT_RANGE_MS, areSandboxWritesAllowed } from './limits';
 import { SandboxScriptsService } from './sandbox-scripts.service';
+import { declaredOnly, missingConnectors, type ScriptUse } from './script-uses.util';
 import {
   SCRIPT_CODE_MAX_CHARS,
   SCRIPT_DESCRIPTION_MAX_CHARS,
+  SCRIPT_MAX_TOOLS,
   SCRIPT_NAME_MESSAGE,
   SCRIPT_NAME_PATTERN,
 } from './sandbox-scripts.dto';
@@ -152,9 +154,13 @@ export function buildSandboxToolEntries(
     // Which saved script ran, shown to the caller: it runs with THEIR authority
     // but may have been written by someone else.
     let scriptInfo: { name: string; version: number; ownedByYou: boolean } | undefined;
+    // What a saved script declares it uses: it can call those tools and no others.
+    let declared: ScriptUse[] | undefined;
     if (hasName) {
-      const saved = await scripts.getByName(orgId, serverId, input.scriptName as string);
-      if (!saved) {
+      const saved = await scripts.getByName(orgId, input.scriptName as string);
+      // A script is offered on a server only if the server has every connector the
+      // script uses, so one that needs a connector this server lacks is not found.
+      if (!saved || missingConnectors(saved.uses, invocationContext.connectorIds).length > 0) {
         return textResult(
           `Script '${input.scriptName}' not found. Call sandbox_list_scripts to see the saved scripts.`,
           true,
@@ -162,6 +168,7 @@ export function buildSandboxToolEntries(
       }
       code = saved.code;
       scriptId = saved.id;
+      declared = saved.uses;
       scriptInfo = {
         name: saved.name,
         version: saved.version,
@@ -180,6 +187,8 @@ export function buildSandboxToolEntries(
       }
     }
 
+    if (declared) tools = declaredOnly(tools, declared);
+
     // One id for the run: its row in sandbox_runs, and the mark on the audit row
     // of every connector call it makes.
     const runId = randomUUID();
@@ -193,6 +202,12 @@ export function buildSandboxToolEntries(
       executeTool,
       limits: input.timeoutMs ? { timeoutMs: input.timeoutMs } : undefined,
     });
+    if (declared && result.error?.code === 'TOOL_NOT_ALLOWED') {
+      result.error.hint = (
+        `${result.error.hint ?? ''} A saved script can call only the tools it declares: add the tool ` +
+        'with sandbox_edit_script { name, tools: [...] }, or run the code directly with sandbox_run_script { code }.'
+      ).trim();
+    }
     await scripts.recordRun({
       id: runId,
       organizationId: orgId,
@@ -223,9 +238,23 @@ export function buildSandboxToolEntries(
     );
   };
 
-  const create = async (input: { name: string; code: string; description?: string }) => {
+  /** The uses of a script as an agent reads them: connector name and its tool names. */
+  const showUses = (uses: ScriptUse[]) => uses.map((u) => ({ connector: u.connectorName, tools: u.tools }));
+  const saveNotes = (added: string[], warnings: string[]) => ({
+    ...(added.length > 0 && { addedFromCode: added }),
+    ...(warnings.length > 0 && { warnings }),
+  });
+  // Names in the tool list are meant; where one exists on several connectors, this server's wins.
+  const saveContext = { preferConnectorIds: invocationContext.connectorIds };
+
+  const create = async (input: { name: string; code: string; description?: string; tools?: string[] }) => {
     try {
-      const script = await scripts.create(orgId, serverId, userId, input);
+      const { script, added, warnings } = await scripts.create(
+        orgId,
+        userId,
+        { name: input.name, code: input.code, description: input.description, toolNames: input.tools },
+        saveContext,
+      );
       const syntax = await sandbox.checkSyntax(input.code);
       return jsonResult({
         ok: true,
@@ -233,23 +262,30 @@ export function buildSandboxToolEntries(
         name: script.name,
         version: script.version,
         syntax: formatSyntax(syntax),
+        uses: showUses(script.uses),
+        ...saveNotes(added, warnings),
       });
     } catch (err) {
       return writeFailure(err, input.name);
     }
   };
 
-  const edit = async (input: { name: string; code?: string; description?: string }) => {
-    if (input.code === undefined && input.description === undefined) {
-      return textResult('Provide "code" and/or "description" to change.', true);
+  const edit = async (input: { name: string; code?: string; description?: string; tools?: string[] }) => {
+    if (input.code === undefined && input.description === undefined && input.tools === undefined) {
+      return textResult('Provide "code", "description" and/or "tools" to change.', true);
     }
     try {
-      const script = await scripts.updateByName(
+      // A script that needs a connector this server lacks is not offered here, so it is not editable here.
+      const existing = await scripts.getByName(orgId, input.name);
+      if (existing && missingConnectors(existing.uses, invocationContext.connectorIds).length > 0) {
+        return textResult(`Script '${input.name}' not found`, true);
+      }
+      const { script, added, warnings } = await scripts.updateByName(
         orgId,
-        serverId,
         input.name,
-        { code: input.code, description: input.description },
+        { code: input.code, description: input.description, toolNames: input.tools },
         userId,
+        saveContext,
       );
       const syntax = await sandbox.checkSyntax(script.code);
       return jsonResult({
@@ -257,6 +293,8 @@ export function buildSandboxToolEntries(
         name: script.name,
         version: script.version,
         syntax: formatSyntax(syntax),
+        uses: showUses(script.uses),
+        ...saveNotes(added, warnings),
       });
     } catch (err) {
       return writeFailure(err, input.name);
@@ -264,15 +302,18 @@ export function buildSandboxToolEntries(
   };
 
   const list = async () => {
-    const rows = await scripts.list(orgId, serverId);
+    const rows = await scripts.list(orgId);
+    // Only the scripts this server can run: it has every connector they use.
+    const offered = rows.filter((s) => missingConnectors(s.uses, invocationContext.connectorIds).length === 0);
     return jsonResult({
-      scripts: rows.map((s) => {
+      scripts: offered.map((s) => {
         const meta = (s.lastRunMeta ?? {}) as { ms?: number; bytesReturned?: number };
         return {
           name: s.name,
           description: s.description,
           version: s.version,
           ownedByYou: (s.createdById ?? null) === (userId ?? null),
+          uses: showUses(s.uses),
           lastRunAt: s.lastRunAt,
           lastRunOk: s.lastRunOk,
           lastRunMeta: s.lastRunMeta ? { ms: meta.ms, bytesReturned: meta.bytesReturned } : null,
@@ -287,6 +328,14 @@ export function buildSandboxToolEntries(
     .max(SCRIPT_CODE_MAX_CHARS)
     .describe('JavaScript body. Top-level await and return are allowed.');
   const descriptionField = z.string().max(SCRIPT_DESCRIPTION_MAX_CHARS);
+  const toolsField = z
+    .array(z.string().max(200))
+    .max(SCRIPT_MAX_TOOLS)
+    .describe(
+      'Names of the tools the script calls, as in the tool list. Tools called as `tools.name(...)` ' +
+        'in the code are found automatically; list any that are called some other way. A saved ' +
+        'script can call only the tools it declares.',
+    );
 
   const entry = (
     name: string,
@@ -346,12 +395,14 @@ export function buildSandboxToolEntries(
         'sandbox_create_script',
         {
           description:
-            'Save a reusable script for this MCP server so it can be rerun by name with ' +
-            'sandbox_run_script { scriptName }. The code is syntax-checked but not executed.',
+            'Save a reusable script so it can be rerun by name with sandbox_run_script { scriptName }. ' +
+            'The script is remembered with the connectors and tools it calls, and is offered only on MCP ' +
+            'servers that have all of those connectors. The code is syntax-checked but not executed.',
           inputSchema: {
             name: z.string().regex(SCRIPT_NAME_PATTERN, SCRIPT_NAME_MESSAGE),
             code: codeField,
             description: descriptionField.optional(),
+            tools: toolsField.optional(),
           },
           annotations: {
             title: 'Save sandbox script',
@@ -369,7 +420,8 @@ export function buildSandboxToolEntries(
         'sandbox_edit_script',
         {
           description:
-            "Change a saved script's code and/or description. Only the script's author can edit it " +
+            "Change a saved script's code, description and/or the tools it declares (`tools` replaces the list). " +
+            "Only the script's author can edit it " +
             '(`ownedByYou` in sandbox_list_scripts); to change someone else\'s script, save your own ' +
             'copy under a new name. The version increases when the code changes. The code is ' +
             'syntax-checked but not executed.',
@@ -377,6 +429,7 @@ export function buildSandboxToolEntries(
             name: z.string(),
             code: codeField.optional(),
             description: descriptionField.optional(),
+            tools: toolsField.optional(),
           },
           annotations: {
             title: 'Edit sandbox script',
@@ -394,7 +447,8 @@ export function buildSandboxToolEntries(
         'sandbox_list_scripts',
         {
           description:
-            'List the saved scripts of this MCP server with their version and last run (duration, bytes returned).',
+            'List the saved scripts this MCP server can run (it has every connector they use), with the ' +
+            'connectors and tools each one uses, its version and last run (duration, bytes returned).',
           inputSchema: {},
           annotations: { title: 'List sandbox scripts', readOnlyHint: true, openWorldHint: false },
         },

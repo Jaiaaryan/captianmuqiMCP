@@ -11,13 +11,40 @@ import type { SandboxRunResult } from './types';
 const ORG = 'org-a';
 const SERVER = 'srv-1';
 
+/** The organization's connectors and their tools, as the database would hold them. */
+const CONNECTORS = [
+  { id: 'c-erp', name: 'ERP', organizationId: ORG },
+  { id: 'c-shop', name: 'Shop', organizationId: ORG },
+  { id: 'c-other', name: 'Other customer', organizationId: 'org-b' },
+];
+const TOOLS = [
+  { connectorId: 'c-erp', name: 'erp_orders_list' },
+  { connectorId: 'c-erp', name: 'erp_items_list' },
+  { connectorId: 'c-erp', name: 'orders_list' },
+  { connectorId: 'c-shop', name: 'shop_orders_list' },
+  { connectorId: 'c-shop', name: 'orders_list' },
+  { connectorId: 'c-other', name: 'secret_tool' },
+];
+
 function makePrisma() {
+  const connectorOf = (id: string) => CONNECTORS.find((c) => c.id === id)!;
   return {
     sandboxScript: {
       findMany: jest.fn().mockResolvedValue([]),
       findFirst: jest.fn().mockResolvedValue(null),
-      create: jest.fn(async ({ data }: any) => ({ id: 'sc-1', version: 1, ...data })),
-      update: jest.fn(async ({ data }: any) => ({ id: 'sc-1', ...data })),
+      create: jest.fn(async ({ data }: any) => ({
+        id: 'sc-1',
+        version: 1,
+        ...data,
+        uses: data.uses?.create ?? [],
+      })),
+      update: jest.fn(async ({ data }: any) => ({
+        id: 'sc-1',
+        name: 'abc',
+        code: data.code ?? 'return 1',
+        version: 1,
+        uses: data.uses?.create ?? [],
+      })),
       updateMany: jest.fn().mockResolvedValue({ count: 1 }),
       deleteMany: jest.fn().mockResolvedValue({ count: 1 }),
     },
@@ -25,11 +52,46 @@ function makePrisma() {
       create: jest.fn().mockResolvedValue({ id: 'run-1' }),
       findMany: jest.fn().mockResolvedValue([]),
     },
-    mcpServerConfig: {
-      findFirst: jest.fn().mockResolvedValue({ id: SERVER }),
+    connector: {
+      findMany: jest.fn(async ({ where }: any) =>
+        CONNECTORS.filter(
+          (c) => c.organizationId === where.organizationId && where.id.in.includes(c.id),
+        ).map((c) => ({ id: c.id, name: c.name })),
+      ),
+    },
+    mcpTool: {
+      findMany: jest.fn(async ({ where }: any) => {
+        let rows = TOOLS;
+        if (where.connectorId?.in) rows = rows.filter((t) => where.connectorId.in.includes(t.connectorId));
+        if (where.name?.in) rows = rows.filter((t) => where.name.in.includes(t.name));
+        if (where.connector?.organizationId) {
+          rows = rows.filter((t) => connectorOf(t.connectorId).organizationId === where.connector.organizationId);
+        }
+        return rows.map((t) => ({
+          name: t.name,
+          connectorId: t.connectorId,
+          connector: { name: connectorOf(t.connectorId).name },
+        }));
+      }),
     },
   };
 }
+
+/** A stored script row with what the service reads from it. */
+const stored = (over: Record<string, unknown> = {}) => ({
+  id: 'sc-1',
+  name: 'abc',
+  code: 'return 1',
+  version: 1,
+  createdById: 'u1',
+  uses: [] as { connectorId: string; connectorName: string; toolName: string }[],
+  ...over,
+});
+const row = (connectorId: string, connectorName: string, toolName: string) => ({
+  connectorId,
+  connectorName,
+  toolName,
+});
 
 const okResult = (result: unknown): SandboxRunResult => ({
   ok: true,
@@ -55,21 +117,17 @@ describe('SandboxScriptsService', () => {
 
   describe('tenant scoping', () => {
     it('filters every read by organization', async () => {
-      await service.list(ORG, SERVER);
+      await service.list(ORG);
       await service.get(ORG, 'sc-1').catch(() => undefined);
-      await service.getByName(ORG, SERVER, 'x');
+      await service.getByName(ORG, 'x');
       await service.listRuns(ORG, SERVER);
-      expect(prisma.sandboxScript.findMany.mock.calls[0][0].where).toEqual({
-        organizationId: ORG,
-        mcpServerId: SERVER,
-      });
+      expect(prisma.sandboxScript.findMany.mock.calls[0][0].where).toEqual({ organizationId: ORG });
       expect(prisma.sandboxScript.findFirst.mock.calls[0][0].where).toEqual({
         id: 'sc-1',
         organizationId: ORG,
       });
       expect(prisma.sandboxScript.findFirst.mock.calls[1][0].where).toEqual({
         organizationId: ORG,
-        mcpServerId: SERVER,
         name: 'x',
       });
       expect(prisma.sandboxRun.findMany.mock.calls[0][0].where).toEqual({
@@ -79,6 +137,7 @@ describe('SandboxScriptsService', () => {
     });
 
     it('scopes update and delete by organization, so another org\'s id is not found', async () => {
+      prisma.sandboxScript.findFirst.mockResolvedValueOnce(stored());
       await service.update(ORG, 'sc-1', { code: 'return 1' });
       expect(prisma.sandboxScript.update.mock.calls[0][0].where).toEqual({
         id: 'sc-1',
@@ -91,34 +150,63 @@ describe('SandboxScriptsService', () => {
       });
     });
 
-    it('maps a missing record on update to NotFound', async () => {
-      prisma.sandboxScript.update.mockRejectedValueOnce(
-        Object.assign(new Error('missing'), { code: 'P2025' }),
-      );
+    it('does not update a script of another organization', async () => {
       await expect(service.update('org-b', 'sc-1', { code: 'x' })).rejects.toBeInstanceOf(
         NotFoundException,
       );
+      expect(prisma.sandboxScript.findFirst.mock.calls[0][0].where).toEqual({
+        id: 'sc-1',
+        organizationId: 'org-b',
+      });
+      expect(prisma.sandboxScript.update).not.toHaveBeenCalled();
     });
 
-    it('refuses to create a script on a server outside the organization', async () => {
-      prisma.mcpServerConfig.findFirst.mockResolvedValueOnce(null);
-      await expect(
-        service.create(ORG, 'srv-of-other-org', 'u1', { name: 'abc', code: 'return 1' }),
-      ).rejects.toBeInstanceOf(NotFoundException);
-      expect(prisma.mcpServerConfig.findFirst.mock.calls[0][0].where).toEqual({
-        id: 'srv-of-other-org',
-        organizationId: ORG,
-      });
-      expect(prisma.sandboxScript.create).not.toHaveBeenCalled();
+    it('maps a record that disappears during an update to NotFound', async () => {
+      prisma.sandboxScript.findFirst.mockResolvedValueOnce(stored());
+      prisma.sandboxScript.update.mockRejectedValueOnce(
+        Object.assign(new Error('missing'), { code: 'P2025' }),
+      );
+      await expect(service.update(ORG, 'sc-1', { code: 'x' })).rejects.toBeInstanceOf(
+        NotFoundException,
+      );
     });
   });
 
   describe('list', () => {
     it('leaves the code out unless asked', async () => {
-      await service.list(ORG, SERVER);
-      await service.list(ORG, SERVER, { includeCode: true });
+      await service.list(ORG);
+      await service.list(ORG, { includeCode: true });
       expect(prisma.sandboxScript.findMany.mock.calls[0][0].select.code).toBe(false);
       expect(prisma.sandboxScript.findMany.mock.calls[1][0].select.code).toBe(true);
+    });
+
+    it('groups what a script uses by connector, with the connectors\' current names', async () => {
+      prisma.sandboxScript.findMany.mockResolvedValueOnce([
+        stored({
+          uses: [
+            row('c-erp', 'ERP (old name)', 'erp_orders_list'),
+            row('c-erp', 'ERP (old name)', 'erp_items_list'),
+            row('c-shop', 'Shop', 'shop_orders_list'),
+          ],
+        }),
+      ]);
+      const [script] = await service.list(ORG);
+      expect(script.uses).toEqual([
+        { connectorId: 'c-erp', connectorName: 'ERP', connectorExists: true, tools: ['erp_items_list', 'erp_orders_list'] },
+        { connectorId: 'c-shop', connectorName: 'Shop', connectorExists: true, tools: ['shop_orders_list'] },
+      ]);
+      // The names come from the organization's own connectors only.
+      expect(prisma.connector.findMany.mock.calls[0][0].where.organizationId).toBe(ORG);
+    });
+
+    it('keeps a deleted connector in the list, under the name it had', async () => {
+      prisma.sandboxScript.findMany.mockResolvedValueOnce([
+        stored({ uses: [row('c-gone', 'Old CRM', 'crm_list')] }),
+      ]);
+      const [script] = await service.list(ORG);
+      expect(script.uses).toEqual([
+        { connectorId: 'c-gone', connectorName: 'Old CRM', connectorExists: false, tools: ['crm_list'] },
+      ]);
     });
   });
 
@@ -127,24 +215,21 @@ describe('SandboxScriptsService', () => {
       'rejects the name %j',
       async (name) => {
         await expect(
-          service.create(ORG, SERVER, 'u1', { name, code: 'return 1' }),
+          service.create(ORG, 'u1', { name, code: 'return 1' }),
         ).rejects.toBeInstanceOf(BadRequestException);
         expect(prisma.sandboxScript.create).not.toHaveBeenCalled();
       },
     );
 
-    it('stores the script for the caller\'s organization and server', async () => {
-      await service.create(ORG, SERVER, 'u1', {
+    it('stores the script for the caller\'s organization, not for a server', async () => {
+      await service.create(ORG, 'u1', {
         name: 'delayed_orders-1',
         code: 'return 1',
         description: 'd',
       });
-      expect(prisma.sandboxScript.create.mock.calls[0][0].data).toMatchObject({
-        organizationId: ORG,
-        mcpServerId: SERVER,
-        createdById: 'u1',
-        name: 'delayed_orders-1',
-      });
+      const data = prisma.sandboxScript.create.mock.calls[0][0].data;
+      expect(data).toMatchObject({ organizationId: ORG, createdById: 'u1', name: 'delayed_orders-1' });
+      expect(data).not.toHaveProperty('mcpServerId');
     });
 
     it('reports a duplicate name as a conflict', async () => {
@@ -152,68 +237,237 @@ describe('SandboxScriptsService', () => {
         new Prisma.PrismaClientKnownRequestError('dup', { code: 'P2002', clientVersion: 'x' }),
       );
       await expect(
-        service.create(ORG, SERVER, undefined, { name: 'abc', code: 'return 1' }),
+        service.create(ORG, undefined, { name: 'abc', code: 'return 1' }),
       ).rejects.toBeInstanceOf(ConflictException);
+    });
+
+    describe('the connectors and tools it declares', () => {
+      it('stores what a person picked, with the connector names from the database', async () => {
+        const { script } = await service.create(ORG, 'u1', {
+          name: 'abc',
+          code: 'return 1',
+          uses: [
+            { connectorId: 'c-erp', tools: ['erp_orders_list', 'erp_items_list'] },
+            { connectorId: 'c-shop', tools: ['shop_orders_list'] },
+          ],
+        });
+        const rows = prisma.sandboxScript.create.mock.calls[0][0].data.uses.create;
+        expect(rows).toEqual(
+          expect.arrayContaining([
+            { organizationId: ORG, connectorId: 'c-erp', connectorName: 'ERP', toolName: 'erp_orders_list' },
+            { organizationId: ORG, connectorId: 'c-erp', connectorName: 'ERP', toolName: 'erp_items_list' },
+            { organizationId: ORG, connectorId: 'c-shop', connectorName: 'Shop', toolName: 'shop_orders_list' },
+          ]),
+        );
+        expect(rows).toHaveLength(3);
+        expect(script.uses.map((u) => u.connectorName)).toEqual(['ERP', 'Shop']);
+      });
+
+      it('refuses a connector of another organization', async () => {
+        await expect(
+          service.create(ORG, 'u1', {
+            name: 'abc',
+            code: 'return 1',
+            uses: [{ connectorId: 'c-other', tools: ['secret_tool'] }],
+          }),
+        ).rejects.toThrow("Unknown connector 'c-other'");
+        expect(prisma.sandboxScript.create).not.toHaveBeenCalled();
+      });
+
+      it('refuses a tool the connector does not have', async () => {
+        await expect(
+          service.create(ORG, 'u1', {
+            name: 'abc',
+            code: 'return 1',
+            uses: [{ connectorId: 'c-erp', tools: ['shop_orders_list'] }],
+          }),
+        ).rejects.toThrow("Connector 'ERP' has no tool 'shop_orders_list'");
+      });
+
+      it('refuses a connector with no tool picked', async () => {
+        await expect(
+          service.create(ORG, 'u1', { name: 'abc', code: 'return 1', uses: [{ connectorId: 'c-erp', tools: [] }] }),
+        ).rejects.toThrow("Pick at least one tool of 'ERP'");
+      });
+
+      it('resolves tool names an agent gives to their connectors', async () => {
+        await service.create(ORG, 'u1', {
+          name: 'abc',
+          code: 'return 1',
+          toolNames: ['erp_orders_list', 'shop_orders_list'],
+        });
+        const rows = prisma.sandboxScript.create.mock.calls[0][0].data.uses.create;
+        expect(rows.map((r: any) => `${r.connectorId}/${r.toolName}`).sort()).toEqual([
+          'c-erp/erp_orders_list',
+          'c-shop/shop_orders_list',
+        ]);
+      });
+
+      it('refuses a tool name that no connector of the organization has', async () => {
+        await expect(
+          service.create(ORG, 'u1', { name: 'abc', code: 'return 1', toolNames: ['secret_tool'] }),
+        ).rejects.toThrow("Unknown tool 'secret_tool'");
+      });
+
+      it('refuses an ambiguous tool name, unless the server\'s connector settles it', async () => {
+        const input = { name: 'abc', code: 'return 1', toolNames: ['orders_list'] };
+        await expect(service.create(ORG, 'u1', input)).rejects.toThrow(/exists on several connectors \(ERP, Shop\)/);
+        await service.create(ORG, 'u1', input, { preferConnectorIds: ['c-shop'] });
+        expect(prisma.sandboxScript.create.mock.calls[0][0].data.uses.create).toEqual([
+          { organizationId: ORG, connectorId: 'c-shop', connectorName: 'Shop', toolName: 'orders_list' },
+        ]);
+      });
+
+      it('adds the tools the code calls that were not declared, and says so', async () => {
+        const { script, added, warnings } = await service.create(ORG, 'u1', {
+          name: 'abc',
+          code: 'const a = await tools.erp_orders_list({}); const b = await tools.shop_orders_list({});',
+          uses: [{ connectorId: 'c-erp', tools: ['erp_orders_list'] }],
+        });
+        expect(added).toEqual(['Shop / shop_orders_list']);
+        expect(warnings).toEqual([]);
+        expect(script.uses.map((u) => u.connectorName)).toEqual(['ERP', 'Shop']);
+      });
+
+      it('does not re-add a tool whose name was declared', async () => {
+        // `orders_list` is on two connectors; the person picked the ERP one.
+        const { added, warnings } = await service.create(ORG, 'u1', {
+          name: 'abc',
+          code: 'await tools.orders_list({});',
+          uses: [{ connectorId: 'c-erp', tools: ['orders_list'] }],
+        });
+        expect(added).toEqual([]);
+        expect(warnings).toEqual([]);
+        expect(prisma.sandboxScript.create.mock.calls[0][0].data.uses.create).toHaveLength(1);
+      });
+
+      it('warns about a call it cannot match, and about a computed name, without failing', async () => {
+        const { script, warnings } = await service.create(ORG, 'u1', {
+          name: 'abc',
+          code: 'await tools.no_such_tool({}); await tools.orders_list({}); await tools[pick]({});',
+        });
+        expect(script.uses).toEqual([]);
+        expect(warnings).toEqual([
+          'tools.no_such_tool is not a tool of any connector in this organization.',
+          expect.stringMatching(/tools\.orders_list exists on several connectors \(ERP, Shop\)/),
+          expect.stringMatching(/computed name/),
+        ]);
+      });
+
+      it('limits how many tools a script can declare', async () => {
+        const names = Array.from({ length: 101 }, (_, i) => `t${i}`);
+        prisma.mcpTool.findMany.mockResolvedValueOnce(
+          names.map((n) => ({ name: n, connectorId: 'c-erp', connector: { name: 'ERP' } })),
+        );
+        await expect(
+          service.create(ORG, 'u1', { name: 'abc', code: 'return 1', toolNames: names }),
+        ).rejects.toThrow(/at most 100 tools/);
+        expect(prisma.sandboxScript.create).not.toHaveBeenCalled();
+      });
     });
   });
 
   describe('update', () => {
     it('bumps the version only when the code changes', async () => {
+      prisma.sandboxScript.findFirst.mockResolvedValue(stored());
       await service.update(ORG, 'sc-1', { code: 'return 2' });
       await service.update(ORG, 'sc-1', { description: 'only text' });
-      expect(prisma.sandboxScript.update.mock.calls[0][0].data).toEqual({
+      expect(prisma.sandboxScript.update.mock.calls[0][0].data).toMatchObject({
         code: 'return 2',
         version: { increment: 1 },
       });
-      expect(prisma.sandboxScript.update.mock.calls[1][0].data).toEqual({
-        description: 'only text',
+      expect(prisma.sandboxScript.update.mock.calls[1][0].data).toEqual({ description: 'only text' });
+    });
+
+    it('leaves what the script declares alone when only the description changes', async () => {
+      prisma.sandboxScript.findFirst.mockResolvedValueOnce(
+        stored({ uses: [row('c-erp', 'ERP', 'erp_orders_list')] }),
+      );
+      await service.update(ORG, 'sc-1', { description: 'text' });
+      expect(prisma.sandboxScript.update.mock.calls[0][0].data).not.toHaveProperty('uses');
+    });
+
+    it('keeps the declared tools and adds the ones new code calls', async () => {
+      prisma.sandboxScript.findFirst.mockResolvedValueOnce(
+        stored({ uses: [row('c-erp', 'ERP', 'erp_orders_list')] }),
+      );
+      const { added } = await service.update(ORG, 'sc-1', {
+        code: 'await tools.erp_orders_list({}); await tools.shop_orders_list({});',
       });
+      expect(added).toEqual(['Shop / shop_orders_list']);
+      const { deleteMany, create } = prisma.sandboxScript.update.mock.calls[0][0].data.uses;
+      expect(deleteMany).toEqual({});
+      expect(create.map((r: any) => r.toolName).sort()).toEqual(['erp_orders_list', 'shop_orders_list']);
+    });
+
+    it('replaces the declared tools when a new list is sent', async () => {
+      prisma.sandboxScript.findFirst.mockResolvedValueOnce(
+        stored({ uses: [row('c-erp', 'ERP', 'erp_orders_list'), row('c-shop', 'Shop', 'shop_orders_list')] }),
+      );
+      await service.update(ORG, 'sc-1', { uses: [{ connectorId: 'c-erp', tools: ['erp_items_list'] }] });
+      const { create } = prisma.sandboxScript.update.mock.calls[0][0].data.uses;
+      expect(create.map((r: any) => r.toolName)).toEqual(['erp_items_list']);
+    });
+
+    it('can clear the declared tools with an empty list of tool names', async () => {
+      prisma.sandboxScript.findFirst.mockResolvedValueOnce(
+        stored({ uses: [row('c-erp', 'ERP', 'erp_orders_list')] }),
+      );
+      await service.update(ORG, 'sc-1', { toolNames: [] });
+      expect(prisma.sandboxScript.update.mock.calls[0][0].data.uses.create).toEqual([]);
     });
 
     it('requires something to change', async () => {
       await expect(service.update(ORG, 'sc-1', {})).rejects.toBeInstanceOf(BadRequestException);
     });
 
-    it('lets the author edit by name within the caller\'s server', async () => {
-      prisma.sandboxScript.findFirst.mockResolvedValueOnce({ id: 'sc-9', createdById: 'u1' });
-      await service.updateByName(ORG, SERVER, 'abc', { code: 'return 3' }, 'u1');
+    it('lets the author edit by name', async () => {
+      prisma.sandboxScript.findFirst.mockResolvedValue(stored({ id: 'sc-9' }));
+      await service.updateByName(ORG, 'abc', { code: 'return 3' }, 'u1');
       expect(prisma.sandboxScript.findFirst.mock.calls[0][0].where).toEqual({
         organizationId: ORG,
-        mcpServerId: SERVER,
         name: 'abc',
       });
       expect(prisma.sandboxScript.update.mock.calls[0][0].where.id).toBe('sc-9');
     });
 
     it('refuses an edit by anyone but the author, so planted code cannot run with someone else\'s authority', async () => {
-      prisma.sandboxScript.findFirst.mockResolvedValueOnce({ id: 'sc-9', createdById: 'u-admin' });
+      prisma.sandboxScript.findFirst.mockResolvedValueOnce(stored({ id: 'sc-9', createdById: 'u-admin' }));
       await expect(
-        service.updateByName(ORG, SERVER, 'monthly_report', { code: 'await tools.delete_all({})' }, 'u-low'),
+        service.updateByName(ORG, 'monthly_report', { code: 'await tools.delete_all({})' }, 'u-low'),
+      ).rejects.toBeInstanceOf(ForbiddenException);
+      expect(prisma.sandboxScript.update).not.toHaveBeenCalled();
+    });
+
+    it('refuses a change of the declared tools by anyone but the author', async () => {
+      prisma.sandboxScript.findFirst.mockResolvedValueOnce(stored({ id: 'sc-9', createdById: 'u-admin' }));
+      await expect(
+        service.updateByName(ORG, 'abc', { toolNames: ['erp_orders_list'] }, 'u-low'),
       ).rejects.toBeInstanceOf(ForbiddenException);
       expect(prisma.sandboxScript.update).not.toHaveBeenCalled();
     });
 
     it('treats an unidentified editor as a different person from an identified author', async () => {
-      prisma.sandboxScript.findFirst.mockResolvedValueOnce({ id: 'sc-9', createdById: 'u1' });
+      prisma.sandboxScript.findFirst.mockResolvedValueOnce(stored({ id: 'sc-9', createdById: 'u1' }));
       await expect(
-        service.updateByName(ORG, SERVER, 'abc', { code: 'x' }, undefined),
+        service.updateByName(ORG, 'abc', { code: 'x' }, undefined),
       ).rejects.toBeInstanceOf(ForbiddenException);
-      prisma.sandboxScript.findFirst.mockResolvedValueOnce({ id: 'sc-9', createdById: null });
+      prisma.sandboxScript.findFirst.mockResolvedValueOnce(stored({ id: 'sc-9', createdById: null }));
       await expect(
-        service.updateByName(ORG, SERVER, 'abc', { code: 'x' }, 'u1'),
+        service.updateByName(ORG, 'abc', { code: 'x' }, 'u1'),
       ).rejects.toBeInstanceOf(ForbiddenException);
       expect(prisma.sandboxScript.update).not.toHaveBeenCalled();
     });
 
     it('lets scripts made without a user (auth disabled) be edited without one', async () => {
-      prisma.sandboxScript.findFirst.mockResolvedValueOnce({ id: 'sc-9', createdById: null });
-      await service.updateByName(ORG, SERVER, 'abc', { code: 'return 3' }, undefined);
+      prisma.sandboxScript.findFirst.mockResolvedValue(stored({ id: 'sc-9', createdById: null }));
+      await service.updateByName(ORG, 'abc', { code: 'return 3' }, undefined);
       expect(prisma.sandboxScript.update).toHaveBeenCalledTimes(1);
     });
 
     it('reports an unknown name as not found', async () => {
       await expect(
-        service.updateByName(ORG, SERVER, 'nope', { code: 'x' }, 'u1'),
+        service.updateByName(ORG, 'nope', { code: 'x' }, 'u1'),
       ).rejects.toBeInstanceOf(NotFoundException);
     });
   });
@@ -335,21 +589,8 @@ describe('SandboxScriptsService', () => {
   });
 
   describe('dashboard access (by id)', () => {
-    it('finds a script only on the server it belongs to', async () => {
-      prisma.sandboxScript.findFirst.mockResolvedValueOnce({ id: 'sc-1', mcpServerId: SERVER });
-      await service.getForServer(ORG, SERVER, 'sc-1');
-      expect(prisma.sandboxScript.findFirst.mock.calls[0][0].where).toEqual({
-        id: 'sc-1',
-        organizationId: ORG,
-        mcpServerId: SERVER,
-      });
-      await expect(service.getForServer(ORG, 'srv-2', 'sc-1')).rejects.toBeInstanceOf(
-        NotFoundException,
-      );
-    });
-
     it('lets the author edit by id', async () => {
-      prisma.sandboxScript.findFirst.mockResolvedValueOnce({ id: 'sc-1', name: 'abc', createdById: 'u1' });
+      prisma.sandboxScript.findFirst.mockResolvedValue(stored());
       await service.updateByIdAsAuthor(ORG, 'sc-1', { code: 'return 2' }, 'u1');
       expect(prisma.sandboxScript.findFirst.mock.calls[0][0].where).toEqual({
         id: 'sc-1',
@@ -362,7 +603,7 @@ describe('SandboxScriptsService', () => {
     });
 
     it('refuses an edit by anyone but the author, administrators included', async () => {
-      prisma.sandboxScript.findFirst.mockResolvedValueOnce({ id: 'sc-1', name: 'abc', createdById: 'u-low' });
+      prisma.sandboxScript.findFirst.mockResolvedValueOnce(stored({ createdById: 'u-low' }));
       await expect(
         service.updateByIdAsAuthor(ORG, 'sc-1', { code: 'await tools.x({})' }, 'u-admin'),
       ).rejects.toBeInstanceOf(ForbiddenException);
@@ -377,7 +618,7 @@ describe('SandboxScriptsService', () => {
     });
 
     it('lets the author delete their script', async () => {
-      prisma.sandboxScript.findFirst.mockResolvedValueOnce({ id: 'sc-1', createdById: 'u1' });
+      prisma.sandboxScript.findFirst.mockResolvedValueOnce(stored());
       await service.removeAsUser(ORG, 'sc-1', { userId: 'u1', isAdmin: false });
       expect(prisma.sandboxScript.deleteMany).toHaveBeenCalledWith({
         where: { id: 'sc-1', organizationId: ORG },
@@ -385,13 +626,13 @@ describe('SandboxScriptsService', () => {
     });
 
     it('lets an administrator delete anyone\'s script', async () => {
-      prisma.sandboxScript.findFirst.mockResolvedValueOnce({ id: 'sc-1', createdById: 'u-low' });
+      prisma.sandboxScript.findFirst.mockResolvedValueOnce(stored({ createdById: 'u-low' }));
       await service.removeAsUser(ORG, 'sc-1', { userId: 'u-admin', isAdmin: true });
       expect(prisma.sandboxScript.deleteMany).toHaveBeenCalledTimes(1);
     });
 
     it('refuses a delete by someone who is neither the author nor an administrator', async () => {
-      prisma.sandboxScript.findFirst.mockResolvedValueOnce({ id: 'sc-1', createdById: 'u1' });
+      prisma.sandboxScript.findFirst.mockResolvedValueOnce(stored());
       await expect(
         service.removeAsUser(ORG, 'sc-1', { userId: 'u2', isAdmin: false }),
       ).rejects.toBeInstanceOf(ForbiddenException);

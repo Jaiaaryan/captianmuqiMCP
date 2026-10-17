@@ -1,6 +1,8 @@
 import { ApiProperty, ApiPropertyOptional } from '@nestjs/swagger';
 import { Type } from 'class-transformer';
 import {
+  ArrayMaxSize,
+  IsArray,
   IsIn,
   IsInt,
   IsObject,
@@ -11,6 +13,7 @@ import {
   MaxLength,
   Min,
   MinLength,
+  ValidateNested,
 } from 'class-validator';
 import { SANDBOX_TIMEOUT_RANGE_MS } from './limits';
 
@@ -20,6 +23,28 @@ export const SCRIPT_NAME_MESSAGE =
   'name must start with a lowercase letter and be 2-64 characters of a-z, 0-9, "_" or "-"';
 export const SCRIPT_CODE_MAX_CHARS = 64 * 1024;
 export const SCRIPT_DESCRIPTION_MAX_CHARS = 2_000;
+/** A script may use up to this many connectors, and this many tools across them. */
+export const SCRIPT_MAX_CONNECTORS = 20;
+export const SCRIPT_MAX_TOOLS = 100;
+
+/** The tools of one connector that a script uses, as picked by a person. */
+export class ScriptUseDto {
+  @ApiProperty({ description: 'Id of a connector of this organization.' })
+  @IsString()
+  @MinLength(1)
+  @MaxLength(100)
+  connectorId!: string;
+
+  @ApiProperty({
+    type: [String],
+    description: 'Names of the tools of that connector the script calls. At least one.',
+  })
+  @IsArray()
+  @ArrayMaxSize(SCRIPT_MAX_TOOLS)
+  @IsString({ each: true })
+  @MaxLength(200, { each: true })
+  tools!: string[];
+}
 
 export class CreateSandboxScriptDto {
   @ApiProperty({ example: 'delayed_orders_last_month' })
@@ -38,6 +63,19 @@ export class CreateSandboxScriptDto {
   @IsString()
   @MaxLength(SCRIPT_DESCRIPTION_MAX_CHARS)
   description?: string;
+
+  @ApiPropertyOptional({
+    type: [ScriptUseDto],
+    description:
+      'The connectors and tools the script uses. Tools found in the code are added to this list; ' +
+      'a saved script can call only the tools it declares.',
+  })
+  @IsOptional()
+  @IsArray()
+  @ArrayMaxSize(SCRIPT_MAX_CONNECTORS)
+  @ValidateNested({ each: true })
+  @Type(() => ScriptUseDto)
+  uses?: ScriptUseDto[];
 }
 
 export class UpdateSandboxScriptDto {
@@ -53,6 +91,19 @@ export class UpdateSandboxScriptDto {
   @IsString()
   @MaxLength(SCRIPT_DESCRIPTION_MAX_CHARS)
   description?: string;
+
+  @ApiPropertyOptional({
+    type: [ScriptUseDto],
+    description:
+      'The connectors and tools the script uses. Tools found in the code are added to this list; ' +
+      'a saved script can call only the tools it declares.',
+  })
+  @IsOptional()
+  @IsArray()
+  @ArrayMaxSize(SCRIPT_MAX_CONNECTORS)
+  @ValidateNested({ each: true })
+  @Type(() => ScriptUseDto)
+  uses?: ScriptUseDto[];
 }
 
 /** Exactly one of `code` / `scriptId` is required; the controller checks. */

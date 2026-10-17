@@ -17,6 +17,7 @@ caller has authenticated to. The shared `/mcp` endpoint and the public
 - [Who a script runs as](#who-a-script-runs-as)
 - [Read-only by default](#read-only-by-default)
 - [Saved scripts](#saved-scripts)
+- [Connectors and tools of a saved script](#connectors-and-tools-of-a-saved-script)
 - [Dashboard and REST API](#dashboard-and-rest-api)
 - [Limits and configuration](#limits-and-configuration)
 - [Errors](#errors)
@@ -35,9 +36,9 @@ mode tool of that name is not registered.
 | Tool | Does |
 |------|------|
 | `sandbox_run_script` | Runs `code`, or a saved script given as `scriptName`. Optional `args` (exposed to the script as `args`) and `timeoutMs` (1000 to 30000). Provide exactly one of `code` and `scriptName`. |
-| `sandbox_create_script` | Saves a named script for this MCP server. The code is syntax-checked, not executed. |
-| `sandbox_edit_script` | Changes a saved script's code and/or description. Only the script's author can do this. The version goes up when the code changes. |
-| `sandbox_list_scripts` | Lists the saved scripts with version, owner flag (`ownedByYou`) and last run. |
+| `sandbox_create_script` | Saves a named script for the organization. Optional `tools`: the names of the tools it calls. The code is syntax-checked, not executed. |
+| `sandbox_edit_script` | Changes a saved script's code, description and/or declared `tools` (a new list replaces the old one). Only the script's author can do this. The version goes up when the code changes. |
+| `sandbox_list_scripts` | Lists the saved scripts **this server can run**, with the connectors and tools each uses, version, owner flag (`ownedByYou`) and last run. |
 
 The description of `sandbox_run_script` includes a signature list of the tools
 the script may call, so the agent knows the names and parameters without a
@@ -85,6 +86,8 @@ A script calls tools with the **caller's own session**:
 - `tools.*` contains only the tools that survived the server's role filter for
   this caller, the same tools they would see in the normal tool list. A tool the
   caller cannot call directly cannot be called from a script either.
+  A saved script is narrowed further, to the tools it declared (see
+  [Connectors and tools of a saved script](#connectors-and-tools-of-a-saved-script)).
 - Each call is scoped to the connector that owns the tool, so two connectors with
   a tool of the same name do not collide.
 - The role allow-list is read again at the start of every run, so a role change
@@ -123,9 +126,11 @@ something an agent or a script can ask for:
 
 ## Saved scripts
 
-A saved script belongs to one MCP server. Names are lowercase, start with a
-letter and are 2 to 64 characters of `a-z`, `0-9`, `_` or `-`; a name is unique
-per server.
+Saved scripts belong to the **organization**, not to one MCP server: write a script
+once and every server that has the connectors it needs can offer it (see
+[Connectors and tools of a saved script](#connectors-and-tools-of-a-saved-script)).
+Names are lowercase, start with a letter and are 2 to 64 characters of `a-z`,
+`0-9`, `_` or `-`; a name is unique per organization.
 
 A saved script runs with the authority of **whoever runs it**, not of whoever
 wrote it. To keep a user with fewer permissions from planting code that a more
@@ -133,6 +138,63 @@ privileged user's agent then runs, only a script's author can edit it. Anyone
 else saves their own copy under a new name. When a saved script runs, the result
 includes `script: { name, version, ownedByYou }` so the caller can see whose code
 ran.
+
+## Connectors and tools of a saved script
+
+Every saved script records the connectors it uses and, for each, the tools of it it
+calls. The record does three things.
+
+- **It is shown.** On the Code mode page each script card has a pin with the number
+  of connectors; hover or focus it for the connectors and their tools. The opened
+  script lists them under *Connectors & tools*, and an agent sees them in
+  `sandbox_list_scripts`.
+- **It decides where the script is offered.** An MCP server offers a script to an
+  agent **if and only if the server has every connector the script uses.** On a
+  server that lacks one, the script is absent from `sandbox_list_scripts` and
+  `sandbox_run_script { scriptName }` and `sandbox_edit_script` answer "not found". A
+  script that uses no connector is offered everywhere. The dashboard still lists it,
+  marked *Not on this server*, and cannot run it there (REST: `409`).
+- **It limits the script.** A saved script can call **only the tools it declared**,
+  of those its caller may call anyway. Calling another tool fails with
+  `TOOL_NOT_ALLOWED` and a hint to declare it. This is what makes the record
+  trustworthy. Code run inline declares nothing and can call every tool its caller
+  may.
+
+How the record is made:
+
+- **By a person**, in the editor: *Connectors & tools* lists every connector of the
+  organization; tick the tools the script calls (ticking a connector ticks all of
+  its tools). The host checks that each connector belongs to the organization and
+  has each tool.
+- **By an agent**, with `tools: ["tool_name", …]` on `sandbox_create_script` or
+  `sandbox_edit_script`, using the names in its tool list. The host finds the
+  connector of each. A name that no connector has is an error.
+- **From the code**, always: on every save the host reads the code, and adds each
+  tool called as `tools.name(...)` or `tools['name']` that was not declared and can
+  be matched to exactly one tool. The answer says what was added (`added`) and what
+  could not be matched (`warnings`): a name that is on several connectors, a name no
+  connector has, or a computed name such as `tools[kind]`, which cannot be read from
+  the text and must be declared by hand. Comments and strings are ignored.
+
+Saving a new list replaces the declared tools (and the code's calls are added
+again); saving new code with no list keeps what was declared and adds new calls.
+
+If a connector is **deleted**, the script keeps needing it: it shows the connector
+as *removed* and is offered on no server, instead of quietly losing the dependency.
+Re-creating a connector gives it a new identity, so declare the new one.
+
+Limits: 20 connectors and 100 tools per script. When two connectors of one server
+have a tool of the same name, only the first can be called from a script (the same
+rule as for every script), so a saved script that needs the other one cannot use it.
+
+### Upgrading
+
+The migration `sandbox_script_connectors` moves existing scripts to the
+organization: where two servers of one organization had a script of the same name,
+the older keeps it and the others get a short suffix from their id. Each script's
+code is read once and the tools it calls on its old server are declared, so
+existing scripts keep working. A script that picked tools by a computed name has to
+be declared by hand.
 
 ## Dashboard and REST API
 
@@ -142,17 +204,23 @@ negative-test suite) and *Benchmark* (one raw tool call against a script that
 answers the same question). Viewers can read scripts and the history but not run
 or change anything.
 
+On *Scripts*, the MCP server chosen at the top decides what can run. The list shows
+the whole organization's scripts; a pin on each card shows how many connectors it
+uses, with the tools in its tooltip, and a script the chosen server cannot run says
+which connector it lacks. **Filter** opens a pop-up with a checkbox per connector;
+after *Apply* only the scripts that use at least one ticked connector are listed.
+
 The same operations are available over REST with the dashboard's JWT. All routes
 are under `/api/sandbox`, scoped to the caller's active organization; a server of
 another organization answers `404`, never `403`.
 
 | Route | Does |
 |-------|------|
-| `POST /servers/:serverId/run` | Run `code` or a saved `scriptId` (exactly one), with optional `args` and `timeoutMs`. A failing script still answers `200` with `ok: false`; `429` means the organization is at `SANDBOX_MAX_CONCURRENT`. Needs ADMIN or EDITOR. |
-| `GET /servers/:serverId/scripts` | Saved scripts (without code unless `includeCode=1`). Any role. |
-| `POST /servers/:serverId/scripts` | Save a script. The code is syntax-checked, not run. Needs ADMIN or EDITOR. |
-| `GET /scripts/:scriptId` | One script, with its code. |
-| `PATCH /scripts/:scriptId` | Change code and/or description. Author only. Needs ADMIN or EDITOR. |
+| `POST /servers/:serverId/run` | Run `code` or a saved `scriptId` (exactly one), with optional `args` and `timeoutMs`. A failing script still answers `200` with `ok: false`; `409` means the server lacks a connector the saved script uses; `429` means the organization is at `SANDBOX_MAX_CONCURRENT`. Needs ADMIN or EDITOR. |
+| `GET /servers/:serverId/scripts` | The organization's saved scripts (without code unless `includeCode=1`), each with `uses` (connectors and tools) and, for this server, `availableOnServer` and `missingConnectors`. Any role. |
+| `POST /servers/:serverId/scripts` | Save a script, optionally with `uses: [{ connectorId, tools }]`. Tools called in the code are added; the answer has `added` and `warnings`. The code is syntax-checked, not run. The server only settles ambiguous tool names. Needs ADMIN or EDITOR. |
+| `GET /scripts/:scriptId` | One script, with its code and `uses`. |
+| `PATCH /scripts/:scriptId` | Change code, description and/or `uses` (a new list replaces the old). Author only. Needs ADMIN or EDITOR. |
 | `DELETE /scripts/:scriptId` | Delete. Its author or an ADMIN. Answers `204`. |
 | `GET /servers/:serverId/runs?limit=` | Recent runs. An ADMIN sees all of them; anyone else sees their own, because a run keeps a preview of what the connectors returned. |
 | `POST /servers/:serverId/isolation-tests` | Runs the fixed negative-test suite against the live sandbox with synthetic tools. Touches no connector. Needs ADMIN or EDITOR. |
@@ -231,8 +299,8 @@ Runs are not pruned automatically; they are removed together with their MCP
 server or organization. A failure to store a run is logged and never turns a
 finished run into an error for the caller.
 
-Saved scripts are stored in `sandbox_scripts`. Every query on both tables is
-filtered by `organizationId`, and both tables are in the optional row-level
+Saved scripts are stored in `sandbox_scripts`, and the tools each declares in `sandbox_script_tools` (one row per connector and tool; the connector is kept by id and name, not as a foreign key, so that deleting a connector does not erase the dependency). Every query on these tables is
+filtered by `organizationId`, and all three tables are in the optional row-level
 security script, which is off by default (see
 [Row-level security](operations/row-level-security.md)).
 

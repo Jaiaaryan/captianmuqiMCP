@@ -24,6 +24,7 @@ const OUT = resolve(ROOT, 'docs/sandbox/screenshots');
 const BASE = (process.env.AMCP_UI ?? 'http://localhost:3000').replace(/\/$/, '');
 const DEMO_SERVER = process.env.DEMO_SERVER ?? 'koch-demo';
 const BIG_SERVER = process.env.BIG_SERVER ?? 'Shop A';
+const SHOP_CONNECTOR = process.env.SHOP_CONNECTOR ?? 'Shop API (A)';
 
 if (!process.env.AMCP_EMAIL || !process.env.AMCP_PASSWORD) {
   console.error('Set AMCP_EMAIL and AMCP_PASSWORD.');
@@ -76,48 +77,110 @@ try {
   const page = await ctx.newPage();
   watch(page, 'admin');
 
+  // A server that has both the demo ERP and the shop connector, so a script that uses both can run
+  // somewhere. (The demo server only has the ERP.)
+  const api = async (method, path, body) => {
+    const res = await fetch(`${API}${path}`, {
+      method,
+      headers: { 'content-type': 'application/json', authorization: `Bearer ${session.accessToken}` },
+      body: body === undefined ? undefined : JSON.stringify(body),
+    });
+    const text = await res.text();
+    if (!res.ok) throw new Error(`${method} ${path} -> ${res.status}: ${text.slice(0, 200)}`);
+    return text ? JSON.parse(text) : null;
+  };
+  const connectorList = await api('GET', '/api/connectors');
+  const idOf = (name) => connectorList.find((c) => c.name === name)?.id;
+  const BOTH_SERVER = 'Demo: ERP + Shop';
+  const erpId = idOf('KOCH Demo ERP');
+  const shopId = idOf(SHOP_CONNECTOR);
+  if (!erpId || !shopId) throw new Error(`Need the connectors "KOCH Demo ERP" and "${SHOP_CONNECTOR}" (seed the demo and the e2e stack first).`);
+  const existing = (await api('GET', '/api/mcp-servers')).find((x) => x.name === BOTH_SERVER);
+  const bothServer = existing ?? (await api('POST', '/api/mcp-servers', { name: BOTH_SERVER }));
+  await api('PUT', `/api/mcp-servers/${bothServer.id}/connectors`, { connectorIds: [erpId, shopId] });
+  // A run that stopped half way leaves its script behind; start clean.
+  for (const leftover of await api('GET', `/api/sandbox/servers/${bothServer.id}/scripts`)) {
+    if (leftover.name === 'erp_products_vs_shop_orders') await api('DELETE', `/api/sandbox/scripts/${leftover.id}`);
+  }
+
   await page.goto(`${BASE}/sandbox`);
   await expect(page.getByRole('tablist', { name: 'Code mode' })).toBeVisible();
   await chooseServer(page, DEMO_SERVER);
 
-  // ---- 1. a saved script, read ------------------------------------------------
+  // ---- 1. a saved script, read: the pin on each card and the connectors & tools of the opened one ------------
   await page.getByTestId('script-row').filter({ hasText: 'delayed_orders_last_month' }).click();
   await expect(page.locator('pre').first()).toContainText('erp_orders_export');
+  await expect(page.getByTestId('script-uses')).toContainText('erp_orders_export');
   await shot(page, '01-scripts');
 
-  // ---- 2. ...and run: the data-flow line is the point of code mode -------------
+  // ---- 2. hover a pin: the connectors and tools, in a tooltip --------------------------------------------------
+  await page.locator('li', { hasText: 'top10_customers_by_delay_days' }).getByTestId('script-pin').hover();
+  await expect(page.getByTestId('pin-tooltip')).toContainText('erp_customers_list');
+  await shot(page, '02-pin-tooltip');
+  await page.mouse.move(700, 20);
+
+  // ---- 3. ...and run: the data-flow line is the point of code mode -------------------------------------------
   await page.locator('#script-args').fill('{"asOf": "2026-10-15"}');
   await page.getByRole('button', { name: 'Run', exact: true }).click();
   await expect(page.getByTestId('run-result')).toContainText('Succeeded', { timeout: 30_000 });
   await expect(page.getByTestId('run-result')).toContainText('"delayedOrders": 922');
-  await shot(page, '02-script-run');
+  await shot(page, '03-script-run');
 
-  // ---- 3. write a script, save it, run it, delete it ---------------------------
+  // ---- 4. write a script that uses two connectors, picking them and their tools ------------------------------
   await page.getByRole('button', { name: 'New script' }).click();
-  await page.locator('#script-name').fill('top_categories_this_year');
-  await page.locator('#script-desc').fill('Revenue of the three biggest categories this year');
-  await page.getByLabel('Script code').fill(`const items = await tools.erp_order_items_list({ from: '2026-01-01', to: '2027-01-01', limit: 200000 });
+  await page.locator('#script-name').fill('erp_products_vs_shop_orders');
+  await page.locator('#script-desc').fill('How many products the ERP has and how many recent orders the shop shows');
+  await page.getByLabel('Script code').fill(`const shop = await tools.shop_list_orders({ limit: 5 });
 const products = await tools.erp_products_list({});
-const category = Object.fromEntries(products.rows.map((p) => [p.id, p.category]));
-const totals = {};
-for (const i of items.rows) totals[category[i.product_id]] = (totals[category[i.product_id]] ?? 0) + i.qty * i.price;
-const top = Object.entries(totals).sort((a, b) => b[1] - a[1]).slice(0, 3);
-return Object.fromEntries(top.map(([c, v]) => [c, Math.round(v * 100) / 100]));
+return { shopOrdersSeen: shop.length, erpProducts: products.rows.length };
 `);
+  const picker = page.getByTestId('uses-picker');
+  await picker.getByRole('button', { name: /^KOCH Demo ERP/ }).click();
+  await picker.getByLabel('KOCH Demo ERP: erp_products_list').check();
+  await picker.getByRole('button', { name: new RegExp(`^${SHOP_CONNECTOR.replace(/[()]/g, '\\$&')}`) }).click();
+  await picker.getByLabel(`${SHOP_CONNECTOR}: shop_list_orders`).check();
+  await expect(page.getByTestId('uses-count')).toHaveText('2 connectors, 2 tools');
+  // Clicking into the list scrolled it; show it from the top.
+  await picker.locator('ul').first().evaluate((el) => { el.scrollTop = 0; });
+  await picker.scrollIntoViewIfNeeded();
+  await shot(page, '04-new-script-picker');
+
+  // ---- 5. saved: the demo server has no shop connector, so it says it cannot run the script here ------------
   await page.getByRole('button', { name: 'Save', exact: true }).click();
-  await expect(page.getByRole('status')).toContainText('Saved top_categories_this_year', { timeout: 15_000 });
+  await expect(page.getByTestId('notice')).toContainText('Saved erp_products_vs_shop_orders', { timeout: 15_000 });
+  await expect(page.getByTestId('unavailable-notice')).toBeVisible();
+  await expect(page.getByRole('button', { name: 'Run', exact: true })).toBeDisabled();
+  await shot(page, '05-script-needs-a-connector');
+
+  // ---- 6. the filter pop-up ----------------------------------------------------------------------------------
+  await page.getByTestId('filter-button').click();
+  const dialog = page.getByTestId('filter-dialog');
+  await dialog.locator('label').filter({ hasText: new RegExp(`${SHOP_CONNECTOR.replace(/[()]/g, '\\$&')}\\s*\\d+ script`) }).locator('input').check();
+  await shot(page, '06-filter-dialog');
+  await dialog.getByRole('button', { name: 'Apply' }).click();
+  await expect(page.getByTestId('filter-chips')).toBeVisible();
+  await shot(page, '07-filtered');
+  await page.getByTestId('filter-chips').getByRole('button', { name: 'Clear' }).click();
+
+  // ---- 7. on a server that has both connectors, the same script runs -----------------------------------------
+  await chooseServer(page, BOTH_SERVER);
+  await page.getByTestId('script-row').filter({ hasText: 'erp_products_vs_shop_orders' }).click();
+  await expect(page.getByTestId('unavailable-notice')).toHaveCount(0);
   await page.getByRole('button', { name: 'Run', exact: true }).click();
   await expect(page.getByTestId('run-result')).toContainText('Succeeded', { timeout: 30_000 });
-  await shot(page, '03-new-script');
+  await expect(page.getByTestId('run-result')).toContainText('erpProducts');
+  await shot(page, '08-two-connectors-run');
+  // Done with it: delete it, and go back to the demo server.
   await page.getByRole('button', { name: 'Delete' }).click();
   await page.getByRole('button', { name: 'Yes, delete' }).click();
-  await expect(page.getByTestId('script-row').filter({ hasText: 'top_categories_this_year' })).toHaveCount(0);
+  await expect(page.getByTestId('script-row').filter({ hasText: 'erp_products_vs_shop_orders' })).toHaveCount(0);
+  await chooseServer(page, DEMO_SERVER);
 
   // ---- 4. run history ----------------------------------------------------------
   await tab(page, 'Runs');
   await expect(page.getByTestId('run-row').first()).toBeVisible();
   await page.getByTestId('run-row').first().click();
-  await shot(page, '04-runs');
+  await shot(page, '09-runs');
 
   // ---- 5. the isolation suite: the judges' screen ------------------------------
   await tab(page, 'Isolation tests');
@@ -128,14 +191,14 @@ return Object.fromEntries(top.map(([c, v]) => [c, Math.round(v * 100) / 100]));
   const passed = await page.locator('[data-testid="isolation-row"][data-passed="true"]').count();
   console.log(`isolation suite on screen: ${passed} of ${rows} passed`);
   if (passed !== rows) problems.push(`isolation suite shows ${rows - passed} failing row(s)`);
-  await shot(page, '05-isolation');
+  await shot(page, '10-isolation');
 
   // ---- 6. benchmark: the demo question -----------------------------------------
   await tab(page, 'Benchmark');
   await page.getByRole('button', { name: /Use the demo question/ }).click();
   await page.getByRole('button', { name: 'Run both' }).click();
   await expect(page.getByTestId('benchmark-result')).toContainText('Sandbox script', { timeout: 60_000 });
-  await shot(page, '06-benchmark');
+  await shot(page, '11-benchmark');
 
   // ---- 7. benchmark: the 44 MB response of the brief ---------------------------
   await chooseServer(page, BIG_SERVER);
@@ -151,7 +214,7 @@ return { rows: rows.length, delivered };
 `);
   await page.getByRole('button', { name: 'Run both' }).click();
   await expect(page.getByTestId('reduction-bytes')).toBeVisible({ timeout: 90_000 });
-  await shot(page, '07-benchmark-44mb');
+  await shot(page, '12-benchmark-44mb');
 
   // ---- 8. a viewer: read-only ---------------------------------------------------
   if (process.env.AMCP_VIEWER_TOKEN) {
@@ -169,7 +232,7 @@ return { rows: rows.length, delivered };
     await vp.getByTestId('script-row').first().click();
     await expect(vp.getByText('Viewers can read scripts but not run them.')).toBeVisible();
     await expect(vp.getByRole('button', { name: 'New script' })).toHaveCount(0);
-    await shot(vp, '08-viewer-read-only');
+    await shot(vp, '13-viewer-read-only');
     await viewerCtx.close();
   }
 
@@ -180,10 +243,12 @@ return { rows: rows.length, delivered };
   await phone.goto(`${BASE}/sandbox`);
   await expect(phone.getByRole('tablist', { name: 'Code mode' })).toBeVisible();
   await chooseServer(phone, DEMO_SERVER);
+  await phone.getByTestId('script-row').first().waitFor();
+  await shot(phone, '14-phone-scripts');
   await tab(phone, 'Isolation tests');
   await phone.getByRole('button', { name: 'Run isolation suite' }).click();
   await expect(phone.getByTestId('isolation-results')).toContainText('passed', { timeout: 60_000 });
-  await shot(phone, '09-phone-isolation');
+  await shot(phone, '15-phone-isolation');
   await phoneCtx.close();
 } finally {
   await browser.close();

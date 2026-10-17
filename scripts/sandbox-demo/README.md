@@ -6,7 +6,7 @@ mode does about it.
 ```bash
 node scripts/sandbox-demo/generate-db.mjs        # packages/backend/demo/koch-demo.sqlite (29 MB) + ground-truth.json
 AMCP_EMAIL=admin@example.com AMCP_PASSWORD=... \
-  node scripts/sandbox-demo/seed.mjs             # connector, 5 tools, server "koch-demo", API key, 3 saved scripts
+  node scripts/sandbox-demo/seed.mjs             # connector, 5 tools, server "koch-demo", API key, 3 saved scripts (it declares the tools each uses)
 node scripts/sandbox-demo/benchmark.mjs          # the three questions, three ways
 ```
 

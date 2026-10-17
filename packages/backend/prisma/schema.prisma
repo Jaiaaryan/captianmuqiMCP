@@ -47,6 +47,7 @@ model Organization {
   identityProviders   IdentityProvider[]
   mcpConnectionGrants McpConnectionGrant[]
   sandboxScripts      SandboxScript[]
+  sandboxScriptTools  SandboxScriptTool[]
   sandboxRuns         SandboxRun[]
 
   @@map("organizations")
@@ -602,7 +603,6 @@ model McpServerConfig {
   apiKeys         McpApiKey[]
   toolInvocations ToolInvocation[]
   kgSkills        KgSkillSuggestion[]
-  sandboxScripts  SandboxScript[]
   sandboxRuns     SandboxRun[]
 
   @@unique([organizationId, slug])
@@ -1398,16 +1398,15 @@ model KgValueSeen {
 
 // ── Sandbox (code mode) ─────────────────────────────────────────────────────
 // Agent-written scripts that run in the gateway's isolated V8 sandbox next to
-// the connectors. Scripts belong to one MCP server (the tool set a script can
-// call is that server's); every row carries organization_id for tenant scoping.
+// the connectors. Scripts belong to the organization, not to one MCP server: a
+// server offers a script to an agent only when it has every connector the script
+// uses (SandboxScriptTool). Every row carries organization_id for tenant scoping.
 
 model SandboxScript {
-  id             String          @id @default(cuid())
-  organizationId String          @map("organization_id")
-  organization   Organization    @relation(fields: [organizationId], references: [id], onDelete: Cascade)
-  mcpServerId    String          @map("mcp_server_id")
-  mcpServer      McpServerConfig @relation(fields: [mcpServerId], references: [id], onDelete: Cascade)
-  createdById    String?         @map("created_by_id")
+  id             String       @id @default(cuid())
+  organizationId String       @map("organization_id")
+  organization   Organization @relation(fields: [organizationId], references: [id], onDelete: Cascade)
+  createdById    String?      @map("created_by_id")
 
   name        String
   description String? @db.Text
@@ -1422,10 +1421,34 @@ model SandboxScript {
   updatedAt DateTime @updatedAt @map("updated_at")
 
   runs SandboxRun[]
+  // The connectors and tools the script declares it calls.
+  uses SandboxScriptTool[]
 
-  @@unique([mcpServerId, name])
+  @@unique([organizationId, name])
   @@index([organizationId])
   @@map("sandbox_scripts")
+}
+
+// One tool of one connector that a saved script calls. A script may use several
+// connectors; its connectors are the distinct connector_id values of its rows.
+//
+// connector_id is deliberately NOT a foreign key. If a connector is deleted, the
+// script must keep needing it (so no server offers it to an agent) rather than
+// silently lose the dependency; connector_name keeps the name for the dashboard.
+model SandboxScriptTool {
+  id             String        @id @default(cuid())
+  organizationId String        @map("organization_id")
+  organization   Organization  @relation(fields: [organizationId], references: [id], onDelete: Cascade)
+  scriptId       String        @map("script_id")
+  script         SandboxScript @relation(fields: [scriptId], references: [id], onDelete: Cascade)
+  connectorId    String        @map("connector_id")
+  connectorName  String        @map("connector_name")
+  toolName       String        @map("tool_name")
+
+  @@unique([scriptId, connectorId, toolName])
+  @@index([organizationId])
+  @@index([connectorId])
+  @@map("sandbox_script_tools")
 }
 
 // One execution of a script, saved or inline. The code is snapshotted so a run
