@@ -1699,23 +1699,6 @@ export interface SandboxRunResponse {
 }
 
 /** One connector a saved script uses, and the tools of it the script calls. */
-/** One argument a saved script reads (`args.<name>`), as the script's tool declares it. */
-export interface SandboxParameter {
-  type: 'string' | 'number' | 'integer' | 'boolean' | 'array' | 'object';
-  description?: string;
-  enum?: (string | number | boolean)[];
-  items?: { type: 'string' | 'number' | 'integer' | 'boolean' };
-  /** Keep this parameter although the code no longer reads it. */
-  'x-keep'?: boolean;
-}
-
-/** The arguments of a saved script as a JSON Schema object. A script that has them is also an MCP tool. */
-export interface SandboxParametersSchema {
-  type: 'object';
-  properties: Record<string, SandboxParameter>;
-  required: string[];
-}
-
 export interface SandboxScriptUse {
   connectorId: string;
   /** The connector's current name, or the name it had when the script was saved. */
