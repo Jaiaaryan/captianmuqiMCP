@@ -88,6 +88,65 @@ export interface SandboxRunRequest {
   invocationContext: SandboxInvocationContext;
   executeTool: SandboxExecuteTool;
   limits?: Partial<SandboxLimits>;
+  /**
+   * Level 3 (`capabilities.env`): the variables the script reads as `env`, only
+   * those of the connectors it declares. Absent: `env` does not exist in the run.
+   * Set by the host for a saved script that opts in, never for inline code.
+   */
+  env?: Record<string, string>;
+  /**
+   * Level 3 (`capabilities.http`): what `http.fetch` may reach. Absent: `http`
+   * does not exist in the run. Set by the host, never for inline code.
+   */
+  http?: SandboxHttpPolicy;
+}
+
+/** Level 3 switches of a saved script. Null or absent: Level 2 (tools only). */
+export interface ScriptCapabilities {
+  /** The run gets `env`: the variables of the connectors the script declares. */
+  env?: boolean;
+  /** The run gets `http.fetch`, limited to the origins of those connectors. */
+  http?: boolean;
+}
+
+/** One request a script made with `http.fetch`. Never the query string or headers. */
+export interface SandboxHttpCall {
+  origin: string;
+  path: string;
+  /** 0 when no response came back (refused at the network level, timeout). */
+  status: number;
+  bytes: number;
+}
+
+/** The request `http.fetch` asks the host to make, after the policy checks. */
+export interface SandboxHttpRequest {
+  url: string;
+  method: string;
+  headers: Record<string, string>;
+  body?: string;
+  timeoutMs: number;
+  maxBytes: number;
+  /** Fires when the run ends before the answer. */
+  signal?: AbortSignal;
+}
+
+export interface SandboxHttpResponse {
+  status: number;
+  /** Lower-cased names. */
+  headers: Record<string, string>;
+  body: Buffer;
+}
+
+/** Performs one checked request on the host. Replaced by a fake in tests. */
+export type SandboxHttpSend = (req: SandboxHttpRequest) => Promise<SandboxHttpResponse>;
+
+export interface SandboxHttpPolicy {
+  /** Origin (`scheme://host[:port]`) -> name of the declared connector it belongs to. */
+  origins: Map<string, string>;
+  /** Methods other than GET and HEAD need the trusted write policy. */
+  allowWrites: boolean;
+  /** Default: the SSRF-guarded outbound client (no redirects followed). */
+  send?: SandboxHttpSend;
 }
 
 export type SandboxErrorCode =
@@ -104,7 +163,9 @@ export type SandboxErrorCode =
   | 'WRITE_NOT_ALLOWED'
   | 'CONNECTOR_TIMEOUT'
   | 'CANCELLED'
-  | 'BUSY';
+  | 'BUSY'
+  | 'HTTP_NOT_ALLOWED'
+  | 'HTTP_ERROR';
 
 export interface SandboxError {
   code: SandboxErrorCode;
@@ -125,6 +186,8 @@ export interface SandboxRunMeta {
   /** console.log output, capped. */
   logs: string[];
   toolsCalled: string[];
+  /** Level 3: the requests made with `http.fetch` (they count as connector calls). */
+  httpCalls?: SandboxHttpCall[];
 }
 
 export interface SandboxRunResult {

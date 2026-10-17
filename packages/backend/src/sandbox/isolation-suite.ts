@@ -157,6 +157,16 @@ export const ISOLATION_CASES: IsolationCase[] = [
     verify: (r) => (r.result === 'undefined/undefined/undefined' ? null : `got ${JSON.stringify(r.result)}`),
   },
   {
+    id: 'no-level3-without-capability',
+    name: 'No env or http.fetch without the capability',
+    claim:
+      '`env` and `http` exist only in runs of a saved script whose author turned them on; inline code never has them.',
+    specRef: 'extra',
+    code: "return typeof env + '/' + typeof http;",
+    expected: 'OK',
+    verify: (r) => (r.result === 'undefined/undefined' ? null : `got ${JSON.stringify(r.result)}`),
+  },
+  {
     id: 'secrets',
     name: 'No secrets on the global object',
     claim: 'The global object holds only the script API: no environment, credentials or bridge handles.',

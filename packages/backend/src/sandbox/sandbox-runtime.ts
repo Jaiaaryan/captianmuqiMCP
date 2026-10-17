@@ -1,6 +1,7 @@
 /**
  * Everything that runs INSIDE the isolate: the bootstrap that builds the script's
- * world (`tools`, `util`, `args`, `console`) and the wrapper around user code.
+ * world (`tools`, `util`, `args`, `console`, and for a Level 3 saved script `env`
+ * and `http`) and the wrapper around user code.
  *
  * The isolate is a bare V8 context: no require, process, fs, fetch, timers or
  * Buffer exist in it. The bootstrap only adds what the script is meant to use and
@@ -36,6 +37,11 @@ export function wrapUserCode(code: string): string {
  *   __log(line)                                 Reference, applySync
  *   __toolNamesJson, __argsJson                 JSON strings
  *   __maxOut, __maxLog                          numbers
+ * Level 3, present only for a saved script that has the capability:
+ *   __envJson                                   JSON string -> frozen global `env`
+ *   __http(requestJson)                         Reference -> Promise<envelope JSON>,
+ *                                               behind the frozen global `http.fetch`
+ * Without them `env` and `http` do not exist (`typeof env === 'undefined'`).
  *
  * Bridge envelopes are `{"ok":true,"v":<json>}` or `{"ok":false,"code","message"}`;
  * host callbacks never reject, so a dying isolate cannot leave an unhandled
@@ -51,11 +57,13 @@ export const RUNTIME_SOURCE = `
   var names = JSON.parse(g.__toolNamesJson);
   var argsJson = g.__argsJson;
   var maxOut = g.__maxOut, maxLog = g.__maxLog;
+  var envJson = g.__envJson, httpRef = g.__http;
   var stringify = JSON.stringify, parse = JSON.parse, map = Array.prototype.map;
   var RES = { result: { promise: true } };
 
   delete g.__call; delete g.__describe; delete g.__log;
   delete g.__toolNamesJson; delete g.__argsJson; delete g.__maxOut; delete g.__maxLog;
+  delete g.__envJson; delete g.__http;
   // Wasm memory lives outside the V8 heap cap and nothing here needs it.
   delete g.WebAssembly;
 
@@ -139,5 +147,22 @@ export const RUNTIME_SOURCE = `
   g.tools = tools;
   g.util = util;
   g.args = parse(argsJson);
+
+  // Level 3. Read-only globals; the host's own fetch is never handed in, only
+  // this bridge, which checks every request on the host.
+  if (typeof envJson === 'string') {
+    var envVars = parse(envJson);
+    Object.defineProperty(g, 'env', { value: Object.freeze(envVars), writable: false, configurable: false, enumerable: false });
+  }
+  if (httpRef) {
+    var httpApi = Object.freeze({
+      fetch: async function (url, init) {
+        var o = init === undefined || init === null ? {} : init;
+        var req = stringify({ url: String(url), method: o.method, headers: o.headers, body: o.body });
+        return unwrap(await httpRef.apply(undefined, [req], RES));
+      }
+    });
+    Object.defineProperty(g, 'http', { value: httpApi, writable: false, configurable: false, enumerable: false });
+  }
 })();
 `;

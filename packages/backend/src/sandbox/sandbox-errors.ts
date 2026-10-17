@@ -25,11 +25,14 @@ export const HINTS: Partial<Record<SandboxErrorCode, string>> = {
     'The connector was too slow. Narrow the query (date range, status, limit) or fetch less per call.',
   CANCELLED: 'The request was cancelled before the script finished.',
   BUSY: 'Too many scripts are running for this organization. Retry in a moment.',
+  HTTP_NOT_ALLOWED:
+    'http.fetch reaches only the base URLs of the connectors the script declares (same scheme, host and port).',
+  HTTP_ERROR: 'Check the URL, method and headers, or use the connector\'s tool instead.',
 };
 
 /** Codes the bridge raises inside the isolate as `CODE: message`. */
 const BRIDGE_ERROR =
-  /^(TOOL_NOT_ALLOWED|TOOL_ERROR|CONNECTOR_CALL_LIMIT|CONNECTOR_BYTES_LIMIT|WRITE_NOT_ALLOWED|CONNECTOR_TIMEOUT): ([\s\S]*)$/;
+  /^(TOOL_NOT_ALLOWED|TOOL_ERROR|CONNECTOR_CALL_LIMIT|CONNECTOR_BYTES_LIMIT|WRITE_NOT_ALLOWED|CONNECTOR_TIMEOUT|HTTP_NOT_ALLOWED|HTTP_ERROR): ([\s\S]*)$/;
 
 const FRAME = new RegExp(`${SCRIPT_FILE.replace('.', '\\.')}:(\\d+):(\\d+)`);
 
