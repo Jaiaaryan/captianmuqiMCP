@@ -59,6 +59,9 @@ function DemoRow({
 }) {
   const [revealed, setRevealed] = useState(false);
   const { email, name, role, workspace, password } = account;
+  // An account with MCP roles is told apart by them (`VIEWER · Staff`), the others by workspace.
+  const mcpRoles = Array.isArray(account.mcpRoles) ? account.mcpRoles : [];
+  const qualifier = mcpRoles.length > 0 ? mcpRoles.join(', ') : workspace;
 
   return (
     <li
@@ -70,9 +73,13 @@ function DemoRow({
         <span className="truncate" title={email}>{name}</span>
       </span>
 
-      <span className="w-[68px] shrink-0 text-[11px] font-medium tracking-wide">
+      <span
+        data-testid={`demo-role-${email}`}
+        title={account.workspaceName || undefined}
+        className="w-[96px] shrink-0 truncate text-[11px] font-medium tracking-wide"
+      >
         <span className={role === 'ADMIN' ? 'text-[var(--brand)]' : 'text-[var(--text-2)]'}>{role}</span>
-        <span className="text-[var(--text-3)]"> · {workspace}</span>
+        <span className="text-[var(--text-3)]"> · {qualifier}</span>
       </span>
 
       <span className="flex min-w-0 flex-1 items-center gap-0.5">
