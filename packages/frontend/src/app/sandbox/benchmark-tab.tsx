@@ -19,19 +19,114 @@ const rows = Array.isArray(res) ? res : (res.rows ?? []);
 return { rows: rows.length };
 `;
 
-// The first question of the Codebound demo (scripts/sandbox-demo).
-const DEMO = {
-  tool: 'erp_orders_export',
-  toolArgs: '{\n  "from": "2026-09-01",\n  "to": "2026-10-01"\n}',
-  code: `// How many orders were delayed last month, and what revenue did they carry?
-const res = await tools.erp_orders_export({ from: '2026-09-01', to: '2026-10-01' });
-const late = res.rows.filter((o) => o.delivered_at && o.delivered_at > o.promised_at);
+// Sample questions for the public Bundesbank and Coinbase connectors. Each script
+// calls several tools; the raw call is the first one the model would otherwise
+// have to read itself. Raw arguments are worked out when the sample is loaded,
+// so the date windows match the script's.
+const unix = () => Math.floor(Date.now() / 1000);
+const json = (v: unknown) => JSON.stringify(v, null, 2);
+
+const DEMOS = [
+  {
+    id: 'bundesbank',
+    label: 'Bundesbank: euro this year and the Bund curve (7 calls)',
+    connector: 'Bundesbank',
+    tool: 'bundesbank_get_exchange_rates',
+    needs: ['bundesbank_get_exchange_rates', 'bundesbank_get_bund_yields'],
+    toolArgs: () => json({ currency: 'USD', startPeriod: `${new Date().getUTCFullYear()}-01-01` }),
+    code: `// How has the euro moved this year against five currencies, and where is the Bund curve?
+// Seven calls in one script: five exchange-rate series and the 2- and 10-year Bund yields.
+const startPeriod = new Date().getUTCFullYear() + '-01-01';
+
+// Bundesbank answers in SDMX-JSON: values sit in observations keyed by position and
+// the dates in the structure. Days without a fixing come back as null.
+const points = (res) => {
+  const { structure, dataSets } = res.data;
+  const dates = structure.dimensions.observation[0].values;
+  const series = Object.values(dataSets[0].series)[0];
+  return Object.entries(series.observations)
+    .filter(([, v]) => v[0] !== null)
+    .map(([i, v]) => ({ date: dates[i].id, value: Number(v[0]) }))
+    .sort((a, b) => (a.date < b.date ? -1 : 1));
+};
+const pct = (a, b) => Math.round(((b - a) / a) * 10000) / 100;
+
+const currencies = ['USD', 'GBP', 'CHF', 'JPY', 'CNY'];
+const [rates, bund2, bund10] = await Promise.all([
+  Promise.all(currencies.map((currency) => tools.bundesbank_get_exchange_rates({ currency, startPeriod }))),
+  tools.bundesbank_get_bund_yields({ maturityYears: '02', startPeriod }),
+  tools.bundesbank_get_bund_yields({ maturityYears: '10', startPeriod }),
+]);
+
+const euro = rates.map((res, i) => {
+  const p = points(res);
+  const values = p.map((x) => x.value);
+  return {
+    currency: currencies[i],
+    first: p[0].value,
+    last: p.at(-1).value,
+    changePct: pct(p[0].value, p.at(-1).value),
+    low: Math.min(...values),
+    high: Math.max(...values),
+  };
+});
+const yieldOf = (res) => {
+  const p = points(res);
+  return { start: p[0].value, latest: p.at(-1).value, date: p.at(-1).date };
+};
+const y2 = yieldOf(bund2), y10 = yieldOf(bund10);
+
 return {
-  delayedOrders: late.length,
-  revenue: Math.round(util.sum(late, (o) => o.total) * 100) / 100,
+  from: startPeriod,
+  euroAgainst: euro.sort((a, b) => b.changePct - a.changePct),
+  bundYields: { '2y': y2, '10y': y10 },
+  curveSlopeBp: Math.round((y10.latest - y2.latest) * 100),
 };
 `,
-};
+  },
+  {
+    id: 'coinbase',
+    label: 'Coinbase: 30 days of five coins with live spreads (11 calls)',
+    connector: 'Coinbase',
+    tool: 'coinbase_get_candles',
+    needs: ['coinbase_get_server_time', 'coinbase_get_candles', 'coinbase_get_product_book'],
+    toolArgs: () =>
+      json({ product_id: 'BTC-USD', granularity: 'SIX_HOUR', start: String(unix() - 30 * 86400), end: String(unix()), limit: 120 }),
+    code: `// How did BTC, ETH, SOL, XRP and DOGE do over the last 30 days, and how tight is each book now?
+// Eleven calls in one script: the server clock, then candles and the order book of each pair.
+// Prices only, not advice.
+const pairs = ['BTC-USD', 'ETH-USD', 'SOL-USD', 'XRP-USD', 'DOGE-USD'];
+const now = Number((await tools.coinbase_get_server_time({})).epochSeconds);
+const start = String(now - 30 * 86400), end = String(now);
+const round = (x, d) => Math.round(x * 10 ** d) / 10 ** d;
+
+const rows = [];
+for (const product_id of pairs) {
+  // One pair at a time keeps clear of Coinbase's per-IP rate limit; its two calls run together.
+  const [hist, book] = await Promise.all([
+    tools.coinbase_get_candles({ product_id, granularity: 'SIX_HOUR', start, end, limit: 120 }),
+    tools.coinbase_get_product_book({ product_id, limit: 10 }),
+  ]);
+  const candles = hist.candles.slice().sort((a, b) => Number(a.start) - Number(b.start));
+  const closes = candles.map((c) => Number(c.close));
+  const returns = closes.slice(1).map((x, i) => Math.log(x / closes[i]));
+  const mean = util.sum(returns) / returns.length;
+  const sd = Math.sqrt(util.sum(returns, (r) => (r - mean) ** 2) / (returns.length - 1));
+  rows.push({
+    pair: product_id,
+    last: Number(book.last),
+    change30dPct: round(((closes.at(-1) - closes[0]) / closes[0]) * 100, 2),
+    low30d: Math.min(...candles.map((c) => Number(c.low))),
+    high30d: Math.max(...candles.map((c) => Number(c.high))),
+    volatilityPct: round(sd * Math.sqrt(4 * 365) * 100, 1), // annualised from 6-hour returns
+    spreadBps: Number(Number(book.spread_bps).toPrecision(3)),
+  });
+}
+
+return { asOf: new Date(now * 1000).toISOString(), pairs: rows.sort((a, b) => b.change30dPct - a.change30dPct) };
+`,
+  },
+] as const;
 
 function Metric({ label, value, hint }: { label: string; value: string; hint?: string }) {
   return (
@@ -51,6 +146,7 @@ export function BenchmarkTab({ serverId, token, canWrite }: { serverId: string; 
   const [running, setRunning] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const [result, setResult] = useState<SandboxBenchmark | null>(null);
+  const [demo, setDemo] = useState<(typeof DEMOS)[number] | null>(null);
 
   // The tools of the connectors assigned to this server.
   useEffect(() => {
@@ -79,15 +175,20 @@ export function BenchmarkTab({ serverId, token, canWrite }: { serverId: string; 
   const pick = (name: string) => {
     setTool(name);
     setCode(genericCode(name));
+    setDemo(null);
     setResult(null);
   };
 
-  const useDemo = () => {
-    setTool(DEMO.tool);
-    setToolArgs(DEMO.toolArgs);
-    setCode(DEMO.code);
+  const applyDemo = (d: (typeof DEMOS)[number]) => {
+    setTool(d.tool);
+    setToolArgs(d.toolArgs());
+    setCode(d.code);
+    setDemo(d);
     setResult(null);
   };
+
+  // The samples are always offered; they run only where their connector is on this server.
+  const missing = demo ? demo.needs.filter((n) => !toolNames.includes(n)) : [];
 
   const run = async () => {
     const args = parseArgs(toolArgs);
@@ -117,8 +218,27 @@ export function BenchmarkTab({ serverId, token, canWrite }: { serverId: string; 
           <div className="text-[14px] font-semibold">Raw tool call against a script</div>
           <p className="mt-1 max-w-[680px] text-[12.5px] leading-relaxed text-[var(--text-2)]">
             Calls one read-only tool once, the way a model would see it, and runs a script that answers the same question
-            inside the gateway. Compares what each path puts in front of the model. Tokens are estimated as bytes ÷ 4.
+            inside the gateway. Compares what each path puts in front of the model. Tokens are estimated as bytes ÷ 4. A
+            script may call several tools, while the raw column is always a single call: for a question that needs more
+            than one tool, the raw column is only the first response the model would have to read.
           </p>
+        </div>
+
+        <div className="space-y-2">
+          <div className="text-[11.5px] font-semibold text-[var(--text-2)]">Sample scripts</div>
+          <div className="flex flex-wrap gap-2">
+            {DEMOS.map((d) => (
+              <Button key={d.id} type="button" variant="outlineBrand" size="sm" onClick={() => applyDemo(d)}>
+                {d.label}
+              </Button>
+            ))}
+          </div>
+          {missing.length > 0 && (
+            <div className="rounded-lg bg-[var(--t-warn-bg)] px-3.5 py-2.5 text-[12.5px] text-[var(--t-warn-fg)]">
+              This server does not have {missing.map((n) => <code key={n} className="mr-1 font-mono">{n}</code>)}
+              so the sample cannot run here. Add the {demo?.connector} connector to this server first.
+            </div>
+          )}
         </div>
 
         <div className="grid gap-4 md:grid-cols-2">
@@ -134,11 +254,6 @@ export function BenchmarkTab({ serverId, token, canWrite }: { serverId: string; 
                 className="h-9 w-full rounded-[9px] border border-[var(--border)] bg-[var(--surface)] px-3 font-mono text-[12.5px] text-[var(--text-2)]"
                 options={toolNames.length ? toolNames.map((n) => ({ value: n, label: n })) : [{ value: '', label: 'No tools on this server' }]}
               />
-              {toolNames.includes(DEMO.tool) && (
-                <button type="button" onClick={useDemo} className="mt-1.5 text-[12px] font-medium text-[var(--brand)] hover:underline">
-                  Use the demo question (delayed orders last month)
-                </button>
-              )}
             </div>
             <div>
               <label className="mb-1.5 block text-[11.5px] font-semibold text-[var(--text-2)]" htmlFor="bench-tool-args">
