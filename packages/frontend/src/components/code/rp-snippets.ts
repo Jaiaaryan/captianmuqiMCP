@@ -12,7 +12,7 @@ const SNIPPETS: { label: string; detail: string; body: string }[] = [
   {
     label: 'convert',
     detail: 'value × rate, 2 decimals',
-    body: 'return Math.round(value * ${1:(params.rate ?? 0.92)} * 100) / 100;',
+    body: 'return builtins.currency(value, ${1:(params.rate ?? 0.92)});',
   },
   {
     label: 'clean',

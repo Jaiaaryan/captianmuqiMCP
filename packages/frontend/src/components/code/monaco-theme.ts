@@ -3,12 +3,16 @@
 import type { Monaco } from './monaco-setup';
 
 /**
- * One grayscale theme, `amcp`, built from the app's CSS variables at runtime.
- * Syntax is told apart by lightness and weight only: keywords --text bold,
- * strings --text-2, comments --text-3, numbers --text. No hue anywhere.
+ * One theme, `amcp`, built from the app's CSS variables at runtime. The chrome
+ * is grayscale; syntax uses the app's four semantic colours so code reads as
+ * code: keywords info, strings success, numbers warn, types and calls brand;
+ * identifiers --text, punctuation --text-2, comments --text-3.
  */
 
-const VARS = ['--bg', '--surface', '--surface-2', '--surface-3', '--text', '--text-2', '--text-3'] as const;
+const VARS = [
+  '--bg', '--surface', '--surface-2', '--surface-3', '--text', '--text-2', '--text-3',
+  '--brand', '--t-info-fg', '--t-success-fg', '--t-warn-fg', '--t-danger-fg',
+] as const;
 type Var = (typeof VARS)[number];
 
 /** `rrggbb` (no leading hash) from `#rgb`, `#rrggbb` or `rgb(r, g, b)`. */
@@ -73,6 +77,7 @@ export function defineAmcpTheme(monaco: Monaco) {
     'editorWarning.foreground': c('--text-2'),
     'editorInfo.foreground': c('--text-3'),
     'editorHint.foreground': c('--text-3'),
+    'editor.placeholder.foreground': c('--text-3'),
     'editorGutter.background': clear,
     'editorOverviewRuler.border': clear,
     'editorWidget.background': c('--surface'),
@@ -119,7 +124,8 @@ export function defineAmcpTheme(monaco: Monaco) {
     'inputValidation.errorBorder': c('--text'),
   };
   for (const k of symbolKeys) colors[`symbolIcon.${k}Foreground`] = c('--text-2');
-  for (let i = 1; i <= 6; i++) colors[`editorBracketHighlight.foreground${i}`] = c('--text-2');
+  const brackets = ['--text-2', '--t-info-fg', '--t-warn-fg'] as const;
+  for (let i = 1; i <= 6; i++) colors[`editorBracketHighlight.foreground${i}`] = c(brackets[(i - 1) % brackets.length]);
   for (const k of Object.keys(colors)) if (!colors[k]) delete colors[k];
 
   const fg = (name: Var) => v[name] || undefined;
@@ -128,19 +134,27 @@ export function defineAmcpTheme(monaco: Monaco) {
     inherit: false,
     rules: [
       { token: '', foreground: fg('--text') },
-      { token: 'keyword', foreground: fg('--text'), fontStyle: 'bold' },
-      { token: 'string', foreground: fg('--text-2') },
-      { token: 'string.escape', foreground: fg('--text-2'), fontStyle: 'bold' },
-      { token: 'regexp', foreground: fg('--text-2') },
+      { token: 'keyword', foreground: fg('--t-info-fg'), fontStyle: 'bold' },
+      { token: 'keyword.operator', foreground: fg('--text-2') },
+      { token: 'string', foreground: fg('--t-success-fg') },
+      { token: 'string.escape', foreground: fg('--t-success-fg'), fontStyle: 'bold' },
+      { token: 'regexp', foreground: fg('--t-warn-fg') },
+      { token: 'regexp.escape', foreground: fg('--t-warn-fg'), fontStyle: 'bold' },
       { token: 'comment', foreground: fg('--text-3'), fontStyle: 'italic' },
-      { token: 'number', foreground: fg('--text') },
-      { token: 'type', foreground: fg('--text') },
+      { token: 'number', foreground: fg('--t-warn-fg') },
+      { token: 'constant', foreground: fg('--t-warn-fg') },
+      { token: 'type', foreground: fg('--brand') },
+      { token: 'type.identifier', foreground: fg('--brand') },
       { token: 'identifier', foreground: fg('--text') },
       { token: 'delimiter', foreground: fg('--text-2') },
+      { token: 'delimiter.bracket', foreground: fg('--text-2') },
       { token: 'operator', foreground: fg('--text-2') },
+      { token: 'invalid', foreground: fg('--t-danger-fg') },
       { token: 'key', foreground: fg('--text') },
       { token: 'string.key.json', foreground: fg('--text') },
-      { token: 'string.value.json', foreground: fg('--text-2') },
+      { token: 'string.value.json', foreground: fg('--t-success-fg') },
+      { token: 'number.json', foreground: fg('--t-warn-fg') },
+      { token: 'keyword.json', foreground: fg('--t-info-fg') },
     ],
     colors,
   });

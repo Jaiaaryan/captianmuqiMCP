@@ -112,6 +112,38 @@ export function readValue(element: unknown, reads: string | undefined): { found:
   return { found: v !== undefined, value: v };
 }
 
+/**
+ * `builtins` inside a script step: the step processors as frozen functions
+ * (same rounding and refusals). Shown in completions and on hover.
+ */
+export const BUILTINS_DTS = `/** Besides a number, the numeric built-ins take an array / object of numbers: mapped one level deep, same shape back. */
+type BuiltinNumbers = number[] | Record<string, number>;
+/** The built-in processors as functions: same rounding (half away from zero) and refusals as the steps. Frozen. */
+declare const builtins: Readonly<{
+  /** Money: value × rate (rate > 0), always 2 decimals. \`builtins.currency(54.67, { rate: 0.92 })\` → 50.3 */
+  currency(value: number, params: number | { rate: number }): number;
+  currency<T extends BuiltinNumbers>(value: T, params: number | { rate: number }): T;
+  /** value × factor, optionally rounded. \`builtins.scale(54.67, { factor: 0.92, round: 2 })\` → 50.3 */
+  scale(value: number, params: { factor: number; round?: number }): number;
+  scale<T extends BuiltinNumbers>(value: T, params: { factor: number; round?: number }): T;
+  /** value + amount, optionally rounded. */
+  offset(value: number, params: { amount: number; round?: number }): number;
+  offset<T extends BuiltinNumbers>(value: T, params: { amount: number; round?: number }): T;
+  /** value × (1 + rate), optionally rounded. \`builtins.vat(50.3, { rate: 0.19, round: 2 })\` → 59.86 */
+  vat(value: number, params: { rate: number; round?: number }): number;
+  vat<T extends BuiltinNumbers>(value: T, params: { rate: number; round?: number }): T;
+  /** Round half away from zero; decimals defaults to 2. */
+  round(value: number, decimals?: number | { decimals?: number }): number;
+  round<T extends BuiltinNumbers>(value: T, decimals?: number | { decimals?: number }): T;
+  /** Collapse whitespace runs to one space and trim (both on by default). */
+  clean_text(value: string, params?: { trim?: boolean; collapseWhitespace?: boolean }): string;
+  /** Shorten to maxLength characters, the ellipsis (default …) included. */
+  truncate(value: string, maxLength: number | { maxLength: number; ellipsis?: string }): string;
+  /** Look the value up in a table; fallback when it is missing, else it throws. */
+  map(value: unknown, params: { map: Record<string, unknown>; fallback?: string }): unknown;
+}>;
+`;
+
 export interface SampleDeclOptions {
   /** The step's `each` and `reads`; `value` is unknown without them. */
   each?: string;
@@ -128,12 +160,16 @@ export interface SampleDeclOptions {
  */
 export function declarationsFromSample(sample: unknown, options: SampleDeclOptions = {}): string {
   const { each, reads, valueName = 'value', responseName = 'response' } = options;
+  const valueDoc = (type: string) =>
+    `/** \`${valueName}\`: ${type.replace(/\*\//g, '* /')} · \`params\`: {} · \`builtins\`.currency/scale/offset/vat/round/clean_text/truncate/map. What the step reads: \`${(reads ?? '').replace(/\*\//g, '* /')}\` of each element. */`;
   if (sample === undefined) {
     return [
+      valueDoc('unknown'),
       `declare const ${valueName}: unknown;`,
       `declare const ${responseName}: unknown;`,
+      '/** The step\'s `params` (`null` without any). */',
       'declare const params: Record<string, unknown>;',
-      '',
+      BUILTINS_DTS,
     ].join('\n');
   }
   const emit = new Emitter('Sample');
@@ -143,11 +179,12 @@ export function declarationsFromSample(sample: unknown, options: SampleDeclOptio
   const valueType = read.found ? emit.type([read.value], 'value', 0) : 'unknown';
   return [
     ...emit.decls,
-    `/** What the step reads: \`${(reads ?? '').replace(/\*\//g, '* /')}\` of each element. */`,
+    valueDoc(valueType),
     `declare const ${valueName}: ${valueType};`,
     '/** The whole response root, as it stands before this step. */',
     `declare const ${responseName}: ${responseType};`,
+    '/** The step\'s `params` (`null` without any). */',
     'declare const params: Record<string, unknown>;',
-    '',
+    BUILTINS_DTS,
   ].join('\n');
 }

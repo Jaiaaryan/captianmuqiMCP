@@ -2,7 +2,7 @@
 
 /**
  * Self-hosted Monaco: the editor and its workers come from our own bundle,
- * never a CDN. Imported only from client code loaded with `ssr: false`.
+ * never a CDN. Reached only through `monaco-preload` (client, on demand).
  *
  * Workers: Turbopack bundles `new Worker(new URL(<pkg path>, import.meta.url))`
  * as a separate module-worker entry. The package's export map turns
@@ -18,7 +18,9 @@ export const IGNORE_RETURN_OUTSIDE_FUNCTION = 1108;
 export const IGNORE_TOP_LEVEL_AWAIT = [1375, 1378];
 
 let configured = false;
+let javascriptConfigured = false;
 
+/** Editor core and workers only; every language service waits for a field of its language. */
 export function setupMonaco(): typeof monaco {
   if (configured) return monaco;
   configured = true;
@@ -40,7 +42,17 @@ export function setupMonaco(): typeof monaco {
   };
 
   loader.config({ monaco });
+  return monaco;
+}
 
+/**
+ * The JavaScript language service: compiler options, diagnostics, snippets. Called
+ * by JavaScript fields only, so a JSON field never configures it. Monaco starts
+ * the TypeScript worker on the first JavaScript model, not here.
+ */
+export function setupJavaScript() {
+  if (javascriptConfigured) return;
+  javascriptConfigured = true;
   const js = monaco.typescript.javascriptDefaults;
   js.setCompilerOptions({
     target: monaco.typescript.ScriptTarget.ESNext,
@@ -61,7 +73,6 @@ export function setupMonaco(): typeof monaco {
   });
   js.setEagerModelSync(true);
   registerResponseProcessingSnippets(monaco);
-  return monaco;
 }
 
 export type Monaco = typeof monaco;
@@ -76,21 +87,32 @@ export interface ExtraLib {
 }
 
 let activeOwner: string | null = null;
+let appliedLibs = '[]';
+let appliedIgnore = '';
 
 /**
  * `javascriptDefaults` is global; the editor with focus (or the first one)
- * owns the declarations and the ignored diagnostic codes.
+ * owns the declarations and the ignored diagnostic codes. Unchanged values are
+ * not re-applied: new diagnostics options restart the TypeScript worker.
  */
 export function activateLibs(owner: string, libs: ExtraLib[], ignore: number[], force = false) {
   if (!force && activeOwner !== null && activeOwner !== owner) return;
   activeOwner = owner;
   const js = monaco.typescript.javascriptDefaults;
-  js.setExtraLibs(libs.map((l) => ({ filePath: l.path, content: l.content })));
-  js.setDiagnosticsOptions({
-    noSemanticValidation: false,
-    noSyntaxValidation: false,
-    diagnosticCodesToIgnore: [IGNORE_RETURN_OUTSIDE_FUNCTION, ...ignore],
-  });
+  const libsKey = JSON.stringify(libs);
+  if (libsKey !== appliedLibs) {
+    appliedLibs = libsKey;
+    js.setExtraLibs(libs.map((l) => ({ filePath: l.path, content: l.content })));
+  }
+  const ignoreKey = ignore.join(',');
+  if (ignoreKey !== appliedIgnore) {
+    appliedIgnore = ignoreKey;
+    js.setDiagnosticsOptions({
+      noSemanticValidation: false,
+      noSyntaxValidation: false,
+      diagnosticCodesToIgnore: [IGNORE_RETURN_OUTSIDE_FUNCTION, ...ignore],
+    });
+  }
 }
 
 export function releaseLibs(owner: string) {

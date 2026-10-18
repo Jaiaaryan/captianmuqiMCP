@@ -1,38 +1,33 @@
 'use client';
 
-import { useState } from 'react';
+import { useMemo, useState } from 'react';
+import { Play } from 'lucide-react';
 import { sandbox, type SandboxBenchmark } from '@/lib/api';
 import { Card } from '@/components/ui/card';
 import { Button } from '@/components/ui/button';
 import { Badge, StatusPill } from '@/components/ui/badge';
-import { AppSelect } from '@/components/ui/select';
+import { Combobox } from '@/components/ui/combobox';
+import { TabHint } from '@/components/ui/tab-hint';
+import { Icon } from '@/components/tool-editor/icon';
+import { useTabPlaceholder } from '@/lib/use-tab-placeholder';
 import { cn } from '@/lib/utils';
 import { errorText, formatBytes, formatMs, formatReduction, formatTokens, parseArgs, pretty } from './format';
 import { BlockTitle, Pre } from './result-panel';
 import type { SandboxData } from './use-sandbox-data';
+import {
+  exampleArgs,
+  exampleScriptArgs,
+  genericCode,
+  isReadOnlyName,
+  presetsFor,
+  toJson,
+  type BenchmarkPreset,
+  type SchemaLike,
+} from './benchmark-presets';
 
-const INPUT =
-  'w-full rounded-[9px] border border-[var(--border)] bg-[var(--surface)] px-3 text-[13px] text-[var(--text)] outline-none placeholder:text-[var(--text-3)] focus:border-[var(--brand)]';
-
-const genericCode = (tool: string) => `// The same question as the raw call, answered inside the gateway.
-const res = await tools.${tool}({});
-const rows = Array.isArray(res) ? res : (res.rows ?? []);
-return { rows: rows.length };
-`;
-
-// The first question of the Codebound demo (scripts/sandbox-demo).
-const DEMO = {
-  tool: 'erp_orders_export',
-  toolArgs: '{\n  "from": "2026-09-01",\n  "to": "2026-10-01"\n}',
-  code: `// How many orders were delayed last month, and what revenue did they carry?
-const res = await tools.erp_orders_export({ from: '2026-09-01', to: '2026-10-01' });
-const late = res.rows.filter((o) => o.delivered_at && o.delivered_at > o.promised_at);
-return {
-  delayedOrders: late.length,
-  revenue: Math.round(util.sum(late, (o) => o.total) * 100) / 100,
-};
-`,
-};
+const FIELD =
+  'w-full rounded-md bg-[var(--surface-2)] px-3 py-2 font-mono text-[14px] leading-relaxed text-[var(--text)] outline-none placeholder:text-[var(--text-3)] focus-visible:ring-2 focus-visible:ring-[var(--brand)]';
+const LABEL = 'mb-1.5 block text-[14px] font-semibold text-[var(--text-2)]';
 
 function Metric({ label, value, hint }: { label: string; value: string; hint?: string }) {
   return (
@@ -42,6 +37,54 @@ function Metric({ label, value, hint }: { label: string; value: string; hint?: s
       {hint && <div className="text-[11px] text-[var(--text-3)]">{hint}</div>}
     </div>
   );
+}
+
+/** A JSON field whose placeholder Tab accepts. */
+function ArgsField({
+  id,
+  label,
+  value,
+  onChange,
+  placeholder,
+  rows,
+}: {
+  id: string;
+  label: string;
+  value: string;
+  onChange: (v: string) => void;
+  placeholder: string;
+  rows: number;
+}) {
+  const tab = useTabPlaceholder<HTMLTextAreaElement>({ value, placeholder, onAccept: onChange });
+  return (
+    <div>
+      <label className={LABEL} htmlFor={id}>
+        {label}
+      </label>
+      <div className="relative">
+        <textarea
+          id={id}
+          spellCheck={false}
+          rows={rows}
+          className={cn(FIELD, tab.hint && 'pr-12')}
+          value={value}
+          onChange={(e) => onChange(e.target.value)}
+          placeholder={placeholder || undefined}
+          onKeyDown={tab.onKeyDown}
+          onFocus={tab.onFocus}
+          onBlur={tab.onBlur}
+        />
+        <TabHint show={tab.hint} className="top-2 translate-y-0" />
+      </div>
+    </div>
+  );
+}
+
+interface Draft {
+  tool: string;
+  toolArgs: string;
+  code: string;
+  scriptArgs: string;
 }
 
 export function BenchmarkTab({
@@ -55,42 +98,105 @@ export function BenchmarkTab({
   canWrite: boolean;
   data: SandboxData;
 }) {
-  const { toolNames, serverError, refreshRuns } = data;
+  const { toolNames, catalogTools, scripts, serverError, refreshRuns } = data;
+  const schemas = useMemo(
+    () => new Map((catalogTools ?? []).map((t) => [t.name, (t.parameters ?? null) as SchemaLike | null])),
+    [catalogTools],
+  );
+  const presets = useMemo(
+    () => presetsFor(toolNames, catalogTools?.map((t) => ({ name: t.name, parameters: t.parameters as SchemaLike | null })) ?? null),
+    [toolNames, catalogTools],
+  );
+
   // Until the user picks, the first tool of the server and a generic script for it.
   const [pickedTool, setTool] = useState<string | null>(null);
   const [pickedCode, setCode] = useState<string | null>(null);
   const [toolArgs, setToolArgs] = useState('');
+  const [scriptArgs, setScriptArgs] = useState('');
+  const [presetId, setPresetId] = useState('');
+  const [scriptId, setScriptId] = useState('');
+  const [script, setScript] = useState<{ name: string; argsExample: string } | null>(null);
   const [running, setRunning] = useState(false);
   const [runError, setError] = useState<string | null>(null);
   const [result, setResult] = useState<SandboxBenchmark | null>(null);
+  const [ranScript, setRanScript] = useState<string | null>(null);
+
   const tool = pickedTool ?? toolNames[0] ?? '';
-  const code = pickedCode ?? (tool ? genericCode(tool) : '');
+  const code = pickedCode ?? (tool ? genericCode(tool, exampleArgs(schemas.get(tool))) : '');
   const error = runError ?? serverError;
+  const preset = presets.find((p) => p.id === presetId) ?? null;
 
-  const pick = (name: string) => {
+  const toolPlaceholder = toJson(exampleArgs(schemas.get(tool)));
+  const scriptPlaceholder = script?.argsExample ?? toJson(preset?.args);
+
+  const reset = () => {
+    setResult(null);
+    setError(null);
+  };
+
+  const pickTool = (name: string) => {
     setTool(name);
-    setCode(genericCode(name));
-    setResult(null);
+    setToolArgs('');
+    setCode(genericCode(name, exampleArgs(schemas.get(name))));
+    setScriptArgs('');
+    setPresetId('');
+    setScriptId('');
+    setScript(null);
+    reset();
   };
 
-  const useDemo = () => {
-    setTool(DEMO.tool);
-    setToolArgs(DEMO.toolArgs);
-    setCode(DEMO.code);
-    setResult(null);
+  const fill = (p: BenchmarkPreset): Draft => {
+    const draft = { tool: p.toolName, toolArgs: toJson(p.toolArgs), code: p.code, scriptArgs: toJson(p.args) };
+    setPresetId(p.id);
+    setScriptId('');
+    setScript(null);
+    setTool(draft.tool);
+    setToolArgs(draft.toolArgs);
+    setCode(draft.code);
+    setScriptArgs(draft.scriptArgs);
+    reset();
+    return draft;
   };
 
-  const run = async () => {
-    const args = parseArgs(toolArgs);
-    if (!args.ok) {
-      setError(args.message);
-      return;
+  const pickScript = async (id: string) => {
+    const summary = scripts?.find((s) => s.id === id);
+    if (!summary) return;
+    setScriptId(id);
+    setPresetId('');
+    reset();
+    try {
+      const full = await sandbox.script(id, token);
+      const argsExample = toJson(exampleScriptArgs(full.parameters as SchemaLike | null));
+      const rawTool = full.uses.flatMap((u) => u.tools).find((t) => toolNames.includes(t) && isReadOnlyName(t));
+      setScript({ name: full.name, argsExample });
+      setCode(full.code);
+      setScriptArgs(argsExample);
+      if (rawTool) {
+        setTool(rawTool);
+        setToolArgs('');
+      }
+    } catch (err) {
+      setError(errorText(err));
     }
+  };
+
+  const run = async (draft: Draft, name: string | null) => {
+    const callArgs = parseArgs(draft.toolArgs);
+    if (!callArgs.ok) return setError(callArgs.message);
+    const args = parseArgs(draft.scriptArgs);
+    if (!args.ok) return setError(args.message);
     setRunning(true);
     setError(null);
     setResult(null);
+    setRanScript(name);
     try {
-      setResult(await sandbox.benchmark(serverId, { toolName: tool, toolArgs: args.value, code }, token));
+      setResult(
+        await sandbox.benchmark(
+          serverId,
+          { toolName: draft.tool, toolArgs: callArgs.value, code: draft.code, ...(args.value ? { args: args.value } : {}) },
+          token,
+        ),
+      );
       void refreshRuns(); // the script half is recorded as a run
     } catch (err) {
       setError(errorText(err));
@@ -99,79 +205,131 @@ export function BenchmarkTab({
     }
   };
 
+  const runPreset = () => {
+    const p = preset ?? presets[0];
+    if (p) void run(fill(p), null);
+  };
+
   const raw = result?.raw;
-  const script = result?.script;
+  const scriptResult = result?.script;
+  const blocked = running || !canWrite;
 
   return (
     <div className="space-y-4">
       <Card className="space-y-4 p-5">
-        <div>
-          <div className="text-[14px] font-semibold">Raw tool call against a script</div>
-          <p className="mt-1 max-w-[680px] text-[12.5px] leading-relaxed text-[var(--text-2)]">
-            Calls one read-only tool once, the way a model would see it, and runs a script that answers the same question
-            inside the gateway. Compares what each path puts in front of the model. Tokens are estimated as bytes ÷ 4.
-          </p>
+        <div className="flex flex-wrap items-end gap-2">
+          <div className="min-w-[260px] max-w-[420px] flex-1">
+            <label className={LABEL} id="bench-example-label" htmlFor="bench-example">
+              Examples
+            </label>
+            <Combobox
+              id="bench-example"
+              aria-labelledby="bench-example-label"
+              testId="bench-examples"
+              value={presetId}
+              onChange={(id) => {
+                const p = presets.find((x) => x.id === id);
+                if (p) fill(p);
+              }}
+              options={presets.map((p) => ({ value: p.id, label: p.title, meta: p.id.startsWith('tool:') ? undefined : p.toolName }))}
+              placeholder={presets[0]?.title ?? '—'}
+            />
+          </div>
+          <Button
+            variant="secondary"
+            onClick={runPreset}
+            disabled={blocked || !presets.length}
+            aria-label="Run"
+            title={(preset ?? presets[0])?.title}
+            className="h-9 gap-1.5 rounded-md border-0 bg-[var(--surface-2)] px-3 text-[14px] leading-none text-[var(--text)] hover:bg-[var(--surface-3)]"
+          >
+            <Icon as={Play} />
+            Run
+          </Button>
+          {!canWrite && <Badge tone="neutral">Viewer</Badge>}
         </div>
 
         <div className="grid gap-4 md:grid-cols-2">
           <div className="space-y-3">
             <div>
-              <label className="mb-1.5 block text-[11.5px] font-semibold text-[var(--text-2)]" id="bench-tool-label">
-                Tool to call directly
+              <label className={LABEL} id="bench-tool-label" htmlFor="bench-tool">
+                Tool
               </label>
-              <AppSelect
+              <Combobox
+                id="bench-tool"
                 aria-labelledby="bench-tool-label"
+                testId="bench-tool"
+                mono
                 value={tool}
-                onValueChange={pick}
-                className="h-9 w-full rounded-[9px] border border-[var(--border)] bg-[var(--surface)] px-3 font-mono text-[12.5px] text-[var(--text-2)]"
-                options={toolNames.length ? toolNames.map((n) => ({ value: n, label: n })) : [{ value: '', label: 'No tools on this server' }]}
+                onChange={pickTool}
+                options={toolNames.map((n) => ({ value: n, label: n }))}
+                placeholder="—"
               />
-              {toolNames.includes(DEMO.tool) && (
-                <button type="button" onClick={useDemo} className="mt-1.5 text-[12px] font-medium text-[var(--brand)] hover:underline">
-                  Use the demo question (delayed orders last month)
-                </button>
-              )}
+            </div>
+            <ArgsField
+              id="bench-tool-args"
+              label="Tool args"
+              value={toolArgs}
+              onChange={setToolArgs}
+              placeholder={toolPlaceholder}
+              rows={4}
+            />
+          </div>
+          <div className="space-y-3">
+            <div>
+              <label className={LABEL} id="bench-script-label" htmlFor="bench-script">
+                Script
+              </label>
+              <Combobox
+                id="bench-script"
+                aria-labelledby="bench-script-label"
+                testId="bench-script"
+                mono
+                value={scriptId}
+                onChange={(id) => void pickScript(id)}
+                options={(scripts ?? []).map((s) => ({ value: s.id, label: s.name }))}
+                placeholder="—"
+              />
             </div>
             <div>
-              <label className="mb-1.5 block text-[11.5px] font-semibold text-[var(--text-2)]" htmlFor="bench-tool-args">
-                Tool arguments (JSON, optional)
+              <label className={LABEL} htmlFor="bench-code">
+                Code
               </label>
               <textarea
-                id="bench-tool-args"
+                id="bench-code"
                 spellCheck={false}
-                rows={4}
-                className={cn(INPUT, 'py-2 font-mono text-xs')}
-                value={toolArgs}
-                onChange={(e) => setToolArgs(e.target.value)}
-                placeholder='{"from": "2026-09-01", "to": "2026-10-01"}'
+                rows={12}
+                wrap="off"
+                className={FIELD}
+                value={code}
+                onChange={(e) => setCode(e.target.value)}
               />
             </div>
-          </div>
-          <div>
-            <label className="mb-1.5 block text-[11.5px] font-semibold text-[var(--text-2)]" htmlFor="bench-code">
-              Script that answers the same question
-            </label>
-            <textarea
-              id="bench-code"
-              spellCheck={false}
-              rows={10}
-              className={cn(INPUT, 'py-2 font-mono text-xs leading-relaxed')}
-              value={code}
-              onChange={(e) => setCode(e.target.value)}
+            <ArgsField
+              id="bench-script-args"
+              label="Script args"
+              value={scriptArgs}
+              onChange={setScriptArgs}
+              placeholder={scriptPlaceholder}
+              rows={3}
             />
           </div>
         </div>
 
         <div className="flex flex-wrap items-center gap-3">
-          <Button onClick={() => void run()} disabled={running || !tool || !code.trim() || !canWrite} size="lg">
-            {running ? 'Running both…' : 'Run both'}
+          <Button
+            onClick={() => void run({ tool, toolArgs, code, scriptArgs }, script?.name ?? null)}
+            disabled={blocked || !tool || !code.trim()}
+            className="h-10 rounded-md px-4 text-[14px]"
+          >
+            {running ? 'Running…' : 'Run benchmark'}
           </Button>
-          {!canWrite && <span className="text-[12px] text-[var(--text-3)]">Viewers cannot run benchmarks.</span>}
-          <span className="text-[12px] text-[var(--text-3)]">
-            Only read-only tools can be called for real. The tool is called once, and the script once.
-          </span>
         </div>
-        {error && <div role="alert" className="rounded-lg bg-[var(--t-danger-bg)] px-3.5 py-2.5 text-[12.5px] text-[var(--t-danger-fg)]">{error}</div>}
+        {error && (
+          <div role="alert" className="rounded-md bg-[var(--t-danger-bg)] px-3.5 py-2.5 text-[14px] text-[var(--t-danger-fg)]">
+            {error}
+          </div>
+        )}
       </Card>
 
       {result && (
@@ -179,7 +337,7 @@ export function BenchmarkTab({
           {result.reduction && (
             <Card className="flex flex-wrap items-baseline gap-x-6 gap-y-1 px-5 py-4" style={{ background: 'var(--t-success-bg)' }}>
               <span className="text-[34px] font-semibold leading-none" style={{ color: 'var(--t-success-fg)' }} data-testid="reduction-bytes">
-                {formatReduction(raw?.bytes ?? 0, script?.bytes ?? 0) ?? `−${result.reduction.bytesPct}%`}
+                {formatReduction(raw?.bytes ?? 0, scriptResult?.bytes ?? 0) ?? `−${result.reduction.bytesPct}%`}
               </span>
               <span className="text-[14px]" style={{ color: 'var(--t-success-fg)' }}>
                 reaches the model ({result.reduction.bytesPct}% fewer bytes, {result.reduction.tokensPct}% fewer est. tokens)
@@ -205,32 +363,37 @@ export function BenchmarkTab({
             <Card className="space-y-4 p-5">
               <div className="flex items-center gap-2">
                 <div className="text-[13px] font-semibold">Sandbox script</div>
-                {script ? (
-                  script.ok ? <StatusPill tone="success" dot="var(--ok)">answered</StatusPill> : <StatusPill tone="danger">{script.error?.code}</StatusPill>
+                {ranScript && (
+                  <span className="font-mono text-[14px] text-[var(--text-2)]" data-testid="benchmark-script-name">
+                    {ranScript}
+                  </span>
+                )}
+                {scriptResult ? (
+                  scriptResult.ok ? <StatusPill tone="success" dot="var(--ok)">answered</StatusPill> : <StatusPill tone="danger">{scriptResult.error?.code}</StatusPill>
                 ) : (
                   <Badge tone="neutral">not run</Badge>
                 )}
               </div>
-              {script ? (
+              {scriptResult ? (
                 <>
                   <div className="grid grid-cols-3 gap-3">
-                    <Metric label="To the model" value={formatBytes(script.bytes)} />
-                    <Metric label="Est. tokens" value={formatTokens(script.estTokens)} hint="bytes ÷ 4" />
-                    <Metric label="Latency" value={formatMs(script.ms)} />
+                    <Metric label="To the model" value={formatBytes(scriptResult.bytes)} />
+                    <Metric label="Est. tokens" value={formatTokens(scriptResult.estTokens)} hint="bytes ÷ 4" />
+                    <Metric label="Latency" value={formatMs(scriptResult.ms)} />
                   </div>
                   <div className="text-[12px] text-[var(--text-3)]">
-                    {script.connectorCalls} connector call{script.connectorCalls === 1 ? '' : 's'}; pulled{' '}
-                    <span className="font-mono text-[var(--text-2)]">{formatBytes(script.bytesFromConnectors)}</span> inside the gateway.
+                    {scriptResult.connectorCalls} connector call{scriptResult.connectorCalls === 1 ? '' : 's'}; pulled{' '}
+                    <span className="font-mono text-[var(--text-2)]">{formatBytes(scriptResult.bytesFromConnectors)}</span> inside the gateway.
                   </div>
-                  {script.ok ? (
+                  {scriptResult.ok ? (
                     <div>
                       <BlockTitle>Answer</BlockTitle>
-                      <Pre maxH="max-h-48">{pretty(script.result)}</Pre>
+                      <Pre maxH="max-h-48">{pretty(scriptResult.result)}</Pre>
                     </div>
                   ) : (
                     <div className="rounded-lg bg-[var(--t-danger-bg)] px-3.5 py-2.5 text-[12.5px] text-[var(--t-danger-fg)]">
-                      {script.error?.message}
-                      {script.error?.hint && <div className="mt-1 opacity-80">Hint: {script.error.hint}</div>}
+                      {scriptResult.error?.message}
+                      {scriptResult.error?.hint && <div className="mt-1 opacity-80">Hint: {scriptResult.error.hint}</div>}
                     </div>
                   )}
                 </>
