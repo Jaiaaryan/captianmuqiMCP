@@ -5,45 +5,48 @@ import { useAuth } from '@/lib/auth-context';
 import {
   ApiError,
   responseProcessing,
-  type ResponseProcessingBuiltins,
+  tools as toolsApi,
   type ResponseProcessingPreview,
 } from '@/lib/api';
-import {
-  ChevronDown,
-  Circle,
-  CircleDot,
-  Code,
-  Play,
-  Plus,
-  Sigma,
-  Undo2,
-  X,
-} from 'lucide-react';
-import { AppSelect } from '@/components/ui/select';
-import { ActionMenu, type ActionMenuGroup } from '@/components/ui/action-menu';
+import { HardDrive, PenLine, SkipForward, Undo2, X } from 'lucide-react';
 import { Icon } from './icon';
 import { Kbd } from './kbd';
-import { StatusChip, type ChipTone } from './status-chip';
-import { CONTENT, HEADER_TRIGGER, ITEM, TEXT_BUTTON, TONE_TEXT } from './response-processing-styles';
+import { BTN_GHOST, ROW, TONE_TEXT } from './response-processing-styles';
+import { checkSyntax } from './code-field';
+import { useBuiltins, type ChainStatus, type ProcessingSummaryInfo } from './response-processing-controls';
+import type { SheetRequest } from './use-sheet-state';
 import { ResponseProcessingStepRow } from './response-processing-step-row';
-import { earlierWrites, samplePathProblems } from './path-picker';
+import { earlierWrites, elementIsScalar, isNewField, samplePathProblems, splitInput, type PathMode } from './path-picker';
 import {
-  FALLBACK_BUILTINS,
-  FALLBACK_MAX_CODE_BYTES,
-  FALLBACK_MAX_STEPS,
-  SCRIPT_USE,
-  diffSamples,
+  ResponseTree,
+  addStepWrites,
+  buildTree,
+  placeOf,
+  scopeOf,
+  type PickContext,
+  type RunParam,
+  type SampleSource,
+  type TreeNode,
+} from './response-tree';
+import {
   emptyResponseProcessing,
   formatBytes,
+  isScript,
+  loadCollapsed,
   localProblems,
   newBuiltinStep,
   newScriptStep,
   nextStepId,
+  normalizeChain,
   problemStepId,
+  saveCollapsed,
   splitFailure,
   stepKey,
-  toBuiltinInfo,
+  followMode,
+  withInput,
   withKey,
+  withWrites,
+  writesKind,
   type ResponseProcessingChain,
   type Step,
 } from './response-processing-model';
@@ -57,29 +60,46 @@ export {
 export type { ResponseProcessingChain, Step } from './response-processing-model';
 
 /* ------------------------------------------------------------------ */
-/*  Contract (built-ins + limits), fetched once per page load          */
+/*  Recorded sample                                                    */
 /* ------------------------------------------------------------------ */
 
-let contractPromise: Promise<ResponseProcessingBuiltins> | null = null;
+interface Recorded {
+  sample: unknown;
+  capturedAt?: string | null;
+  lengths?: Record<string, number>;
+  input?: Record<string, unknown>;
+}
 
-function useContract(token: string | null): ResponseProcessingBuiltins | null {
-  const [contract, setContract] = useState<ResponseProcessingBuiltins | null>(null);
+/** The tool's latest recorded response (cut server-side); `sample` undefined without one. */
+function useRecorded(toolId: string | undefined, token: string | null, refresh: number): Recorded {
+  const [state, setState] = useState<{ key: string; value: Recorded } | null>(null);
+  const key = `${toolId ?? ''}:${refresh}`;
   useEffect(() => {
-    if (!token) return;
+    if (!toolId || !token) return;
     let cancelled = false;
-    contractPromise ??= responseProcessing.builtins(token);
-    contractPromise
-      .then((c) => {
-        if (!cancelled) setContract(c);
+    responseProcessing
+      .forTool(toolId, token)
+      .then((r) => {
+        if (cancelled) return;
+        setState({
+          key,
+          value: {
+            sample: r.sampleAvailable ? r.sample : undefined,
+            capturedAt: r.sampleCapturedAt,
+            lengths: r.sampleLengths,
+            input: r.sampleInput,
+          },
+        });
       })
       .catch(() => {
-        contractPromise = null;
+        if (!cancelled) setState({ key, value: { sample: undefined } });
       });
     return () => {
       cancelled = true;
     };
-  }, [token]);
-  return contract;
+  }, [toolId, token, key]);
+  // Keep the previous sample while a refresh is in flight.
+  return toolId && state ? state.value : { sample: undefined };
 }
 
 /* ------------------------------------------------------------------ */
@@ -101,73 +121,86 @@ type PreviewState =
 interface Props {
   state: ResponseProcessingChain | null | undefined;
   onChange: (next: ResponseProcessingChain) => void;
-  /** Preview needs a saved tool; both are absent while creating a new one. */
+  /** Preview and Run need a saved tool; both are absent while creating a new one. */
   connectorId?: string;
   toolId?: string;
-}
-
-const MAX_DIFF_LINES = 8;
-
-
-const CHEVRON = <Icon as={ChevronDown} className="text-[var(--text-3)]" />;
-
-/* ------------------------------------------------------------------ */
-/*  Recorded sample for the path pickers                               */
-/* ------------------------------------------------------------------ */
-
-/** The tool's latest recorded response (truncated server-side); undefined without one. */
-function useSample(toolId: string | undefined, token: string | null, refresh: number): unknown {
-  const [sample, setSample] = useState<{ key: string; value: unknown } | null>(null);
-  const key = `${toolId ?? ''}:${refresh}`;
-  useEffect(() => {
-    if (!toolId || !token) return;
-    let cancelled = false;
-    responseProcessing
-      .forTool(toolId, token)
-      .then((r) => {
-        if (!cancelled) setSample({ key, value: r.sample });
-      })
-      .catch(() => {
-        if (!cancelled) setSample({ key, value: undefined });
-      });
-    return () => {
-      cancelled = true;
-    };
-  }, [toolId, token, key]);
-  // Keep the previous sample while a refresh is in flight.
-  return toolId ? sample?.value : undefined;
+  /** The tool's parameters: the fields of the tree's Run form. */
+  toolParams?: RunParam[];
+  /** Where to land when the sheet opens: a step to expand and scroll to, a field to focus, a preview to run. */
+  request?: SheetRequest | null;
+  /** Status and per-step problems, for the page summary and the sheet header. */
+  onSummary?: (info: ProcessingSummaryInfo) => void;
 }
 
 /* ------------------------------------------------------------------ */
 /*  Panel                                                              */
 /* ------------------------------------------------------------------ */
 
-export function ResponseProcessingPanel({ state, onChange, toolId }: Props) {
+/**
+ * The Response Processing editor body: steps and the response tree. It lives in
+ * the sheet (which hosts its header) and stays mounted while the sheet is
+ * closed, so it keeps reporting status to the page summary.
+ */
+export function ResponseProcessingPanel({
+  state,
+  onChange,
+  connectorId,
+  toolId,
+  toolParams = [],
+  request,
+  onSummary,
+}: Props) {
   const { token } = useAuth();
   const chain = state ?? emptyResponseProcessing();
   const { steps } = chain;
   const rootRef = useRef<HTMLElement>(null);
 
-  const contract = useContract(token);
-  const builtins = useMemo(
-    () => (contract ? contract.builtins.map(toBuiltinInfo) : FALLBACK_BUILTINS),
-    [contract],
-  );
-  const maxSteps = contract?.limits?.maxSteps ?? FALLBACK_MAX_STEPS;
-  const maxCodeBytes = contract?.limits?.script?.maxCodeBytes ?? FALLBACK_MAX_CODE_BYTES;
+  const { builtins, maxSteps, maxCodeBytes } = useBuiltins(token);
+
+  /* ---- sample: recorded, or pasted (client only, never stored) ---- */
 
   const [sampleRefresh, setSampleRefresh] = useState(0);
-  const sample = useSample(toolId, token, sampleRefresh);
+  const recorded = useRecorded(toolId, token, sampleRefresh);
+  const [pasted, setPasted] = useState<{ value: unknown } | null>(null);
+  const sample = pasted ? pasted.value : recorded.sample;
+  const lengths = pasted ? undefined : recorded.lengths;
+  const source: SampleSource | null = pasted
+    ? { kind: 'pasted' }
+    : recorded.sample !== undefined
+      ? { kind: 'recorded', capturedAt: recorded.capturedAt }
+      : null;
 
-  const problems = useMemo(
-    () => localProblems(chain, maxCodeBytes),
-    [chain, maxCodeBytes],
-  );
-  const chainKey = useMemo(() => JSON.stringify(chain), [chain]);
+  const tree = useMemo(() => {
+    const t = buildTree(sample, lengths);
+    addStepWrites(t, steps);
+    return t;
+  }, [sample, lengths, steps]);
+  const scopes = useMemo(() => steps.map((s) => scopeOf(tree, s.each)), [tree, steps]);
+
+  const problems = useMemo(() => localProblems(chain, maxCodeBytes), [chain, maxCodeBytes]);
+  const chainKey = useMemo(() => JSON.stringify(normalizeChain(chain)), [chain]);
+
+  /* ---- collapsed steps (by id, per tool, for the session) ---- */
+
+  const [collapsed, setCollapsed] = useState<Set<string>>(() => loadCollapsed(toolId));
+  const updateCollapsed = (next: Set<string>) => {
+    setCollapsed(next);
+    saveCollapsed(toolId, next);
+  };
+  const toggleStep = (i: number, all: boolean) => {
+    const id = steps[i].id;
+    if (all) {
+      const anyOpen = steps.some((s) => !collapsed.has(s.id));
+      updateCollapsed(anyOpen ? new Set(steps.map((s) => s.id)) : new Set());
+      return;
+    }
+    const next = new Set(collapsed);
+    if (!next.delete(id)) next.add(id);
+    updateCollapsed(next);
+  };
 
   /* ---- editing ---- */
 
-  const set = (next: Partial<ResponseProcessingChain>) => onChange({ ...chain, ...next });
   const setSteps = (next: Step[], extra: Partial<ResponseProcessingChain> = {}) =>
     onChange({ ...chain, ...extra, steps: next });
 
@@ -178,18 +211,32 @@ export function ResponseProcessingPanel({ state, onChange, toolId }: Props) {
     pendingFocus.current = null;
     const i = steps.findIndex((s, idx) => stepKey(s, idx) === target.key);
     if (i < 0) return;
-    rootRef.current
-      ?.querySelector<HTMLElement>(`[data-testid="rp-step-${i}-${target.suffix}"]`)
-      ?.focus();
+    const el = rootRef.current?.querySelector<HTMLElement>(`[data-testid="rp-step-${i}-${target.suffix}"]`);
+    el?.focus({ preventScroll: true });
+    el?.scrollIntoView({ block: 'nearest' });
   }, [steps]);
 
-  const addStep = (step: Step) => {
-    pendingFocus.current = { key: stepKey(step, steps.length), suffix: 'reads' };
+  const addStep = (step: Step, focus: string | null = 'input') => {
+    if (steps.length >= maxSteps) return;
+    if (focus) pendingFocus.current = { key: stepKey(step, steps.length), suffix: focus };
+    if (collapsed.has(step.id)) {
+      const next = new Set(collapsed);
+      next.delete(step.id);
+      updateCollapsed(next);
+    }
     setSteps([...steps, step], steps.length === 0 ? { enabled: true } : {});
   };
 
-  const replaceStep = (i: number, next: Step) =>
+  const replaceStep = (i: number, next: Step) => {
+    const prevId = steps[i].id;
+    if (next.id !== prevId && collapsed.has(prevId)) {
+      const c = new Set(collapsed);
+      c.delete(prevId);
+      c.add(next.id);
+      updateCollapsed(c);
+    }
     setSteps(steps.map((s, idx) => (idx === i ? next : s)));
+  };
 
   const duplicateStep = (i: number) => {
     const src = steps[i];
@@ -236,16 +283,51 @@ export function ResponseProcessingPanel({ state, onChange, toolId }: Props) {
     setSteps([...steps.slice(0, at), restored, ...steps.slice(at)], steps.length === 0 ? { enabled: true } : {});
   };
 
+  /* ---- pick mode: one step's path field, filled from the tree ---- */
+
+  const [picking, setPicking] = useState<{ key: string; field: PathMode } | null>(null);
+  const pickIndex = picking ? steps.findIndex((s, i) => stepKey(s, i) === picking.key) : -1;
+  const pick: PickContext | null =
+    picking && pickIndex >= 0
+      ? { field: picking.field, step: pickIndex, scope: scopes[pickIndex], script: isScript(steps[pickIndex]) }
+      : null;
+
+  const earlier = useMemo(() => steps.map((_, i) => earlierWrites(steps, i)), [steps]);
+
+  const fillFromTree = (value: string) => {
+    if (!pick) return;
+    const i = pick.step;
+    const step = steps[i];
+    // The mode follows what `writes` points at (see followMode).
+    const kindOf = (s: Step) => writesKind(s, isNewField(sample, s.each, earlier[i], s.writes));
+    const next =
+      pick.field === 'input'
+        ? withInput(step, value, elementIsScalar(sample, splitInput(value).each))
+        : withWrites(step, value);
+    replaceStep(i, followMode(step, next, kindOf));
+    // Picked: leave pick mode (the field's blur ends it).
+    (document.activeElement as HTMLElement | null)?.blur();
+    setPicking(null);
+  };
+
+  /** "+" on a tree row: a step on that field, processor by the value's type. */
+  const addStepOn = (node: TreeNode) => {
+    const at = placeOf(node);
+    const type = node.change?.kind === 'added' ? typeof node.change.after : typeof node.value;
+    const use = type === 'number' ? 'scale@1' : type === 'string' ? 'clean_text@1' : null;
+    const info = use ? builtins.find((b) => b.use === use) : undefined;
+    addStep(info ? newBuiltinStep(info, steps, at) : newScriptStep(steps, at), null);
+  };
+
   /* ---- validation: 400 ms debounce -> /validate ---- */
 
   const [remote, setRemote] = useState<Remote | null>(null);
   const hasProblems = problems.size > 0;
-  // What the recorded sample says about each step's paths: shown, never a reason to refuse a save.
+  // What the sample says about each step's paths: shown, never a reason to refuse a save.
   const pathProblems = useMemo(
-    () => steps.map((s, i) => samplePathProblems(steps, i, sample, s.use === SCRIPT_USE)),
+    () => steps.map((s, i) => samplePathProblems(steps, i, sample, isScript(s))),
     [steps, sample],
   );
-  const earlier = useMemo(() => steps.map((_, i) => earlierWrites(steps, i)), [steps]);
   useEffect(() => {
     if (!token || steps.length === 0 || !chain.enabled || hasProblems) return;
     let cancelled = false;
@@ -278,6 +360,7 @@ export function ResponseProcessingPanel({ state, onChange, toolId }: Props) {
   const [preview, setPreview] = useState<PreviewState | null>(null);
   const [previewing, setPreviewing] = useState(false);
   const currentPreview = preview && preview.key === chainKey ? preview : null;
+  const pastedValue = pasted?.value;
 
   const runPreview = useCallback(async () => {
     if (!token || previewing) return;
@@ -290,7 +373,10 @@ export function ResponseProcessingPanel({ state, onChange, toolId }: Props) {
     try {
       const res = await responseProcessing.preview(
         toolId,
-        { chain: { ...JSON.parse(key), enabled: true } },
+        {
+          chain: { ...JSON.parse(key), enabled: true },
+          ...(pastedValue !== undefined ? { sample: pastedValue } : {}),
+        },
         token,
       );
       setPreview(
@@ -304,26 +390,45 @@ export function ResponseProcessingPanel({ state, onChange, toolId }: Props) {
       } else if (err instanceof ApiError && err.status === 404) {
         setPreview({ key, kind: 'unavailable' });
       } else {
-        setPreview({
-          key,
-          kind: 'error',
-          message: err instanceof Error ? err.message : 'preview failed',
-        });
+        setPreview({ key, kind: 'error', message: err instanceof Error ? err.message : 'preview failed' });
       }
     } finally {
       setPreviewing(false);
       // A preview may follow a fresh call; pick up the newest recorded response.
-      setSampleRefresh((n) => n + 1);
+      if (pastedValue === undefined) setSampleRefresh((n) => n + 1);
     }
-  }, [token, previewing, chainKey, toolId]);
+  }, [token, previewing, chainKey, toolId, pastedValue]);
 
   const focusStep = (id: string) => {
     const i = steps.findIndex((s) => s.id === id);
     if (i < 0) return;
+    if (collapsed.has(id)) {
+      const next = new Set(collapsed);
+      next.delete(id);
+      updateCollapsed(next);
+    }
     const row = rootRef.current?.querySelector<HTMLElement>(`[data-testid="rp-step-${i}"]`);
     row?.scrollIntoView({ block: 'nearest' });
-    rootRef.current?.querySelector<HTMLElement>(`[data-testid="rp-step-${i}-id"]`)?.focus();
+    rootRef.current?.querySelector<HTMLElement>(`[data-testid="rp-step-${i}-id"]`)?.focus({ preventScroll: true });
   };
+
+  /* ---- Run (records the response as the sample) ---- */
+
+  const runTool = useCallback(
+    async (args: Record<string, unknown>): Promise<string | null> => {
+      if (!token || !connectorId || !toolId) return 'no tool';
+      try {
+        const res = await toolsApi.test(connectorId, toolId, args, token, undefined, { recordSample: true });
+        if (!res.ok) return res.error ?? res.kind ?? 'failed';
+        setPasted(null);
+        setSampleRefresh((n) => n + 1);
+        return null;
+      } catch (err) {
+        return err instanceof Error ? err.message : 'failed';
+      }
+    },
+    [token, connectorId, toolId],
+  );
 
   /* ---- keyboard ---- */
 
@@ -350,109 +455,102 @@ export function ResponseProcessingPanel({ state, onChange, toolId }: Props) {
     }
   };
 
-  /* ---- status chip ---- */
+  /* ---- status ---- */
 
-  const chip = ((): { tone: ChipTone; text: string; detail?: string } | null => {
-    if (currentPreview?.kind === 'nosample') return { tone: 'neutral', text: 'no sample' };
-    if (currentPreview?.kind === 'unavailable') return { tone: 'neutral', text: '—' };
-    if (!chain.enabled) return null;
+  const status = ((): ChainStatus | null => {
+    if (!chain.enabled || steps.length === 0) return null;
     if (hasProblems) {
       const [i, list] = [...problems][0];
+      return { tone: 'error', text: steps[i].id.trim() || `#${i + 1}`, detail: list.map((p) => p.code).join(' · ') };
+    }
+    const danger = pathProblems.findIndex((list) => list.some((p) => p.tone === 'danger'));
+    if (danger >= 0)
       return {
         tone: 'error',
-        text: steps[i].id.trim() || `#${i + 1}`,
-        detail: list.map((p) => p.code).join(' · '),
+        text: steps[danger].id.trim() || `#${danger + 1}`,
+        detail: pathProblems[danger].filter((p) => p.tone === 'danger').map((p) => `${p.field} ${p.code}`).join(' · '),
       };
-    }
-    for (const tone of ['danger', 'warn'] as const) {
-      const i = pathProblems.findIndex((list) => list.some((p) => p.tone === tone));
-      if (i >= 0)
-        return {
-          tone: tone === 'danger' ? 'error' : 'warn',
-          text: `${steps[i].id.trim() || `#${i + 1}`} · ${pathProblems[i].filter((p) => p.tone === tone).map((p) => p.code).join(' · ')}`,
-        };
-    }
     if (currentRemote?.status === 'ok')
       return { tone: 'ok', text: `${steps.length} ${steps.length === 1 ? 'step' : 'steps'}` };
     if (currentRemote?.status === 'invalid')
-      return {
-        tone: 'error',
-        text: serverStepId ?? currentRemote.problem,
-        detail: currentRemote.problem,
-      };
+      return { tone: 'error', text: serverStepId ?? currentRemote.problem, detail: currentRemote.problem };
     if (currentRemote?.status === 'unavailable' || !token) return { tone: 'neutral', text: '—' };
     return { tone: 'neutral', text: '…' };
   })();
 
-  /* ---- menus ---- */
+  /* ---- report to the summary and the sheet header ---- */
 
-  const addGroups: ActionMenuGroup[] = [
-    {
-      label: 'Built-in',
-      items: builtins.map((b) => ({
-        label: b.title,
-        icon: <Icon as={Sigma} />,
-        testId: `rp-add-${b.use}`,
-        onSelect: () => addStep(newBuiltinStep(b, steps)),
-      })),
-    },
-    {
-      label: 'Script',
-      items: [
-        {
-          label: 'Script',
-          icon: <Icon as={Code} />,
-          testId: `rp-add-${SCRIPT_USE}`,
-          onSelect: () => addStep(newScriptStep(steps)),
-        },
-      ],
-    },
-  ];
+  const issues = steps.map((s, i): string | null => {
+    const local = problems.get(i)?.[0];
+    if (local) return local.field;
+    const path = pathProblems[i]?.find((p) => p.tone === 'danger');
+    if (path) return path.field;
+    if (isScript(s) && checkSyntax(s.code ?? '').state === 'error') return 'code';
+    if (serverStepId && s.id === serverStepId) {
+      const field = /^step\s+\S+?:\s*(each|reads|writes|code|use|params|id)\b/.exec(serverProblem ?? '');
+      // `each` and `reads` are one field in the editor: the Input.
+      return field ? (field[1] === 'each' || field[1] === 'reads' ? 'input' : field[1]) : '';
+    }
+    return null;
+  });
+  const summaryKey = JSON.stringify({ status, issues, previewing });
+  useEffect(() => {
+    onSummary?.(JSON.parse(summaryKey) as ProcessingSummaryInfo);
+  }, [summaryKey, onSummary]);
 
-  const addMenu = (
-    <ActionMenu
-      variant="flat"
-      align="start"
-      label="add step"
-      testId="rp-add-step"
-      className="font-medium text-[var(--brand)] hover:text-[var(--brand)]"
-      disabled={steps.length >= maxSteps}
-      groups={addGroups}
-      trigger={
-        <>
-          <Icon as={Plus} />
-          Step
-          {CHEVRON}
-        </>
-      }
+  /* ---- requests from the sheet: land on a step, run a preview ---- */
+
+  const handled = useRef(0);
+  const runPreviewRef = useRef(runPreview);
+  useEffect(() => {
+    runPreviewRef.current = runPreview;
+  }, [runPreview]);
+  useEffect(() => {
+    if (!request || request.nonce === handled.current) return;
+    handled.current = request.nonce;
+    if (request.preview) void runPreviewRef.current();
+    if (request.stepId === undefined) return;
+    const i = steps.findIndex((s) => s.id === request.stepId);
+    if (i < 0) return;
+    const id = steps[i].id;
+    if (collapsed.has(id)) {
+      const next = new Set(collapsed);
+      next.delete(id);
+      setCollapsed(next);
+      saveCollapsed(toolId, next);
+    }
+    const root = rootRef.current;
+    // After the expansion has rendered.
+    requestAnimationFrame(() => {
+      root?.querySelector<HTMLElement>(`[data-testid="rp-step-${i}"]`)?.scrollIntoView({ block: 'start' });
+      root
+        ?.querySelector<HTMLElement>(`[data-testid="rp-step-${i}-${request.focus === 'reads' ? 'input' : request.focus ?? 'id'}"]`)
+        ?.focus({ preventScroll: true });
+    });
+  }, [request, steps, collapsed, toolId]);
+
+  const empty = steps.length === 0;
+
+  /* ---- preview rows (rendered in the tree) ---- */
+
+  const previewSlot = currentPreview && (
+    <PreviewRows
+      preview={currentPreview}
+      steps={steps}
+      onClose={() => setPreview(null)}
+      onFocusStep={focusStep}
     />
   );
 
-  const toggle = (
-    <AppSelect
-      aria-label="Response Processing enabled"
-      testId="rp-toggle"
-      value={chain.enabled ? 'on' : 'off'}
-      onValueChange={(v) => set({ enabled: v === 'on' })}
-      options={[
-        { value: 'on', label: 'On', icon: <Icon as={CircleDot} />, testId: 'rp-toggle-on', className: TONE_TEXT.success },
-        { value: 'off', label: 'Off', icon: <Icon as={Circle} />, testId: 'rp-toggle-off', className: TONE_TEXT.muted },
-      ]}
-      className={`${HEADER_TRIGGER} ${chain.enabled ? `font-medium ${TONE_TEXT.success}` : TONE_TEXT.muted}`}
-      chevron={CHEVRON}
-      contentClassName={CONTENT}
-      itemClassName={ITEM}
-    />
+  const undoButton = undo && (
+    <button type="button" data-testid="rp-undo" onClick={undoDelete} className={`${BTN_GHOST} self-start`}>
+      <Icon as={Undo2} />
+      Undo
+    </button>
   );
 
-  const title = (
-    <h4 className="text-[13px] font-medium text-[var(--text)]">Response Processing</h4>
-  );
-
-  /* ---- render ---- */
-
-  const collapsed = steps.length === 0;
-
+  // Layout bands by the width of the sheet body (`@container/rp`, set by the sheet):
+  // two columns from 1100px; below, one column with the tree under the steps.
   return (
     <section
       ref={rootRef}
@@ -460,241 +558,177 @@ export function ResponseProcessingPanel({ state, onChange, toolId }: Props) {
       aria-label="Response Processing"
       data-testid="rp-root"
       onKeyDown={onKeyDown}
-      className="[&_*:focus-visible]:outline-none!"
+      className={`text-sm [&_*:focus-visible]:outline-none! ${
+        empty
+          ? 'flex flex-col gap-3'
+          : 'grid grid-cols-1 gap-x-8 gap-y-4 @min-[1100px]/rp:grid-cols-[minmax(0,1fr)_minmax(400px,460px)]'
+      }`}
     >
-      {collapsed ? (
-        <div className="flex flex-wrap items-center gap-x-5 gap-y-1">
-          {title}
-          {toggle}
-          {addMenu}
-          {undo && <UndoChip onUndo={undoDelete} />}
-        </div>
-      ) : (
-        <>
-          <div className="flex flex-wrap items-center gap-x-5 gap-y-1 pb-2">
-            {title}
-            {toggle}
-            {chip && (
-              <StatusChip testId="rp-status" tone={chip.tone} detail={chip.detail}>
-                {chip.text}
-              </StatusChip>
-            )}
-            <div className="ml-auto flex items-center gap-1.5">
-              <span className="text-[12.5px] text-[var(--text-2)]">On error</span>
-              <AppSelect
-                aria-label="On error"
-                testId="rp-on-error"
-                value={chain.onError}
-                onValueChange={(v) => set({ onError: v as ResponseProcessingChain['onError'] })}
-                options={[
-                  { value: 'fail', label: 'Fail', testId: 'rp-on-error-fail', className: TONE_TEXT.danger },
-                  {
-                    value: 'passthrough',
-                    label: 'Pass through',
-                    testId: 'rp-on-error-passthrough',
-                    className: TONE_TEXT.warn,
-                  },
-                ]}
-                className={`${HEADER_TRIGGER} ${chain.onError === 'fail' ? TONE_TEXT.danger : TONE_TEXT.warn}`}
-                chevron={CHEVRON}
-                contentClassName={CONTENT}
-                itemClassName={ITEM}
-              />
-            </div>
-          </div>
-
-          <div className={`space-y-px ${chain.enabled ? '' : 'text-[var(--text-3)]'}`}>
-            {steps.map((step, i) => (
-              <ResponseProcessingStepRow
-                key={stepKey(step, i)}
-                step={step}
-                index={i}
-                count={steps.length}
-                builtins={builtins}
-                problems={problems.get(i) ?? []}
-                pathProblems={pathProblems[i] ?? []}
-                earlier={earlier[i] ?? []}
-                flagged={!!serverStepId && step.id === serverStepId}
-                flaggedDetail={serverStepId && step.id === serverStepId ? serverProblem : undefined}
-                sample={sample}
-                onReplace={(next) => replaceStep(i, next)}
-                onDuplicate={() => duplicateStep(i)}
-                onMove={(d) => moveStep(i, d)}
-                onDelete={() => deleteStep(i)}
-              />
-            ))}
-          </div>
-
-          <div className="flex flex-wrap items-center gap-x-5 gap-y-1 pt-2">
-            {addMenu}
-            <button
-              type="button"
-              data-testid="rp-preview"
-              aria-keyshortcuts="Meta+Enter Control+Enter"
-              aria-busy={previewing || undefined}
-              disabled={!token || previewing}
-              onClick={() => void runPreview()}
-              className={TEXT_BUTTON}
-            >
-              <Icon as={Play} />
-              Preview
-              <Kbd>⌘↵</Kbd>
-            </button>
-            {undo && <UndoChip onUndo={undoDelete} />}
-          </div>
-
-          {currentPreview?.kind === 'result' && (
-            <PreviewResult
-              data={currentPreview.data}
-              onClose={() => setPreview(null)}
-              onFocusStep={focusStep}
+      {/* steps (no column at all while there are none) */}
+      {!empty && (
+        <div className="flex min-w-0 flex-col gap-3">
+          {steps.map((step, i) => (
+            <ResponseProcessingStepRow
+              key={stepKey(step, i)}
+              step={step}
+              index={i}
+              count={steps.length}
+              builtins={builtins}
+              problems={problems.get(i) ?? []}
+              pathProblems={pathProblems[i] ?? []}
+              earlier={earlier[i] ?? []}
+              flagged={!!serverStepId && step.id === serverStepId}
+              flaggedDetail={serverStepId && step.id === serverStepId ? serverProblem : undefined}
+              sample={sample}
+              lengths={lengths}
+              tree={tree}
+              scope={scopes[i]}
+              collapsed={collapsed.has(step.id)}
+              onToggle={(all) => toggleStep(i, all)}
+              picking={picking && picking.key === stepKey(step, i) ? picking.field : null}
+              onPick={(field) =>
+                setPicking((cur) =>
+                  field
+                    ? { key: stepKey(step, i), field }
+                    : cur && cur.key === stepKey(step, i)
+                      ? null
+                      : cur,
+                )
+              }
+              onReplace={(next) => replaceStep(i, next)}
+              onDuplicate={() => duplicateStep(i)}
+              onMove={(d) => moveStep(i, d)}
+              onDelete={() => deleteStep(i)}
             />
-          )}
-          {currentPreview?.kind === 'error' && (
-            <p
-              data-testid="rp-preview-error"
-              className={`mt-2 inline-flex items-center gap-1.5 pt-2 font-mono text-[12px] font-medium ${TONE_TEXT.danger}`}
-            >
-              <Icon as={X} />
-              {currentPreview.message}
-            </p>
-          )}
-        </>
+          ))}
+          {undoButton}
+        </div>
       )}
+      {empty && undoButton}
+
+      {/* response tree */}
+      <ResponseTree
+        className={empty ? '' : '@min-[1100px]/rp:sticky @min-[1100px]/rp:top-2'}
+        compact={empty}
+        sample={sample}
+        source={source}
+        lengths={lengths}
+        steps={steps}
+        result={currentPreview?.kind === 'result' && currentPreview.data.ok ? currentPreview.data.result : undefined}
+        pick={pick}
+        onPick={fillFromTree}
+        onAddStep={addStepOn}
+        previewSlot={previewSlot}
+        onRun={connectorId && toolId ? runTool : undefined}
+        runParams={toolParams}
+        runDefaults={recorded.input}
+        onPaste={(value) => setPasted({ value })}
+      />
     </section>
   );
 }
 
 /* ------------------------------------------------------------------ */
-/*  Pieces                                                             */
+/*  Preview rows (in the tree, under its header)                       */
 /* ------------------------------------------------------------------ */
 
-function UndoChip({ onUndo }: { onUndo: () => void }) {
-  return (
-    <button type="button" data-testid="rp-undo" onClick={onUndo} className={`${TEXT_BUTTON} font-medium`}>
-      <Icon as={Undo2} />
-      Undo
-    </button>
-  );
-}
-
-const COLS = 'grid grid-cols-[minmax(120px,max-content)_9ch_10ch_9ch] items-center gap-x-4';
-
-function PreviewResult({
-  data,
+function PreviewRows({
+  preview,
+  steps,
   onClose,
   onFocusStep,
 }: {
-  data: ResponseProcessingPreview;
+  preview: PreviewState;
+  steps: Step[];
   onClose: () => void;
   onFocusStep: (id: string) => void;
 }) {
-  const reports = data.steps ?? [];
-  const failure = !data.ok
-    ? splitFailure(data.error, data.failedStep, data.failedPath)
-    : null;
-
-  return (
-    <div
-      data-testid="rp-preview-result"
-      className="mt-2 space-y-1 pt-2 font-mono text-[12px]"
-    >
-      <div className="flex items-center gap-3 px-1">
-        <span className="text-[var(--text-3)]">{data.sampleSource ?? ''}</span>
-        <button
-          type="button"
-          aria-label="close preview"
-          data-testid="rp-preview-close"
-          onClick={onClose}
-          className={`${TEXT_BUTTON} ml-auto text-[var(--text-3)]`}
-        >
+  if (preview.kind === 'nosample' || preview.kind === 'unavailable' || preview.kind === 'error') {
+    const text = preview.kind === 'error' ? preview.message : preview.kind === 'nosample' ? 'no sample' : '—';
+    return (
+      <div className="mb-2 flex items-center gap-2 px-2 leading-none">
+        <span data-testid="rp-preview-error" className={`${ROW} min-w-0 gap-1.5 font-mono text-sm ${TONE_TEXT.danger}`}>
           <Icon as={X} />
-          <Kbd>esc</Kbd>
-        </button>
+          <span className="truncate">{text}</span>
+        </span>
+        <CloseButton onClose={onClose} />
       </div>
-
-      {reports.map((r, i) => {
-        const failed = failure?.step === r.id;
-        const lines =
-          r.sample === undefined ? [] : diffSamples(i === 0 ? undefined : reports[i - 1].sample, r.sample);
-        const shown = lines.slice(0, MAX_DIFF_LINES);
-        return (
-          <div key={`${r.id}-${i}`} data-testid={`rp-preview-step-${r.id}`}>
-            <button
-              type="button"
-              onClick={() => onFocusStep(r.id)}
-              className={`${COLS} w-full px-1 py-0.5 text-left outline-none hover:bg-[var(--surface-2)] focus-visible:bg-[var(--surface-2)] ${
-                failed ? `bg-[var(--t-danger-bg)] font-medium` : ''
-              }`}
-            >
-              <span className={`inline-flex min-w-0 items-center gap-1.5 ${failed ? TONE_TEXT.danger : 'text-[var(--text)]'}`}>
-                {failed && <Icon as={X} />}
-                <span className="truncate">{r.id}</span>
-              </span>
-              <span>
-                <span className="text-[var(--text-3)]">wrote </span>
-                <span className="text-[var(--text)]">{r.wrote}</span>
-              </span>
-              <span>
-                <span className="text-[var(--text-3)]">skipped </span>
-                <span className="text-[var(--text)]">{r.skipped}</span>
-              </span>
-              <span className="text-[var(--text-2)]">{formatBytes(r.bytes)}</span>
-            </button>
-            {shown.length > 0 && (
-              <ul className="space-y-px pl-6">
-                {shown.map((l) => (
-                  <li key={`${l.kind}-${l.path}`} data-diff={l.kind} className="truncate px-1">
-                    {l.kind === 'added' && (
-                      <span className={TONE_TEXT.success}>
-                        {l.path}: {l.after}
-                      </span>
-                    )}
-                    {l.kind === 'changed' && (
-                      <span className="text-[var(--text)]">
-                        {l.path}: <span className="text-[var(--text-3)]">{l.before}</span> → {l.after}
-                      </span>
-                    )}
-                    {l.kind === 'removed' && (
-                      <span className="text-[var(--text-3)] line-through">
-                        {l.path}: {l.before}
-                      </span>
-                    )}
-                    {l.kind === 'plain' && (
-                      <span className="text-[var(--text-3)]">
-                        {l.path}: {l.after}
-                      </span>
-                    )}
-                  </li>
-                ))}
-                {lines.length > shown.length && (
-                  <li className="px-1 text-[var(--text-3)]">+{lines.length - shown.length}</li>
-                )}
-              </ul>
-            )}
-          </div>
-        );
-      })}
-
+    );
+  }
+  const { data } = preview;
+  const reports = data.steps ?? [];
+  const failure = !data.ok ? splitFailure(data.error, data.failedStep, data.failedPath) : null;
+  const number = (id: string) => {
+    const i = steps.findIndex((s) => s.id === id);
+    return i < 0 ? '··' : String(i + 1).padStart(2, '0');
+  };
+  return (
+    <div data-testid="rp-preview-result" className="mb-3 flex flex-col gap-0.5 rounded-md bg-[var(--surface)] p-1.5">
+      {reports.map((r, i) => (
+        <button
+          key={`${r.id}-${i}`}
+          type="button"
+          data-testid={`rp-preview-step-${r.id}`}
+          onClick={() => onFocusStep(r.id)}
+          className={`${ROW} h-[30px] gap-3 rounded-[4px] px-2 text-left font-mono text-sm hover:bg-[var(--surface-2)]`}
+        >
+          <span className="w-[22px] text-[var(--text-3)]">{number(r.id)}</span>
+          <span className="min-w-0 flex-1 truncate text-[var(--text)]">{r.id}</span>
+          <span className={`${ROW} gap-1.5 text-[var(--text-2)]`} title="wrote">
+            <Icon as={PenLine} className="text-[var(--text-3)]" />
+            {r.wrote}
+          </span>
+          {r.skipped > 0 && (
+            <span className={`${ROW} gap-1.5 ${TONE_TEXT.warn}`} title="skipped">
+              <Icon as={SkipForward} />
+              {r.skipped}
+            </span>
+          )}
+          <span className={`${ROW} gap-1.5 text-[var(--text-3)]`} title="size">
+            <Icon as={HardDrive} />
+            {formatBytes(r.bytes)}
+          </span>
+        </button>
+      ))}
       {failure && (
         <button
           type="button"
-          data-testid="rp-preview-error"
+          data-testid={`rp-preview-step-${failure.step}`}
           onClick={() => onFocusStep(failure.step)}
-          className={`flex w-full items-center gap-1.5 px-1 py-0.5 text-left font-medium outline-none hover:bg-[var(--surface-2)] focus-visible:bg-[var(--surface-2)] ${TONE_TEXT.danger}`}
+          className={`${ROW} min-h-[30px] gap-3 rounded-[4px] bg-[var(--t-danger-bg)] px-2 py-1.5 text-left font-mono text-sm ${TONE_TEXT.danger}`}
         >
-          <Icon as={X} />
-          <span>{failure.step}</span>
-          {failure.path && (
-            <>
-              <span className="text-[var(--text-3)]">·</span>
-              <span>{failure.path}</span>
-            </>
-          )}
-          <span className="text-[var(--text-3)]">·</span>
-          <span className="truncate">{failure.reason}</span>
+          <span className="w-[22px]">{number(failure.step)}</span>
+          <span data-testid="rp-preview-error" className={`${ROW} min-w-0 flex-1 flex-wrap gap-x-1.5 gap-y-1 leading-snug`}>
+            <span className="font-medium">{failure.step}</span>
+            {failure.path && (
+              <>
+                <span className="opacity-60">·</span>
+                <span>{failure.path}</span>
+              </>
+            )}
+            <span className="opacity-60">·</span>
+            <span>{failure.reason}</span>
+          </span>
         </button>
       )}
+      <div className="flex justify-end">
+        <CloseButton onClose={onClose} />
+      </div>
     </div>
+  );
+}
+
+function CloseButton({ onClose }: { onClose: () => void }) {
+  return (
+    <button
+      type="button"
+      aria-label="close preview"
+      data-testid="rp-preview-close"
+      onClick={onClose}
+      className={`${BTN_GHOST} ml-auto h-7 text-[var(--text-3)]`}
+    >
+      <Icon as={X} />
+      <Kbd className="text-sm">esc</Kbd>
+    </button>
   );
 }

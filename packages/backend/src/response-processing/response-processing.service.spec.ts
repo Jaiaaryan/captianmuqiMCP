@@ -1,4 +1,4 @@
-import { SAMPLE_LIMITS, truncateSample } from './response-processing.service';
+import { SAMPLE_LIMITS, sampleLengths, truncateSample } from './response-processing.service';
 
 const bytes = (v: unknown) => Buffer.byteLength(JSON.stringify(v), 'utf8');
 
@@ -40,5 +40,14 @@ describe('truncateSample', () => {
   it('drops values JSON cannot carry', () => {
     const out = truncateSample({ a: undefined, f: () => 1, n: 2 });
     expect(out.sample).toEqual({ a: null, f: null, n: 2 });
+  });
+});
+
+describe('sampleLengths', () => {
+  it('records array lengths by tree path, nested arrays through their first element', () => {
+    expect(
+      sampleLengths({ items: [{ tiers: [1, 2, 3] }, { tiers: [] }], 'odd key': [], n: 1 }),
+    ).toEqual({ '$.items': 2, '$.items[*].tiers': 3, "$['odd key']": 0 });
+    expect(sampleLengths([[1, 2]])).toEqual({ $: 1, '$[*]': 2 });
   });
 });

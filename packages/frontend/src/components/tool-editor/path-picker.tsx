@@ -1,27 +1,16 @@
-'use client';
+import type { FieldTone } from './response-processing-styles';
 
-import { useEffect, useId, useMemo, useRef, useState } from 'react';
-import * as DropdownMenu from '@radix-ui/react-dropdown-menu';
-import {
-  Braces,
-  Brackets,
-  ChevronDown,
-  ChevronRight,
-  CircleSlash,
-  Hash,
-  Plus,
-  ToggleLeft,
-  Type,
-  type LucideIcon,
-} from 'lucide-react';
-import { Icon } from './icon';
-import { CELL, LINE_TONE, TRIGGER, type FieldTone } from './response-processing-styles';
+/**
+ * Paths over a recorded sample: parsing, resolving, and what a sample says
+ * about a step's paths. Pure; the response tree (response-tree.tsx) and the
+ * path fields (path-input.tsx) are built on it.
+ */
 
 /* ------------------------------------------------------------------ */
 /*  Paths over a sample (pure)                                         */
 /* ------------------------------------------------------------------ */
 
-export type PathMode = 'each' | 'reads' | 'writes';
+export type PathMode = 'input' | 'writes';
 export type JsonType = 'object' | 'array' | 'string' | 'number' | 'boolean' | 'null';
 
 export function jsonType(v: unknown): JsonType {
@@ -115,26 +104,166 @@ export function resolvePath(root: unknown, path: string): { found: boolean; valu
 }
 
 /* ------------------------------------------------------------------ */
-/*  What the picker can show                                           */
+/*  Stored form <-> what the field shows                               */
 /* ------------------------------------------------------------------ */
 
-const KEY_PATH = /^[A-Za-z_$][\w$]*(?:\.[A-Za-z_$][\w$]*)*$/;
-const EACH_PATH = /^\$(?:\.[A-Za-z_$][\w$]*|\[\*\])*\[\*\]$/;
-const NEW_KEY = /^[A-Za-z_][A-Za-z0-9_]*$/;
-
-/** Whether a stored path is one the picker writes; anything else needs the raw fields. */
-export function pickerCanShow(mode: PathMode, path: string | undefined): boolean {
-  const p = (path ?? '').trim();
-  if (!p) return true;
-  if (mode === 'each') return EACH_PATH.test(p);
-  return p === '$' || KEY_PATH.test(p);
+/** `$.items[*]` -> `items[*]`; `$` / empty -> empty (the whole response). */
+export function eachLabel(each: string | undefined): string {
+  const p = (each ?? '').trim();
+  if (!p || p === '$') return '';
+  return p.replace(/^\$\.?/, '');
 }
 
-/** The field's label: `any` for the whole response, `element` for `$`, the path without `$.` (and a closing `[*]`) otherwise. */
-export function pathLabel(mode: PathMode, path: string): string {
+/** What the user typed into `each`, stored as an absolute path. */
+export function eachFromInput(text: string): string | undefined {
+  const t = text.trim();
+  if (!t || t === '$') return undefined;
+  if (t.startsWith('$')) return t;
+  return t.startsWith('[') ? `$${t}` : `$.${t}`;
+}
+
+/** `$.a.b` -> `a.b`, `$['x']` -> `['x']`; `$` stays `$`. */
+export function relPath(path: string): string {
   const p = path.trim();
-  if (mode === 'each') return p ? p.replace(/^\$\.?/, '').replace(/\[\*\]$/, '') || 'response' : 'any';
-  return p === '$' ? 'element' : p;
+  return p === '$' ? '$' : p.replace(/^\$\.?/, '');
+}
+
+/**
+ * The Input field: `each` without `$.` joined with `reads`.
+ * `$.items[*]` + `price_usd` -> `items[*].price_usd`; `$.items[*]` + `$` -> `items[*]`;
+ * no each + `$.total` -> `total`; no each + `$` -> `$`.
+ */
+export function inputOf(each: string | undefined, reads: string): string {
+  const e = eachLabel(each);
+  const r = reads.trim();
+  const rel = r === '$' ? '' : relPath(r);
+  if (!e) return r === '$' ? '$' : rel;
+  if (!rel) return e;
+  return rel.startsWith('[') ? `${e}${rel}` : `${e}.${rel}`;
+}
+
+/**
+ * The stored form of an Input: split at the last `[*]`. Up to and including it
+ * is `each` (`$.items[*]`), the rest `reads` relative to the element (`$` when
+ * nothing is left). Without `[*]`: no `each`, `reads` the absolute path.
+ */
+export function splitInput(text: string): { each?: string; reads: string } {
+  const t = text.trim();
+  if (!t) return { reads: '' };
+  if (t === '$') return { reads: '$' };
+  const at = t.lastIndexOf('[*]');
+  if (at < 0) return { reads: t.startsWith('$') ? t : t.startsWith('[') ? `$${t}` : `$.${t}` };
+  const each = eachFromInput(t.slice(0, at + 3));
+  const rest = t.slice(at + 3).replace(/^\./, '');
+  return { ...(each ? { each } : {}), reads: rest || '$' };
+}
+
+/** `items[*].price_usd -> price_eur`; the Input alone when the step writes where it reads. */
+export function pathSummary(step: { each?: string; reads: string; writes: string }): string {
+  const input = step.reads.trim() ? inputOf(step.each, step.reads) : '?';
+  const w = step.writes.trim();
+  return w && relPath(w) !== relPath(step.reads) ? `${input} → ${w}` : input;
+}
+
+/* ------------------------------------------------------------------ */
+/*  What a step receives per run                                       */
+/* ------------------------------------------------------------------ */
+
+/**
+ * The elements `each` stands for in a sample, as the server walks them: `[*]`
+ * through array elements and object values, a path ending on an array (or no
+ * `each` on an array response) means its elements. `many` when that iterates;
+ * `count` uses the uncut length when the sample cut the array. Null when the
+ * path is not there.
+ */
+export function elementsOf(
+  sample: unknown,
+  each: string | undefined,
+  lengths: Record<string, number> = {},
+): { values: unknown[]; many: boolean; count: number } | null {
+  const e = (each ?? '').trim();
+  const tokens = e && e !== '$' ? parsePath(e) : [];
+  if (!tokens) return null;
+  let values: unknown[] = [sample];
+  let many = false;
+  let arrayPath: string | null = null;
+  let path = '$';
+  const iterate = (v: unknown): unknown[] | null =>
+    Array.isArray(v) ? v : isObject(v) ? Object.values(v) : null;
+  for (const t of tokens) {
+    const next: unknown[] = [];
+    for (const v of values) {
+      if (t.kind === 'key') {
+        if (isObject(v) && t.name in v) next.push(v[t.name]);
+      } else if (t.kind === 'index') {
+        if (Array.isArray(v)) {
+          const x = v[t.index < 0 ? v.length + t.index : t.index];
+          if (x !== undefined) next.push(x);
+        }
+      } else {
+        const list = iterate(v);
+        if (list) next.push(...list);
+      }
+    }
+    if (t.kind === 'wildcard') {
+      arrayPath = many ? null : Array.isArray(values[0]) ? path : null;
+      many = true;
+      path = `${path}[*]`;
+    } else {
+      path = t.kind === 'key' ? joinKey(path, t.name) : `${path}[${t.index}]`;
+    }
+    values = next;
+    if (!values.length && !many) return null;
+  }
+  const last = tokens[tokens.length - 1];
+  if ((!last || last.kind !== 'wildcard') && values.length === 1 && Array.isArray(values[0])) {
+    arrayPath = many ? null : path;
+    values = values[0] as unknown[];
+    many = true;
+  }
+  const count = arrayPath !== null && lengths[arrayPath] !== undefined ? lengths[arrayPath] : values.length;
+  return { values, many, count };
+}
+
+/**
+ * The type label of an Input, TypeScript-style. Walking elements (`[*]`):
+ * `number[30]`, `object[30]`, `mixed[30]` when they differ. A single value:
+ * `number`, `string`, `boolean`, `null`, a whole array `array[30]`, a whole
+ * object `object{99}`. Null when the sample cannot tell.
+ */
+export function inputType(
+  sample: unknown,
+  each: string | undefined,
+  reads: string,
+  lengths: Record<string, number> = {},
+): string | null {
+  const r = reads.trim();
+  if (sample === undefined || !r || (r !== '$' && !parsePath(r))) return null;
+  const el = elementsOf(sample, each, lengths);
+  if (!el) return null;
+  const read = r === '$' ? el.values : el.values.map((v) => resolvePath(v, r)).filter((x) => x.found).map((x) => x.value);
+  if (!read.length) return null;
+  if (el.many) {
+    const types = new Set(read.map(jsonType));
+    return `${types.size === 1 ? [...types][0] : 'mixed'}[${el.count}]`;
+  }
+  const v = read[0];
+  if (Array.isArray(v)) {
+    // The uncut length, when the sample cut the array (no `each`: `reads` is the absolute path).
+    const tokens = !(each ?? '').trim() || (each ?? '').trim() === '$' ? parsePath(r === '$' ? '' : r) : null;
+    let key = '$';
+    for (const t of tokens ?? []) key = t.kind === 'key' ? joinKey(key, t.name) : t.kind === 'index' ? `${key}[${t.index}]` : `${key}[*]`;
+    return `array[${tokens && lengths[key] !== undefined ? lengths[key] : v.length}]`;
+  }
+  if (isObject(v)) return `object{${Object.keys(v).length}}`;
+  return jsonType(v);
+}
+
+/** The elements of `each` are scalars: nothing can be written under them, `writes` is the Input itself. */
+export function elementIsScalar(sample: unknown, each: string | undefined): boolean {
+  if (sample === undefined) return false;
+  const el = eachElement(sample, each);
+  return el.found && !Array.isArray(el.value) && !isObject(el.value);
 }
 
 /* ------------------------------------------------------------------ */
@@ -148,7 +277,7 @@ export interface PathProblem {
 }
 
 interface PathStep {
-  use: string;
+  use: unknown;
   each?: string;
   reads: string;
   writes: string;
@@ -173,9 +302,13 @@ export function earlierWrites(steps: PathStep[], index: number): { key: string; 
  * path the sample does not have (the sample may be partial).
  */
 export function samplePathProblems(steps: PathStep[], index: number, sample: unknown, script: boolean): PathProblem[] {
-  if (sample === undefined) return [];
   const step = steps[index];
   const out: PathProblem[] = [];
+  const writes = step.writes.trim();
+  // `$` (the Input itself) always exists: `add` is refused at run time.
+  const tiedWhole = writes === '$' || (!writes && step.reads.trim() === '$');
+  if (tiedWhole && step.mode === 'add') out.push({ field: 'writes', code: 'exists', tone: 'danger' });
+  if (sample === undefined) return out;
   const each = (step.each ?? '').trim();
   if (each && each !== '$') {
     const tokens = parsePath(each);
@@ -186,25 +319,28 @@ export function samplePathProblems(steps: PathStep[], index: number, sample: unk
       for (const t of target) {
         if (t.kind === 'key' && isObject(v) && t.name in v) v = v[t.name];
         else if (t.kind === 'wildcard' && Array.isArray(v)) v = v[0];
+        else if (t.kind === 'wildcard' && isObject(v)) v = Object.values(v)[0];
         else if (t.kind === 'index' && Array.isArray(v)) v = v[t.index];
         else {
           found = false;
           break;
         }
       }
-      if (!found || v === undefined) out.push({ field: 'each', code: 'not in sample', tone: 'warn' });
-      else if (!Array.isArray(v) && !script) out.push({ field: 'each', code: 'not a list', tone: 'danger' });
+      const iterates = tokens[tokens.length - 1]?.kind === 'wildcard';
+      if (!found || v === undefined) out.push({ field: 'input', code: 'not in sample', tone: 'warn' });
+      // `[*]` walks array elements and object values; nothing else.
+      else if (iterates && !Array.isArray(v) && !isObject(v)) out.push({ field: 'input', code: 'not a list', tone: 'danger' });
+      else if (!iterates && !Array.isArray(v) && !script && !isObject(v)) out.push({ field: 'input', code: 'not a list', tone: 'danger' });
     }
   }
   const root = eachElement(sample, step.each);
   if (!root.found) return out;
-  const earlier = new Set(earlierWrites(steps, index).map((e) => e.key));
-  const has = (p: string) => earlier.has(p) || resolvePath(root.value, p).found;
+  const earlier = new Set(earlierWrites(steps, index).map((e) => relPath(e.key)));
+  const has = (p: string) => earlier.has(relPath(p)) || resolvePath(root.value, p).found;
   const reads = step.reads.trim();
   if (reads && reads !== '$' && !reads.includes('*') && parsePath(reads) && !has(reads)) {
-    out.push({ field: 'reads', code: 'not in sample', tone: 'warn' });
+    out.push({ field: 'input', code: 'not in sample', tone: 'warn' });
   }
-  const writes = step.writes.trim();
   if (writes && writes !== '$' && !writes.includes('*') && parsePath(writes)) {
     const exists = has(writes);
     if (step.mode === 'add' && exists) out.push({ field: 'writes', code: 'exists', tone: 'danger' });
@@ -213,491 +349,21 @@ export function samplePathProblems(steps: PathStep[], index: number, sample: unk
   return out;
 }
 
-/* ------------------------------------------------------------------ */
-/*  Rows                                                               */
-/* ------------------------------------------------------------------ */
-
-export interface PathRow {
-  /** Row identity (and expansion key). */
-  id: string;
-  /** What choosing the row writes into the field; null: not selectable here. */
-  path: string | null;
-  label: string;
-  type?: JsonType;
-  /** Right-aligned: a sample value, or `N items` / `N keys`. */
-  right?: string;
-  /** Trailing flag: `exists`, `step 02`. */
-  flag?: string;
-  depth: number;
-  parent: string | null;
-  expandable: boolean;
-  inner?: { value: unknown; base: string };
-  special?: 'any' | 'new' | 'nosample';
-}
-
-const MAX_KEYS = 200;
-
-function hasArray(v: unknown, depth = 0): boolean {
-  if (depth > 6) return false;
-  if (Array.isArray(v)) return true;
-  if (!isObject(v)) return false;
-  return Object.values(v).slice(0, MAX_KEYS).some((x) => hasArray(x, depth + 1));
-}
-
-function rightText(v: unknown, type: JsonType): string {
-  if (type === 'array') {
-    const n = (v as unknown[]).length;
-    return `${n} ${n === 1 ? 'item' : 'items'}`;
-  }
-  if (type === 'object') {
-    const n = Object.keys(v as object).length;
-    return `${n} ${n === 1 ? 'key' : 'keys'}`;
-  }
-  const text = type === 'string' ? JSON.stringify(v) : String(v);
-  return text.length > 28 ? `${text.slice(0, 27)}…` : text;
-}
-
-/** The rows directly under `value`. */
-export function childRows(value: unknown, base: string, mode: PathMode, depth: number, parent: string | null): PathRow[] {
-  if (!isObject(value)) return [];
-  const out: PathRow[] = [];
-  for (const [label, v] of Object.entries(value).slice(0, MAX_KEYS)) {
-    const path = joinKey(base, label);
-    const type = jsonType(v);
-    const right = rightText(v, type);
-    if (mode === 'each') {
-      if (type === 'array') {
-        const first = (v as unknown[])[0];
-        const sel = `${path}[*]`;
-        out.push({ id: sel, path: sel, label, type, right, depth, parent, expandable: isObject(first) && hasArray(first), inner: { value: first, base: sel } });
-      } else {
-        // Not a list: shown dimmed, opened only on the way to a nested one.
-        out.push({ id: path, path: null, label, type, right, depth, parent, expandable: type === 'object' && hasArray(v), inner: { value: v, base: path } });
-      }
-    } else if (type === 'object') {
-      out.push({ id: path, path, label, type, right, depth, parent, expandable: Object.keys(v as object).length > 0, inner: { value: v, base: path } });
-    } else {
-      out.push({ id: path, path, label, type, right, depth, parent, expandable: false });
-    }
-  }
-  return out;
-}
-
-export function rootRows(
-  sample: unknown,
-  mode: PathMode,
-  each: string | undefined,
-  allowWhole: boolean,
-  earlier: { key: string; step: number }[] = [],
-): PathRow[] {
-  if (sample === undefined) return [{ id: '#nosample', path: null, label: 'no sample', depth: 0, parent: null, expandable: false, special: 'nosample' }];
-  if (mode === 'each') {
-    const rows: PathRow[] = [
-      { id: '#any', path: '', label: 'any', right: 'whole response', depth: 0, parent: null, expandable: false, special: 'any' },
-    ];
-    if (Array.isArray(sample)) {
-      const first = sample[0];
-      rows.push({ id: '$[*]', path: '$[*]', label: 'response', type: 'array', right: rightText(sample, 'array'), depth: 0, parent: null, expandable: isObject(first) && hasArray(first), inner: { value: first, base: '$[*]' } });
-    }
-    return [...rows, ...childRows(sample, '$', 'each', 0, null)];
-  }
-  const rows: PathRow[] = [];
-  if (mode === 'writes') rows.push({ id: '#new', path: null, label: 'new key…', depth: 0, parent: null, expandable: false, special: 'new' });
-  if (allowWhole) rows.push({ id: '#any', path: '$', label: 'any', right: 'element', depth: 0, parent: null, expandable: false, special: 'any' });
-  const el = eachElement(sample, each);
-  const children = el.found ? childRows(el.value, '', mode, 0, null) : [];
-  if (mode === 'writes') for (const r of children) r.flag = 'exists';
-  for (const e of earlier) {
-    if (children.some((r) => r.path === e.key)) continue;
-    children.push({ id: `#earlier-${e.key}`, path: e.key, label: e.key, flag: `step ${String(e.step).padStart(2, '0')}`, depth: 0, parent: null, expandable: false });
-  }
-  return [...rows, ...children];
-}
-
-export function visibleRows(roots: PathRow[], expanded: Set<string>, mode: PathMode): PathRow[] {
-  const out: PathRow[] = [];
-  const walk = (rows: PathRow[]) => {
-    for (const r of rows) {
-      out.push(r);
-      if (r.expandable && expanded.has(r.id) && r.inner && r.depth < 12) {
-        const kids = childRows(r.inner.value, r.inner.base, mode, r.depth + 1, r.id);
-        if (mode === 'writes') for (const k of kids) k.flag = 'exists';
-        walk(kids);
-      }
-    }
-  };
-  walk(roots);
-  return out;
-}
-
-/** Expanded set that reveals `value`: every expandable ancestor whose child base prefixes it. */
-export function revealPath(roots: PathRow[], value: string, mode: PathMode): Set<string> {
-  const open = new Set<string>();
-  if (!value) return open;
-  const prefixes = (p: string) => value.startsWith(`${p}.`) || value.startsWith(`${p}[`);
-  const walk = (rows: PathRow[]) => {
-    for (const r of rows) {
-      if (r.expandable && r.inner && prefixes(r.inner.base) && r.depth < 12) {
-        open.add(r.id);
-        walk(childRows(r.inner.value, r.inner.base, mode, r.depth + 1, r.id));
-      }
-    }
-  };
-  walk(roots);
-  return open;
-}
-
-/* ------------------------------------------------------------------ */
-/*  Presentation                                                       */
-/* ------------------------------------------------------------------ */
-
-const TYPE_ICON: Record<JsonType, LucideIcon> = {
-  object: Braces,
-  array: Brackets,
-  string: Type,
-  number: Hash,
-  boolean: ToggleLeft,
-  null: CircleSlash,
-};
-
-/** Width of a monospace field, sized to its content. */
-export function chWidth(text: string, placeholder = '', min = 3): React.CSSProperties {
-  return { width: `${Math.max(min, (text || placeholder).length) + 1}ch` };
-}
-
-interface PickerProps {
-  value: string;
-  onChange: (value: string) => void;
-  mode: PathMode;
-  /** Most recent recorded response; undefined: the picker shows `no sample`. */
-  sample: unknown;
-  /** The step's `each`, for `reads` / `writes`. */
-  each?: string;
-  /** Offer `any` (the whole element, `$`) first: script steps. */
-  allowWhole?: boolean;
-  /** Keys earlier steps write on the same elements. */
-  earlier?: { key: string; step: number }[];
-  placeholder?: string;
-  ariaLabel: string;
-  testId: string;
-  tone?: FieldTone;
-  /** Leading icon inside the trigger. */
-  icon?: LucideIcon;
-  /** Muted word before the value (`on`). */
-  prefix?: string;
-}
 
 /**
- * One path field. By default a picker: the user clicks a key and the picker writes
- * the path. `advanced` shows the stored path verbatim in a monospace input, with
- * the picker behind a chevron; only there can `$`, `[*]` and bracket keys be typed.
+ * Is `path` a field the step's elements do not have yet (not in the sample,
+ * not written by an earlier step)? Null when the sample cannot tell.
  */
-export function PathField(props: PickerProps & { advanced: boolean }) {
-  const { advanced, value, onChange, placeholder, ariaLabel, testId, tone, prefix } = props;
-  if (!advanced) return <TreePicker {...props} variant="field" />;
-  return (
-    <span className="inline-flex min-w-0 max-w-full items-center gap-1">
-      {prefix && <span className="text-[12.5px] text-[var(--text-3)]">{prefix}</span>}
-      <input
-        type="text"
-        value={value}
-        spellCheck={false}
-        placeholder={placeholder}
-        aria-label={ariaLabel}
-        aria-invalid={tone === 'danger' || undefined}
-        data-testid={testId}
-        data-value={value}
-        title={value || undefined}
-        onChange={(e) => onChange(e.target.value)}
-        style={chWidth(value, placeholder)}
-        className={`${CELL} max-w-[220px] truncate ${tone ? LINE_TONE[tone] : ''}`}
-      />
-      <TreePicker {...props} variant="chevron" />
-    </span>
-  );
-}
-
-function TreePicker({
-  value,
-  onChange,
-  mode,
-  sample,
-  each,
-  allowWhole = false,
-  earlier,
-  placeholder,
-  ariaLabel,
-  testId,
-  tone,
-  icon: Lead,
-  prefix,
-  variant,
-}: PickerProps & { variant: 'field' | 'chevron' }) {
-  const [open, setOpen] = useState(false);
-  const [expanded, setExpanded] = useState<Set<string>>(new Set());
-  const [active, setActive] = useState(-1);
-  const [newKey, setNewKey] = useState<string | null>(null);
-  const treeRef = useRef<HTMLDivElement>(null);
-  const baseId = useId();
-  const triggerId = variant === 'field' ? testId : `${testId}-pick`;
-
-  const roots = useMemo(() => rootRows(sample, mode, each, allowWhole, earlier), [sample, mode, each, allowWhole, earlier]);
-  const rows = useMemo(() => visibleRows(roots, expanded, mode), [roots, expanded, mode]);
-
-  const onOpenChange = (next: boolean) => {
-    if (next) {
-      const reveal = revealPath(roots, value, mode);
-      setExpanded(reveal);
-      setNewKey(null);
-      setActive(visibleRows(roots, reveal, mode).findIndex((r) => r.path !== null && r.path === value));
-    }
-    setOpen(next);
-  };
-
-  useEffect(() => {
-    if (!open || newKey !== null) return;
-    const id = requestAnimationFrame(() => treeRef.current?.focus({ preventScroll: true }));
-    return () => cancelAnimationFrame(id);
-  }, [open, newKey]);
-
-  useEffect(() => {
-    if (!open || active < 0) return;
-    document.getElementById(`${baseId}-${active}`)?.scrollIntoView({ block: 'nearest' });
-  }, [open, active, baseId]);
-
-  const choose = (path: string) => {
-    onChange(path);
-    setOpen(false);
-  };
-
-  const toggle = (id: string) =>
-    setExpanded((prev) => {
-      const next = new Set(prev);
-      if (!next.delete(id)) next.add(id);
-      return next;
-    });
-
-  const activate = (row: PathRow | undefined) => {
-    if (!row) return;
-    if (row.special === 'new') setNewKey('');
-    else if (row.path !== null) choose(row.path);
-    else if (row.expandable) toggle(row.id);
-  };
-
-  const onKeyDown = (e: React.KeyboardEvent<HTMLDivElement>) => {
-    // ⌘↵ belongs to the panel (Preview); everything else stays in the picker.
-    if ((e.metaKey || e.ctrlKey) && e.key === 'Enter') return;
-    e.stopPropagation();
-    const row = active >= 0 ? rows[active] : undefined;
-    switch (e.key) {
-      case 'ArrowDown':
-        e.preventDefault();
-        setActive((a) => Math.min(a + 1, rows.length - 1));
-        return;
-      case 'ArrowUp':
-        e.preventDefault();
-        setActive((a) => Math.max(a - 1, 0));
-        return;
-      case 'ArrowRight':
-        if (!row) return;
-        e.preventDefault();
-        if (row.expandable && !expanded.has(row.id)) toggle(row.id);
-        else if (row.expandable) setActive(active + 1);
-        return;
-      case 'ArrowLeft':
-        if (!row) return;
-        e.preventDefault();
-        if (expanded.has(row.id)) toggle(row.id);
-        else if (row.parent !== null) setActive(rows.findIndex((r) => r.id === row.parent));
-        return;
-      case 'Home':
-        e.preventDefault();
-        setActive(0);
-        return;
-      case 'End':
-        e.preventDefault();
-        setActive(rows.length - 1);
-        return;
-      case 'Enter':
-      case ' ':
-        e.preventDefault();
-        activate(row);
-        return;
-      case 'Tab':
-        setOpen(false);
-        return;
-    }
-    // A letter jumps to the next key that starts with it.
-    if (e.key.length === 1 && !e.metaKey && !e.ctrlKey && !e.altKey && /\S/.test(e.key)) {
-      const ch = e.key.toLowerCase();
-      for (let k = 1; k <= rows.length; k += 1) {
-        const i = (active + k + rows.length) % rows.length;
-        if (!rows[i].special && rows[i].label.toLowerCase().startsWith(ch)) {
-          setActive(i);
-          break;
-        }
-      }
-    }
-  };
-
-  const onNewKeyDown = (e: React.KeyboardEvent<HTMLInputElement>) => {
-    if ((e.metaKey || e.ctrlKey) && e.key === 'Enter') return;
-    e.stopPropagation();
-    if (e.key === 'Enter') {
-      e.preventDefault();
-      if (newKey && NEW_KEY.test(newKey)) choose(newKey);
-    } else if (e.key === 'ArrowUp' || e.key === 'ArrowDown') {
-      e.preventDefault();
-      setNewKey(null);
-    }
-  };
-
-  const crumb =
-    mode === 'each' ? 'response' : each?.trim() ? `${each.trim().replace(/^\$\.?/, '') || 'response'} ›` : 'response ›';
-  const shown = value ? pathLabel(mode, value) : '';
-
-  return (
-    <DropdownMenu.Root open={open} onOpenChange={onOpenChange}>
-      {variant === 'field' ? (
-        <DropdownMenu.Trigger
-          aria-label={ariaLabel}
-          aria-invalid={tone === 'danger' || undefined}
-          data-testid={testId}
-          data-value={value}
-          data-tone={tone}
-          title={value || undefined}
-          className={`${TRIGGER} max-w-[240px] font-mono ${value ? 'text-[var(--text)]' : 'text-[var(--text-3)]'} ${tone ? LINE_TONE[tone] : ''}`}
-        >
-          {prefix && <span className="font-sans text-[var(--text-3)]">{prefix}</span>}
-          {Lead && <Icon as={Lead} className="text-[var(--text-3)]" />}
-          <span className={`truncate ${shown ? '' : 'italic'} ${shown === 'any' ? 'text-[var(--text-2)]' : ''}`}>
-            {shown || placeholder}
-          </span>
-          <Icon as={ChevronDown} className="text-[var(--text-3)]" />
-        </DropdownMenu.Trigger>
-      ) : (
-        <DropdownMenu.Trigger
-          aria-label={`pick ${ariaLabel}`}
-          data-testid={triggerId}
-          className="inline-flex h-6 items-center px-0.5 text-[var(--text-3)] outline-none hover:bg-[var(--surface-2)] hover:text-[var(--text)] focus-visible:bg-[var(--surface-3)] data-[state=open]:bg-[var(--surface-3)] focus-visible:outline-none!"
-        >
-          <Icon as={ChevronDown} />
-        </DropdownMenu.Trigger>
-      )}
-      <DropdownMenu.Portal>
-        <DropdownMenu.Content
-          align="start"
-          sideOffset={4}
-          collisionPadding={8}
-          data-testid="rp-path-picker"
-          onCloseAutoFocus={(e) => {
-            // Back to the trigger, but never scroll the editor.
-            e.preventDefault();
-            document.querySelector<HTMLElement>(`[data-testid="${triggerId}"]`)?.focus({ preventScroll: true });
-          }}
-          className="z-50 flex max-h-[360px] w-[340px] flex-col bg-[var(--surface)] shadow-[var(--shadow)] focus-visible:outline-none! [&_*:focus-visible]:outline-none!"
-        >
-          <div
-            data-testid="rp-path-mode"
-            className="flex h-7 shrink-0 items-center gap-1.5 px-2.5 font-mono text-[11px] text-[var(--text-3)]"
-          >
-            <span className="text-[var(--text-2)]">{mode}</span>
-            <span>·</span>
-            <span className="truncate">{crumb}</span>
-          </div>
-          <div
-            ref={treeRef}
-            id={`${baseId}-tree`}
-            role="tree"
-            tabIndex={0}
-            aria-label={ariaLabel}
-            aria-activedescendant={active >= 0 ? `${baseId}-${active}` : undefined}
-            data-testid="rp-path-tree"
-            onKeyDown={onKeyDown}
-            className="min-h-0 overflow-y-auto pb-1 outline-none"
-          >
-            {rows.map((r, i) => {
-              if (r.special === 'new' && newKey !== null) {
-                return (
-                  <div key={r.id} id={`${baseId}-${i}`} className="flex h-7 items-center gap-1.5 pl-1.5 pr-2.5">
-                    <Icon as={Plus} className="text-[var(--text-3)]" />
-                    <input
-                      autoFocus
-                      type="text"
-                      value={newKey}
-                      spellCheck={false}
-                      placeholder="key"
-                      aria-label={`new key for ${ariaLabel}`}
-                      aria-invalid={(newKey !== '' && !NEW_KEY.test(newKey)) || undefined}
-                      data-testid="rp-path-newkey-input"
-                      onChange={(e) => setNewKey(e.target.value.replace(/[^A-Za-z0-9_]/g, ''))}
-                      onKeyDown={onNewKeyDown}
-                      className={`${CELL} flex-1`}
-                    />
-                  </div>
-                );
-              }
-              const selected = r.path !== null && r.path === value;
-              const dim = r.path === null && !r.special;
-              return (
-                <div
-                  key={r.id}
-                  id={`${baseId}-${i}`}
-                  role="treeitem"
-                  aria-level={r.depth + 1}
-                  aria-expanded={r.expandable ? expanded.has(r.id) : undefined}
-                  aria-selected={selected}
-                  aria-disabled={(r.path === null && !r.expandable && r.special !== 'new') || undefined}
-                  data-testid={
-                    r.special === 'any'
-                      ? 'rp-path-any'
-                      : r.special === 'new'
-                        ? 'rp-path-newkey'
-                        : r.special === 'nosample'
-                          ? 'rp-path-nosample'
-                          : `rp-path-node-${r.path ?? r.id}`
-                  }
-                  data-active={i === active || undefined}
-                  onMouseDown={(e) => e.preventDefault()}
-                  onMouseMove={() => setActive(i)}
-                  onClick={() => activate(r)}
-                  style={{ paddingLeft: 6 + r.depth * 16 }}
-                  className={`flex h-7 items-center gap-1.5 pr-2.5 font-mono text-[12.5px] ${
-                    r.special === 'nosample' ? 'cursor-default' : 'cursor-pointer'
-                  } ${i === active ? 'bg-[var(--surface-2)]' : ''} ${
-                    dim || r.special === 'nosample' ? 'text-[var(--text-3)]' : 'text-[var(--text)]'
-                  } ${selected ? 'font-medium' : ''}`}
-                >
-                  {r.expandable ? (
-                    <span
-                      aria-hidden
-                      onClick={(e) => {
-                        e.stopPropagation();
-                        toggle(r.id);
-                      }}
-                      className="inline-flex text-[var(--text-3)] hover:text-[var(--text)]"
-                    >
-                      <Icon as={expanded.has(r.id) ? ChevronDown : ChevronRight} />
-                    </span>
-                  ) : (
-                    <span aria-hidden className="w-[14px] shrink-0" />
-                  )}
-                  {r.special === 'new' ? (
-                    <Icon as={Plus} className="text-[var(--text-2)]" />
-                  ) : r.type ? (
-                    <Icon as={TYPE_ICON[r.type]} className={dim ? 'text-[var(--text-3)]' : 'text-[var(--text-2)]'} />
-                  ) : (
-                    <span aria-hidden className="w-[14px] shrink-0" />
-                  )}
-                  <span className={`truncate ${r.special ? 'font-sans' : ''}`}>{r.label}</span>
-                  <span className="ml-auto truncate pl-3 text-[var(--text-3)]">{r.right ?? ''}</span>
-                  {r.flag && <span className="shrink-0 font-sans text-[11px] text-[var(--text-3)]">{r.flag}</span>}
-                </div>
-              );
-            })}
-          </div>
-        </DropdownMenu.Content>
-      </DropdownMenu.Portal>
-    </DropdownMenu.Root>
-  );
+export function isNewField(
+  sample: unknown,
+  each: string | undefined,
+  earlier: { key: string }[],
+  path: string,
+): boolean | null {
+  const p = path.trim();
+  if (!p || p === '$' || sample === undefined) return null;
+  if (earlier.some((e) => relPath(e.key) === relPath(p))) return false;
+  const el = eachElement(sample, each);
+  if (!el.found) return null;
+  return !resolvePath(el.value, p).found;
 }

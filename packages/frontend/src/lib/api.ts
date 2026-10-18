@@ -718,6 +718,8 @@ export interface ToolTestResult extends MappingSummary {
   note?: string;
   hint?: string;
   kind?: string;
+  /** With `recordSample`: whether the response was stored as the tool's latest sample. */
+  sampleRecorded?: boolean;
 }
 
 export const tools = {
@@ -791,11 +793,17 @@ export const tools = {
     params: Record<string, unknown>,
     token: string,
     transform?: ResponseTransform | null,
+    options: { recordSample?: boolean } = {},
   ) =>
     request<ToolTestResult>(`/api/connectors/${connectorId}/tools/${toolId}/test`, {
       method: 'POST',
       // MCP-standard field name; `params` is still sent for older backends.
-      body: { arguments: params, params, ...(transform ? { transform } : {}) },
+      body: {
+        arguments: params,
+        params,
+        ...(transform ? { transform } : {}),
+        ...(options.recordSample ? { recordSample: true } : {}),
+      },
       token,
     }),
 };
@@ -805,6 +813,7 @@ export const tools = {
 /* ------------------------------------------------------------------ */
 
 export type ResponseProcessingUse =
+  | 'currency@1'
   | 'scale@1'
   | 'offset@1'
   | 'vat@1'
@@ -816,16 +825,20 @@ export type ResponseProcessingUse =
 
 export type ResponseProcessingMode = 'add' | 'replace' | 'upsert';
 
+/** Built-ins only: `script@1` cannot be part of a pipe. */
+export type ResponseProcessingBuiltinUse = Exclude<ResponseProcessingUse, 'script@1'>;
+
 export interface ResponseProcessingStep {
   id: string;
-  use: ResponseProcessingUse;
+  /** One processor, or a pipe of built-ins applied in order (`params` then aligned by index). */
+  use: ResponseProcessingUse | ResponseProcessingBuiltinUse[];
   /** Path of the array whose elements the step runs on; empty = the response itself. */
   each?: string;
   reads: string;
   writes: string;
   mode: ResponseProcessingMode;
   onMissing?: 'fail' | 'skip';
-  params?: Record<string, unknown>;
+  params?: Record<string, unknown> | Record<string, unknown>[];
   /** script@1 only. */
   code?: string;
 }
@@ -844,6 +857,10 @@ export interface ResponseProcessingParam {
   default?: unknown;
   min?: number;
   max?: number;
+  /** Strict lower bound (`rate` of currency@1: greater than 0). */
+  exclusiveMin?: number;
+  /** A string param must match this RegExp source (`from`/`to` of currency@1: `^[A-Z]{3}$`). */
+  pattern?: string;
 }
 
 export interface ResponseProcessingBuiltin {
@@ -853,6 +870,26 @@ export interface ResponseProcessingBuiltin {
   input?: string;
   output?: string;
   params: ResponseProcessingParam[];
+  /** At least one of these param sets in full (currency@1: `[['rate'], ['from', 'to']]`). */
+  requiresOneOf?: string[][];
+}
+
+/** The exchange-rate table currency@1 looks up `from → to` in (base EUR, units per 1 EUR). */
+export interface ResponseProcessingRates {
+  base: string;
+  asOf: string;
+  source: string;
+  /** Base first, then alphabetical. */
+  currencies: string[];
+  rates: Record<string, number>;
+  /** `live`: fetched by the backend; `cached`: the last stored fetch; `snapshot`: shipped with the code. */
+  status: 'live' | 'cached' | 'snapshot';
+  /** The backend refreshes the table by itself (`RP_RATES_AUTO`). */
+  auto: boolean;
+  fetchedAt?: string;
+  nextRefreshAt?: string;
+  /** Last fetch failure: `timeout`, `http_503`, `parse`, `network`, `too_large`, `redirect`, `url`, `disabled`. */
+  error?: string;
 }
 
 export interface ResponseProcessingBuiltins {
@@ -910,6 +947,10 @@ export const responseProcessing = {
       /** The recorded response, cut to ≤ 64 KB, depth ≤ 8, arrays to 3 elements. */
       sample?: unknown;
       sampleTruncated?: boolean;
+      /** Uncut array lengths by path (`$.items` -> 30). */
+      sampleLengths?: Record<string, number>;
+      /** Arguments of the recorded call. */
+      sampleInput?: Record<string, unknown>;
     }>(`/api/response-processing/tools/${toolId}`, { token }),
   preview: (
     toolId: string,
@@ -921,6 +962,12 @@ export const responseProcessing = {
       body,
       token,
     }),
+  rates: {
+    get: (token: string) => request<ResponseProcessingRates>('/api/response-processing/rates', { token }),
+    /** ADMIN, 2 per minute. A failed fetch answers 200 with `error`. */
+    refresh: (token: string) =>
+      request<ResponseProcessingRates>('/api/response-processing/rates/refresh', { method: 'POST', token }),
+  },
 };
 
 // Audit
@@ -1186,8 +1233,11 @@ export interface PublicDemoAccount {
   email: string;
   password: string;
   name: string;
-  role: 'ADMIN' | 'VIEWER' | 'EDITOR';
+  role: 'ADMIN' | 'VIEWER';
+  /** MCP roles in the workspace (e.g. `Staff`); empty for none. */
+  mcpRoles: string[];
   workspace: 'A' | 'B';
+  workspaceName: string;
 }
 
 export type PublicDemo =
@@ -1196,6 +1246,52 @@ export type PublicDemo =
 
 export const publicDemo = {
   get: () => request<PublicDemo>('/api/public/demo'),
+};
+
+// Demo instance, signed in: the demo control's status and the one-click reset.
+export interface DemoStatus {
+  enabled: true;
+  lastResetAt: string | null;
+  mock: { port: number | null; requests: number };
+  workspaces: Array<{ id: string; name: string; letter: 'A' | 'B'; serverId: string | null }>;
+  accounts: Array<PublicDemoAccount & { mcpRoles?: string[]; workspaceName?: string }>;
+  currentWorkspace: 'A' | 'B' | null;
+}
+
+export interface DemoResetResult {
+  ok: true;
+  reset: {
+    runs: number;
+    invocations: number;
+    refusals: number;
+    securityEvents?: number;
+    scriptsRemoved: number;
+    scriptsRestored: number;
+    chainsRestored: number;
+    membershipsRemoved?: number;
+    mockRequests?: number;
+  };
+  at: string;
+}
+
+/** The demo control (pill): the runtime demo-mode switch, for any signed-in user. */
+export interface DemoControl {
+  /** False on Cloud: no demo mode, nothing to render. */
+  available: boolean;
+  enabled: boolean;
+  /** ADMIN of any workspace. */
+  canToggle: boolean;
+  /** ADMIN of a demo workspace, while demo mode is on. */
+  canReset: boolean;
+  status?: DemoStatus;
+}
+
+export const demo = {
+  control: (token: string) => request<DemoControl>('/api/demo/control', { token }),
+  setEnabled: (token: string, enabled: boolean) =>
+    request<DemoControl>('/api/demo/control', { method: 'PUT', token, body: { enabled } }),
+  status: (token: string) => request<DemoStatus>('/api/demo/status', { token }),
+  reset: (token: string) => request<DemoResetResult>('/api/demo/reset', { method: 'POST', token }),
 };
 
 // Site Settings
@@ -1725,6 +1821,12 @@ export interface SandboxParametersSchema {
   required: string[];
 }
 
+/** Level 3 capabilities of a saved script. See docs/sandbox-code-mode.md "Level 3". */
+export interface SandboxCapabilities {
+  env?: boolean;
+  http?: boolean;
+}
+
 export interface SandboxScriptSummary {
   id: string;
   name: string;
@@ -1742,6 +1844,8 @@ export interface SandboxScriptSummary {
   missingConnectors?: { id: string; name: string }[];
   /** The arguments the script reads, or null: no tool of its own. */
   parameters: SandboxParametersSchema | null;
+  /** Level 3 capabilities (author-only): connector variables, outbound HTTP. */
+  capabilities?: SandboxCapabilities | null;
   /** The argument names the code reads right now. */
   inferredParameters: string[];
   /** Whether the server the list was asked about offers the script as a tool of its own name. Only the list has it. */
@@ -1844,6 +1948,7 @@ export const sandbox = {
       description?: string;
       uses?: SandboxScriptUseInput[];
       parameters?: SandboxParametersSchema | null;
+      capabilities?: SandboxCapabilities | null;
     },
     token: string,
   ) =>
@@ -1864,4 +1969,30 @@ export const sandbox = {
     data: { toolName: string; toolArgs?: Record<string, unknown>; code: string; args?: Record<string, unknown> },
     token: string,
   ) => request<SandboxBenchmark>(`/api/sandbox/servers/${serverId}/benchmark`, { method: 'POST', body: data, token }),
+};
+
+// ── Flow (/flow) ────────────────────────────────────────────────────────────
+// The graph itself is fetched by components/flow/use-flow-graph.ts.
+
+export interface FlowAskAnswer {
+  answer: string;
+  model: string;
+  usage?: { inputTokens?: number; outputTokens?: number };
+}
+
+export const flowApi = {
+  /** Replay events of a window; `serverId` left out = every server. */
+  events: (token: string, params: { serverId?: string; since: string; until?: string; limit?: number }) => {
+    const qs = new URLSearchParams({ since: params.since });
+    if (params.serverId) qs.set('serverId', params.serverId);
+    if (params.until) qs.set('until', params.until);
+    if (params.limit) qs.set('limit', String(params.limit));
+    return request<import('@/components/flow/types').FlowEvents>(`/api/flow/events?${qs.toString()}`, { token });
+  },
+  askStatus: (token: string) => request<{ enabled: boolean; model?: string }>('/api/flow/ask', { token }),
+  /** 409 `{ code: 'LLM_OFF' }` when the workspace has no LLM. */
+  ask: (
+    token: string,
+    body: { serverId: string | null; window: '1h' | '24h' | '7d'; nodeId?: string; question: string },
+  ) => request<FlowAskAnswer>('/api/flow/ask', { method: 'POST', body, token }),
 };

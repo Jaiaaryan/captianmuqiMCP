@@ -64,12 +64,15 @@ export function CodeField({ value, onChange, ariaLabel, testId, invalid, sample,
   );
   return (
     <MonacoField
+      className="rounded-md bg-[var(--surface)] px-2 py-2 [&_.amcp-monaco:focus-within]:bg-transparent"
       value={value}
       onChange={onChange}
       language="javascript"
       extraLibs={extraLibs}
-      minLines={3}
+      minLines={2}
       maxLines={20}
+      fontSize={14}
+      lineHeight={22}
       ariaLabel={ariaLabel}
       testId={testId}
       invalid={invalid}

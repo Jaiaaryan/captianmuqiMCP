@@ -1,6 +1,6 @@
 'use client';
 
-import { useState, useEffect, useCallback } from 'react';
+import { useState, useEffect, useCallback, useMemo } from 'react';
 import { AppSelect } from '@/components/ui/select';
 import { Button } from '@/components/ui/button';
 import {
@@ -18,6 +18,11 @@ import {
   serializeResponseProcessing,
   type ResponseProcessingChain,
 } from './response-processing-panel';
+import { ResponseProcessingSummary } from './response-processing-summary';
+import { ResponseProcessingSheet } from './response-processing-sheet';
+import type { ProcessingSummaryInfo } from './response-processing-controls';
+import { useSaveShortcut, useSheetState } from './use-sheet-state';
+import { useMonacoPreload } from '@/components/code/monaco-preload';
 import type { ResponseTransform } from '@/lib/api';
 
 /* ------------------------------------------------------------------ */
@@ -100,6 +105,8 @@ interface ToolEditorProps {
   /** Enables the response-mapping preview (needs a saved tool to sample from) */
   connectorId?: string;
   toolId?: string;
+  /** Shown in the Response Processing sheet's breadcrumb. */
+  connectorName?: string;
   onSave: (data: {
     name: string;
     description: string;
@@ -521,6 +528,24 @@ function buildToolPayload(data: ToolEditorData, connectorType: string) {
   return result;
 }
 
+/**
+ * What a chain stores, with object keys sorted: equal for the editor's chain and
+ * the saved one when nothing changed (key order and client-only keys aside).
+ */
+function chainSignature(chain: ResponseProcessingChain | null | undefined): string {
+  const sorted = (v: unknown): unknown =>
+    Array.isArray(v)
+      ? v.map(sorted)
+      : v && typeof v === 'object'
+        ? Object.fromEntries(
+            Object.keys(v as Record<string, unknown>)
+              .sort()
+              .map((k) => [k, sorted((v as Record<string, unknown>)[k])]),
+          )
+        : v;
+  return JSON.stringify(sorted(serializeResponseProcessing(chain) ?? null));
+}
+
 /* ------------------------------------------------------------------ */
 /*  Component                                                         */
 /* ------------------------------------------------------------------ */
@@ -531,6 +556,7 @@ export function ToolEditor({
   envVarKeys,
   connectorId,
   toolId,
+  connectorName,
   onSave,
   onCancel,
   saving = false,
@@ -558,6 +584,17 @@ export function ToolEditor({
     useState<ResponseMappingState>(EMPTY_MAPPING_STATE);
   const [responseMappingExtra, setResponseMappingExtra] = useState<Record<string, unknown>>({});
   const [responseProcessing, setResponseProcessing] = useState<ResponseProcessingChain | null>(null);
+
+  // Response Processing: a summary on the page, the editor in a sheet. Both write
+  // to `responseProcessing`; the tool's Save button stays the only save.
+  const sheet = useSheetState(method !== 'static');
+  useMonacoPreload(sheet.open);
+  const [processingInfo, setProcessingInfo] = useState<ProcessingSummaryInfo | null>(null);
+  const savedProcessing = existingTool?.responseMapping?.responseProcessing;
+  const processingUnsaved = useMemo(
+    () => chainSignature(responseProcessing) !== chainSignature(parseResponseProcessing(savedProcessing)),
+    [responseProcessing, savedProcessing],
+  );
 
   // Initialize from existing tool
   useEffect(() => {
@@ -699,8 +736,12 @@ export function ToolEditor({
     !bodyMappingJsonInvalid &&
     !mappingStateInvalid(responseMapping) &&
     !responseProcessingInvalid(responseProcessing);
+  // ⌘S / Ctrl+S: the same as Update Tool, from the page or the sheet.
+  useSaveShortcut(handleSave, !!isValid && !saving);
 
   return (
+    <div className="space-y-5">
+    {/* The card holds the request side; Response Processing and below sit on the page surface. */}
     <div className="border border-[var(--border)] rounded-lg p-5 space-y-5 bg-[var(--card)]">
       {/* Header */}
       <div className="flex items-center justify-between">
@@ -720,6 +761,7 @@ export function ToolEditor({
           <button
             onClick={handleSave}
             disabled={!isValid || saving}
+            aria-keyshortcuts="Meta+S Control+S"
             className="bg-[var(--primary)] text-[var(--primary-foreground)] px-4 py-1.5 rounded text-xs font-medium hover:brightness-90 disabled:opacity-50"
           >
             {saving ? 'Saving...' : existingTool ? 'Update Tool' : 'Create Tool'}
@@ -1217,14 +1259,42 @@ export function ToolEditor({
         </p>
       </div>
 
-      {/* Response Processing */}
+    </div>
+
+    {/* Below the card: no background, no border; 1px transparent border + px-5 keep the
+        headings on the same left edge as "Edit Tool". */}
+    <div className="space-y-5 border border-transparent px-5 pb-1">
+      {/* Response Processing: summary here, editing in the sheet */}
       {method !== 'static' && (
-        <ResponseProcessingPanel
-          state={responseProcessing}
-          onChange={setResponseProcessing}
-          connectorId={connectorId}
-          toolId={toolId}
-        />
+        <>
+          <ResponseProcessingSummary
+            state={responseProcessing}
+            onChange={setResponseProcessing}
+            info={processingInfo}
+            onOpen={sheet.openSheet}
+          />
+          <ResponseProcessingSheet
+            open={sheet.open}
+            onClose={sheet.close}
+            onRequest={sheet.openSheet}
+            state={responseProcessing}
+            onChange={setResponseProcessing}
+            info={processingInfo}
+            unsaved={processingUnsaved}
+            connectorName={connectorName}
+            toolName={name.trim() || existingTool?.name}
+          >
+            <ResponseProcessingPanel
+              state={responseProcessing}
+              onChange={setResponseProcessing}
+              connectorId={connectorId}
+              toolId={toolId}
+              toolParams={params.map((p) => ({ name: p.name, type: p.type, required: p.required }))}
+              request={sheet.request}
+              onSummary={setProcessingInfo}
+            />
+          </ResponseProcessingSheet>
+        </>
       )}
 
       {/* Response Mapping */}
@@ -1252,6 +1322,7 @@ export function ToolEditor({
           </pre>
         </details>
       </div>
+    </div>
     </div>
   );
 }

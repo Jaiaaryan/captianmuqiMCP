@@ -66,6 +66,8 @@ export function ActionMenu({
   disabled,
   align = 'end',
   variant = 'default',
+  contentClassName,
+  itemClassName,
 }: {
   items?: ActionMenuItem[];
   /** Labelled sections; used instead of `items` when given. */
@@ -80,6 +82,9 @@ export function ActionMenu({
   disabled?: boolean;
   align?: 'start' | 'center' | 'end';
   variant?: 'default' | 'flat';
+  /** Flat menus: extra classes for the list and its items (merged over the flat look). */
+  contentClassName?: string;
+  itemClassName?: string;
 }) {
   const sections: ActionMenuGroup[] = groups ?? [{ items }];
   const visible = sections.flatMap((g) => g.items.filter(Boolean));
@@ -115,7 +120,7 @@ export function ActionMenu({
           collisionPadding={8}
           className={
             flat
-              ? FLAT.content
+              ? cn(FLAT.content, contentClassName)
               : 'z-50 min-w-[200px] overflow-hidden rounded-[10px] border border-[var(--border)] bg-[var(--surface)] p-1 shadow-[var(--shadow)]'
           }
         >
@@ -123,7 +128,7 @@ export function ActionMenu({
             <DropdownMenu.Group key={group.label ?? gi}>
               {group.label && (
                 <DropdownMenu.Label
-                  className={flat ? FLAT.label : 'px-2.5 pb-1 pt-2 text-[11px] text-[var(--text-3)]'}
+                  className={flat ? cn(FLAT.label, itemClassName && 'text-sm normal-case tracking-normal') : 'px-2.5 pb-1 pt-2 text-[11px] text-[var(--text-3)]'}
                 >
                   {group.label}
                 </DropdownMenu.Label>
@@ -131,7 +136,7 @@ export function ActionMenu({
               {group.items.filter(Boolean).map((item) => {
                 const tone = item.tone ?? (item.destructive ? 'danger' : undefined);
                 const cls = flat
-                  ? cn(FLAT.item, tone && FLAT.tone[tone])
+                  ? cn(FLAT.item, itemClassName, tone && FLAT.tone[tone])
                   : cn(
                       'flex cursor-pointer select-none items-center gap-2.5 rounded-[7px] px-2.5 py-2 text-[13px] outline-none',
                       'data-[disabled]:pointer-events-none data-[disabled]:opacity-50',
