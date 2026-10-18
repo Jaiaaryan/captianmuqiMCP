@@ -121,3 +121,59 @@ describe('checkScriptSyntax', () => {
     expect(checkScriptSyntax('if (value) {\nreturn 1;')).toMatch(/\(line 2\)$/);
   });
 });
+
+describe('builtins inside the script', () => {
+  it('match the step processors', () => {
+    expect(runScript('return builtins.currency(value, { rate: 0.92 })', 54.67)).toBe(50.3);
+    expect(runScript('return builtins.currency(value, 0.1)', 3)).toBe(0.3);
+    expect(runScript('return builtins.scale(value, { factor: 0.92, round: 2 })', 54.67)).toBe(50.3);
+    expect(runScript('return builtins.vat(value, { rate: 0.19, round: 2 })', 50.3)).toBe(59.86);
+    expect(runScript('return builtins.offset(value, { amount: -1 })', 3)).toBe(2);
+    expect(runScript('return builtins.round(value, 2)', 1.005)).toBe(1.01);
+    expect(runScript('return builtins.round(value)', -0.001)).toBe(0);
+    expect(runScript('return builtins.clean_text(value)', '  Black   Screw ')).toBe('Black Screw');
+    expect(runScript('return builtins.truncate(value, { maxLength: 4 })', 'abcdefgh')).toBe('abc…');
+    expect(runScript("return builtins.map(value, { map: { a: 'A' } })", 'a')).toBe('A');
+  });
+
+  it('refuse a wrong input with a sentence', () => {
+    expect(() => runScript("return builtins.currency('x', { rate: 2 })", 1)).toThrow(
+      'script threw: builtins.currency: value is not a number',
+    );
+    expect(() => runScript('return builtins.currency(value, { rate: 0 })', 1)).toThrow(
+      'script threw: builtins.currency: rate must be a number greater than 0',
+    );
+    expect(() => runScript("return builtins.scale('x', { factor: 2 })", 1)).toThrow(
+      'script threw: builtins.scale: value is not a number',
+    );
+  });
+
+  it('map the numeric ones over an array or object of numbers, like the steps', () => {
+    expect(runScript('return builtins.currency(value, 1.1)', { 'A-1': 10, B: 2.5 })).toEqual({ 'A-1': 11, B: 2.75 });
+    expect(runScript('return builtins.scale(value, { factor: 2 })', [1, 2])).toEqual([2, 4]);
+    expect(runScript('return builtins.round(value, 0)', { a: 2.5 })).toEqual({ a: 3 });
+    expect(() => runScript('return builtins.vat(value, { rate: 0.19 })', { 'A-1': 'n/a' })).toThrow(
+      'script threw: builtins.vat: value["A-1"] is not a number',
+    );
+    expect(() => runScript('return builtins.offset(value, { amount: 1 })', [1, [2]])).toThrow(
+      'script threw: builtins.offset: value[1] is not a number',
+    );
+  });
+
+  it('are frozen and give the script no capabilities', () => {
+    expect(runScript("'use strict'; try { builtins.scale = 1; } catch (e) { return 'frozen'; } return 'open';", 1)).toBe('frozen');
+    expect(runScript('return Object.isFrozen(builtins) + typeof require + typeof process + typeof fetch', 1)).toBe(
+      'trueundefinedundefinedundefined',
+    );
+  });
+
+  it('are fresh in every call', () => {
+    const session = new ScriptSession('globalThis.n = (globalThis.n || 0) + 1; return n + typeof builtins.round', null);
+    try {
+      expect(session.run(1)).toBe('1function');
+      expect(session.run(1)).toBe('1function');
+    } finally {
+      session.dispose();
+    }
+  });
+});

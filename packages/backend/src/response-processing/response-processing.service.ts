@@ -74,6 +74,33 @@ export function truncateSample(value: unknown): { sample: unknown; truncated: bo
   return { sample: null, truncated: true };
 }
 
+/**
+ * Lengths of the arrays in a recorded response, before the sample cut them to
+ * 3 elements: `{ "$.items": 30, "$.items[*].tiers": 3 }`. Keys follow the
+ * editor's tree (nested arrays through their first element). At most 500.
+ */
+export function sampleLengths(value: unknown): Record<string, number> {
+  const out: Record<string, number> = {};
+  let count = 0;
+  const walk = (v: unknown, path: string, depth: number) => {
+    if (count >= 500 || depth > SAMPLE_LIMITS.maxDepth) return;
+    if (Array.isArray(v)) {
+      out[path] = v.length;
+      count++;
+      if (v.length) walk(v[0], `${path}[*]`, depth + 1);
+      return;
+    }
+    if (v && typeof v === 'object') {
+      for (const [k, child] of Object.entries(v as Record<string, unknown>).slice(0, 200)) {
+        const seg = /^[A-Za-z_$][\w$]*$/.test(k) ? `.${k}` : `['${k.replace(/'/g, "\\'")}']`;
+        walk(child, path + seg, depth + 1);
+      }
+    }
+  };
+  walk(value, '$', 0);
+  return out;
+}
+
 @Injectable()
 export class ResponseProcessingService {
   constructor(private readonly prisma: PrismaService) {}
@@ -125,14 +152,14 @@ export class ResponseProcessingService {
    */
   async findLatestSample(
     toolId: string,
-  ): Promise<{ output: unknown; createdAt: Date } | null> {
+  ): Promise<{ output: unknown; input?: unknown; createdAt: Date } | null> {
     const recent = await this.prisma.toolInvocation.findMany({
       where: { toolId, status: 'SUCCESS' },
       orderBy: { createdAt: 'desc' },
       take: 10,
-      select: { output: true, createdAt: true },
+      select: { output: true, input: true, createdAt: true },
     });
     const hit = recent.find((r) => r.output !== null && r.output !== undefined);
-    return hit ? { output: hit.output, createdAt: hit.createdAt } : null;
+    return hit ? { output: hit.output, input: hit.input, createdAt: hit.createdAt } : null;
   }
 }

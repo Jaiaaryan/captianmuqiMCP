@@ -1,9 +1,9 @@
-import { Injectable, Logger, NotFoundException } from '@nestjs/common';
+import { BadRequestException, Injectable, Logger, NotFoundException } from '@nestjs/common';
 import { PrismaService } from '../common/prisma.service';
 import { readTransform } from '../connectors/response-transform.util';
 import { deriveToolAnnotations } from '../mcp-server/tool-annotations';
 import { missingConnectors } from '../sandbox/script-uses.util';
-import type { FlowWindow } from './flow.dto';
+import { FLOW_EVENTS_MAX, FLOW_WINDOWS, type FlowWindow } from './flow.dto';
 
 /* ------------------------------------------------------------------ */
 /*  Contract. Mirrors packages/frontend/src/components/flow/types.ts   */
@@ -54,11 +54,46 @@ export interface FlowEdge {
 }
 
 export interface FlowGraph {
-  serverId: string;
+  /** The server drawn, or null when the graph shows every server of the organization. */
+  serverId: string | null;
   since: string;
   generatedAt: string;
   nodes: FlowNode[];
   edges: FlowEdge[];
+}
+
+export type FlowEventKind = 'tool' | 'script' | 'processing';
+export type FlowEventStatus = 'ok' | 'error' | 'refused';
+
+/** One call in the window, for the replay. No payloads, no messages. */
+export interface FlowEvent {
+  ts: string;
+  kind: FlowEventKind;
+  serverId: string;
+  connectorId?: string;
+  toolId?: string;
+  scriptId?: string;
+  status: FlowEventStatus;
+  durationMs: number | null;
+  /** Identical failures stored once (repeatCount), when more than one. */
+  count?: number;
+  /** Script runs: the tool names the run called. */
+  tools?: string[];
+}
+
+export interface FlowEvents {
+  from: string;
+  until: string;
+  /** More events than `limit` in the window: the most recent ones are kept. */
+  truncated: boolean;
+  events: FlowEvent[];
+}
+
+/** A failure of the window, for the Ask context. */
+export interface FlowRecentError {
+  at: Date;
+  nodeId: string;
+  message: string;
 }
 
 /* ------------------------------------------------------------------ */
@@ -67,6 +102,8 @@ export interface FlowGraph {
 
 /** A server that offers more tools than this shows only the most-called ones. */
 export const FLOW_MAX_TOOLS = 500;
+/** Servers drawn when the graph shows the whole organization. */
+export const FLOW_MAX_SERVERS = 100;
 /** Saved scripts read per organization. */
 const MAX_SCRIPTS = 500;
 /** Most recent script runs of the window that are aggregated. */
@@ -77,6 +114,13 @@ const WINDOW_MS: Record<FlowWindow, number> = {
   '24h': 24 * 60 * 60 * 1000,
   '7d': 7 * 24 * 60 * 60 * 1000,
 };
+
+/** How AuditService.logRefusal prefixes the error of a refused call. */
+const REFUSAL_PREFIX = 'REFUSED ';
+/** How a fatal processing failure reaches the audit log (response-transform.util.ts). */
+const PROCESSING_FAILED = 'Response processing failed';
+/** Sandbox error codes that mean a call was refused, not that it failed. */
+const REFUSAL_CODES = new Set(['TOOL_NOT_ALLOWED', 'WRITE_NOT_ALLOWED', 'ROLE_FORBIDDEN', 'CROSS_ORG']);
 
 const isPlainObject = (v: unknown): v is Record<string, unknown> =>
   typeof v === 'object' && v !== null && !Array.isArray(v);
@@ -136,25 +180,34 @@ export class FlowService {
   constructor(private readonly prisma: PrismaService) {}
 
   /**
-   * The data flow of one MCP server: who calls it, what it offers, where each
-   * tool's request goes, how the response is shaped, and which saved scripts
-   * sit on top. Statistics cover the window ending now.
+   * The data flow of one MCP server, or of every server of the organization
+   * (`serverId` null): who calls it, what it offers, where each tool's request
+   * goes, how the response is shaped, and which saved scripts sit on top.
+   * Statistics cover the window ending now.
    *
    * One query per table; everything is aggregated here. Every query is bound
-   * to the organization, and the server must belong to it (404 otherwise).
+   * to the organization, and a named server must belong to it (404 otherwise).
+   * With several servers, connectors, tools and scripts appear once; each
+   * server gets its own `server → tool` edges with its own counts.
    */
-  async buildGraph(organizationId: string, serverId: string, since: FlowWindow): Promise<FlowGraph> {
+  async buildGraph(organizationId: string, serverId: string | null, since: FlowWindow): Promise<FlowGraph> {
     const generatedAt = new Date();
     const from = new Date(generatedAt.getTime() - WINDOW_MS[since]);
 
-    const server = await this.prisma.mcpServerConfig.findFirst({
-      where: { id: serverId, organizationId },
-      select: { id: true, name: true, connectors: { select: { connectorId: true } } },
-    });
-    if (!server) throw new NotFoundException('MCP server not found');
-
-    const connectorIds = server.connectors.map((c) => c.connectorId);
-    const serverNodeId = `server:${server.id}`;
+    const servers = await this.findServers(organizationId, serverId);
+    const serverIds = servers.map((s) => s.id);
+    const connectorIds = [...new Set(servers.flatMap((s) => s.connectors.map((c) => c.connectorId)))];
+    const connectorsOf = new Map(servers.map((s) => [s.id, new Set(s.connectors.map((c) => c.connectorId))]));
+    const serverWhere = serverIds.length === 1 ? serverIds[0] : { in: serverIds };
+    if (!serverIds.length) {
+      return {
+        serverId: null,
+        since: from.toISOString(),
+        generatedAt: generatedAt.toISOString(),
+        nodes: [{ id: 'agent', kind: 'agent', label: 'Agent', stats: { calls: 0, errors: 0 } }],
+        edges: [],
+      };
+    }
 
     const [connectors, tools, invocationGroups, byteRows, scripts] = await Promise.all([
       this.prisma.connector.findMany({
@@ -175,14 +228,14 @@ export class FlowService {
         orderBy: { name: 'asc' },
       }),
       this.prisma.toolInvocation.groupBy({
-        by: ['toolId', 'status'],
-        where: { organizationId, mcpServerId: server.id, createdAt: { gte: from } },
+        by: ['mcpServerId', 'toolId', 'status'],
+        where: { organizationId, mcpServerId: serverWhere, createdAt: { gte: from } },
         _count: { _all: true },
         _sum: { repeatCount: true },
         _avg: { durationMs: true },
         _max: { createdAt: true },
       }),
-      this.readBytes(organizationId, server.id, from),
+      this.readBytes(organizationId, serverIds, from),
       this.prisma.sandboxScript.findMany({
         where: { organizationId },
         select: {
@@ -196,22 +249,29 @@ export class FlowService {
       }),
     ]);
 
-    // ---- per-tool statistics ------------------------------------------
+    // ---- per-tool and per-(server, tool) statistics ----------------------
     const toolAcc = new Map<string, Acc>();
-    for (const g of invocationGroups) {
-      const acc = toolAcc.get(g.toolId) ?? newAcc();
+    const hopAcc = new Map<string, Acc>(); // `${serverId}\u0000${toolId}`
+    for (const g of invocationGroups as any[]) {
+      const sid: string = g.mcpServerId ?? serverIds[0];
       const rows = g._count?._all ?? 0;
       // A failure that repeats within a minute is stored once with repeatCount.
       const calls = g._sum?.repeatCount ?? rows;
-      acc.calls += calls;
-      if (g.status !== 'SUCCESS') acc.errors += calls;
-      if (g._avg?.durationMs != null && rows > 0) {
-        acc.msTotal += g._avg.durationMs * rows;
-        acc.msCalls += rows;
+      const last: Date | undefined = g._max?.createdAt ?? undefined;
+      for (const [map, key] of [
+        [toolAcc, g.toolId],
+        [hopAcc, `${sid}\u0000${g.toolId}`],
+      ] as [Map<string, Acc>, string][]) {
+        const acc = map.get(key) ?? newAcc();
+        acc.calls += calls;
+        if (g.status !== 'SUCCESS') acc.errors += calls;
+        if (g._avg?.durationMs != null && rows > 0) {
+          acc.msTotal += g._avg.durationMs * rows;
+          acc.msCalls += rows;
+        }
+        if (last && (!acc.lastAt || last > acc.lastAt)) acc.lastAt = last;
+        map.set(key, acc);
       }
-      const last = g._max?.createdAt;
-      if (last && (!acc.lastAt || last > acc.lastAt)) acc.lastAt = last;
-      toolAcc.set(g.toolId, acc);
     }
     for (const [toolId, bytes] of byteRows) {
       const acc = toolAcc.get(toolId);
@@ -232,20 +292,22 @@ export class FlowService {
       (a, b) => callsOf(b.id) - callsOf(a.id) || a.name.localeCompare(b.name),
     );
 
-    // ---- scripts: offered here only when the server has all their connectors
-    const visibleScripts = scripts.filter(
-      (s) =>
-        missingConnectors(
-          s.uses.map((u) => ({ connectorId: u.connectorId, connectorName: '' })),
-          connectorIds,
-        ).length === 0,
+    // ---- scripts: offered when some server has all their connectors ------
+    const visibleScripts = scripts.filter((s) =>
+      servers.some(
+        (srv) =>
+          missingConnectors(
+            s.uses.map((u) => ({ connectorId: u.connectorId, connectorName: '' })),
+            [...(connectorsOf.get(srv.id) ?? [])],
+          ).length === 0,
+      ),
     );
     const visibleScriptIds = visibleScripts.map((s) => s.id);
     const runs = visibleScriptIds.length
       ? await this.prisma.sandboxRun.findMany({
           where: {
             organizationId,
-            mcpServerId: server.id,
+            mcpServerId: serverWhere,
             createdAt: { gte: from },
             scriptId: { in: visibleScriptIds },
           },
@@ -259,42 +321,55 @@ export class FlowService {
     const edges: FlowEdge[] = [];
 
     // ---- totals ---------------------------------------------------------
-    const serverAcc = newAcc();
+    const agentAcc = newAcc();
+    const serverAcc = new Map<string, Acc>();
     const connectorAcc = new Map<string, Acc>();
+    const toolById = new Map(tools.map((t) => [t.id, t]));
+    for (const [key, a] of hopAcc) {
+      const [sid, toolId] = key.split('\u0000');
+      if (!toolById.has(toolId)) continue;
+      addAcc(agentAcc, a);
+      const s = serverAcc.get(sid) ?? newAcc();
+      addAcc(s, a);
+      serverAcc.set(sid, s);
+    }
     for (const t of tools) {
       const a = toolAcc.get(t.id);
       if (!a) continue;
-      addAcc(serverAcc, a);
       const c = connectorAcc.get(t.connectorId) ?? newAcc();
       addAcc(c, a);
       connectorAcc.set(t.connectorId, c);
+    }
+    // Bytes leave the server per tool; with one server they are the tool totals.
+    if (servers.length === 1) {
+      const only = serverAcc.get(servers[0].id) ?? newAcc();
+      for (const t of tools) {
+        const b = toolAcc.get(t.id)?.bytesOut;
+        if (b !== undefined) only.bytesOut = (only.bytesOut ?? 0) + b;
+      }
+      serverAcc.set(servers[0].id, only);
     }
 
     nodes.push({
       id: 'agent',
       kind: 'agent',
       label: 'Agent',
-      stats: toStats(serverAcc, ['avgMs', 'lastAt']),
+      stats: toStats(agentAcc, ['avgMs', 'lastAt']),
     });
-    const serverMeta: Record<string, string | number | boolean | null> = {
-      connectors: connectors.length,
-    };
-    if (truncated) serverMeta.truncated = true;
-    nodes.push({
-      id: serverNodeId,
-      kind: 'server',
-      label: server.name,
-      ref: { serverId: server.id },
-      stats: toStats(serverAcc),
-      meta: serverMeta,
-    });
-    edges.push({
-      id: `mcp:agent>${serverNodeId}`,
-      source: 'agent',
-      target: serverNodeId,
-      kind: 'mcp',
-      stats: toStats(serverAcc, ['avgMs', 'lastAt']),
-    });
+    for (const srv of servers) {
+      const id = `server:${srv.id}`;
+      const acc = serverAcc.get(srv.id) ?? newAcc();
+      const meta: Record<string, string | number | boolean | null> = { connectors: srv.connectors.length };
+      if (truncated) meta.truncated = true;
+      nodes.push({ id, kind: 'server', label: srv.name, ref: { serverId: srv.id }, stats: toStats(acc), meta });
+      edges.push({
+        id: `mcp:agent>${id}`,
+        source: 'agent',
+        target: id,
+        kind: 'mcp',
+        stats: toStats(acc, ['avgMs', 'lastAt']),
+      });
+    }
 
     // ---- connectors -----------------------------------------------------
     const toolCountByConnector = new Map<string, number>();
@@ -316,6 +391,7 @@ export class FlowService {
     const processingNodes: FlowNode[] = [];
     const mappingNodes: FlowNode[] = [];
     const toolNodeId = (id: string) => `tool:${id}`;
+    const single = servers.length === 1 ? servers[0].id : undefined;
 
     for (const t of orderedTools) {
       const connector = connectorById.get(t.connectorId);
@@ -336,21 +412,20 @@ export class FlowService {
 
       // What the audit log holds is the raw upstream response, before the
       // processing chain and the mapping run: that is the tool's output here.
-      nodes.push({
-        id,
-        kind: 'tool',
-        label: t.name,
-        ref: { toolId: t.id, connectorId: t.connectorId, serverId: server.id },
-        stats: toStats(acc),
-        meta,
-      });
-      edges.push({
-        id: `tool:${serverNodeId}>${id}`,
-        source: serverNodeId,
-        target: id,
-        kind: 'tool',
-        stats: toStats(acc, ['avgMs', 'lastAt']),
-      });
+      const ref: FlowNode['ref'] = { toolId: t.id, connectorId: t.connectorId };
+      if (single) ref.serverId = single;
+      nodes.push({ id, kind: 'tool', label: t.name, ref, stats: toStats(acc), meta });
+      for (const srv of servers) {
+        if (!connectorsOf.get(srv.id)?.has(t.connectorId)) continue;
+        const sid = `server:${srv.id}`;
+        edges.push({
+          id: `tool:${sid}>${id}`,
+          source: sid,
+          target: id,
+          kind: 'tool',
+          stats: toStats(hopAcc.get(`${srv.id}\u0000${t.id}`) ?? newAcc(), ['avgMs', 'lastAt']),
+        });
+      }
       edges.push({
         id: `http:${id}>connector:${t.connectorId}`,
         source: id,
@@ -373,7 +448,7 @@ export class FlowService {
           id: pid,
           kind: 'processing',
           label: `${t.name} processing`,
-          ref: { toolId: t.id },
+          ref: { toolId: t.id, connectorId: t.connectorId },
           stats,
           meta: {
             steps,
@@ -400,7 +475,7 @@ export class FlowService {
           id: mid,
           kind: 'mapping',
           label: `${t.name} mapping`,
-          ref: { toolId: t.id },
+          ref: { toolId: t.id, connectorId: t.connectorId },
           stats,
           meta: { mode: mappingMode(rm) },
         });
@@ -510,7 +585,7 @@ export class FlowService {
     }
 
     return {
-      serverId: server.id,
+      serverId: serverId ? servers[0].id : null,
       since: from.toISOString(),
       generatedAt: generatedAt.toISOString(),
       nodes,
@@ -519,6 +594,171 @@ export class FlowService {
   }
 
   /**
+   * The individual calls of the window, oldest first, for the replay: tool
+   * invocations (refusals included) and saved-script runs. Times, ids, status
+   * and duration only; the error text is read to classify a row and never
+   * returned. When the window holds more than `limit`, the most recent are kept.
+   */
+  async listEvents(
+    organizationId: string,
+    serverId: string | null,
+    since: string = '24h',
+    until?: string,
+    limit: number = FLOW_EVENTS_MAX,
+  ): Promise<FlowEvents> {
+    const now = new Date();
+    let end = until ? new Date(until) : now;
+    if (Number.isNaN(end.getTime()) || end > now) end = now;
+    let start =
+      (FLOW_WINDOWS as readonly string[]).includes(since)
+        ? new Date(end.getTime() - WINDOW_MS[since as FlowWindow])
+        : new Date(since);
+    if (Number.isNaN(start.getTime())) throw new BadRequestException('since is not a time');
+    const earliest = new Date(end.getTime() - WINDOW_MS['7d']);
+    if (start < earliest) start = earliest;
+    if (start > end) throw new BadRequestException('since is after until');
+    const take = Math.max(1, Math.min(FLOW_EVENTS_MAX, Math.floor(limit))) + 1;
+
+    const servers = await this.findServers(organizationId, serverId);
+    const serverIds = servers.map((s) => s.id);
+    const empty: FlowEvents = { from: start.toISOString(), until: end.toISOString(), truncated: false, events: [] };
+    if (!serverIds.length) return empty;
+    const serverWhere = serverIds.length === 1 ? serverIds[0] : { in: serverIds };
+    const range = { gte: start, lte: end };
+
+    const [invocations, runs] = await Promise.all([
+      this.prisma.toolInvocation.findMany({
+        where: { organizationId, mcpServerId: serverWhere, createdAt: range },
+        select: {
+          createdAt: true,
+          mcpServerId: true,
+          toolId: true,
+          connectorId: true,
+          status: true,
+          durationMs: true,
+          repeatCount: true,
+          error: true,
+          tool: { select: { connectorId: true } },
+        },
+        orderBy: { createdAt: 'desc' },
+        take,
+      }),
+      this.prisma.sandboxRun.findMany({
+        where: { organizationId, mcpServerId: serverWhere, createdAt: range },
+        select: { createdAt: true, mcpServerId: true, scriptId: true, ok: true, errorCode: true, meta: true },
+        orderBy: { createdAt: 'desc' },
+        take,
+      }),
+    ]);
+
+    const events: (FlowEvent & { at: number })[] = [];
+    for (const r of invocations) {
+      const error = typeof r.error === 'string' ? r.error : '';
+      const refused = error.startsWith(REFUSAL_PREFIX);
+      const status: FlowEventStatus = r.status === 'SUCCESS' ? 'ok' : refused ? 'refused' : 'error';
+      const e: FlowEvent & { at: number } = {
+        at: r.createdAt.getTime(),
+        ts: r.createdAt.toISOString(),
+        kind: status === 'error' && error.startsWith(PROCESSING_FAILED) ? 'processing' : 'tool',
+        serverId: r.mcpServerId ?? serverIds[0],
+        toolId: r.toolId,
+        status,
+        durationMs: r.durationMs ?? null,
+      };
+      const connectorId = r.connectorId ?? r.tool?.connectorId;
+      if (connectorId) e.connectorId = connectorId;
+      if ((r.repeatCount ?? 1) > 1) e.count = r.repeatCount;
+      events.push(e);
+    }
+    for (const r of runs) {
+      const meta = isPlainObject(r.meta) ? r.meta : {};
+      const e: FlowEvent & { at: number } = {
+        at: r.createdAt.getTime(),
+        ts: r.createdAt.toISOString(),
+        kind: 'script',
+        serverId: r.mcpServerId,
+        status: r.ok ? 'ok' : REFUSAL_CODES.has(r.errorCode ?? '') ? 'refused' : 'error',
+        durationMs: typeof meta.ms === 'number' ? Math.round(meta.ms) : null,
+      };
+      if (r.scriptId) e.scriptId = r.scriptId;
+      const called = Array.isArray(meta.toolsCalled)
+        ? meta.toolsCalled.filter((n): n is string => typeof n === 'string').slice(0, 20)
+        : [];
+      if (called.length) e.tools = called;
+      events.push(e);
+    }
+
+    events.sort((a, b) => b.at - a.at);
+    const max = take - 1;
+    const kept = events.slice(0, max).reverse();
+    return {
+      ...empty,
+      truncated: events.length > max,
+      events: kept.map(({ at: _at, ...e }) => e),
+    };
+  }
+
+  /**
+   * The latest failures of the window (tool calls and script runs), newest
+   * first, each pointing at the node it belongs to. For the Ask context.
+   */
+  async recentErrors(
+    organizationId: string,
+    serverId: string | null,
+    since: FlowWindow,
+    n = 10,
+  ): Promise<FlowRecentError[]> {
+    const from = new Date(Date.now() - WINDOW_MS[since]);
+    const servers = await this.findServers(organizationId, serverId);
+    const serverIds = servers.map((s) => s.id);
+    if (!serverIds.length) return [];
+    const serverWhere = serverIds.length === 1 ? serverIds[0] : { in: serverIds };
+    const [calls, runs] = await Promise.all([
+      this.prisma.toolInvocation.findMany({
+        where: { organizationId, mcpServerId: serverWhere, createdAt: { gte: from }, status: { not: 'SUCCESS' } },
+        select: { createdAt: true, toolId: true, error: true },
+        orderBy: { createdAt: 'desc' },
+        take: n,
+      }),
+      this.prisma.sandboxRun.findMany({
+        where: { organizationId, mcpServerId: serverWhere, createdAt: { gte: from }, ok: false },
+        select: { createdAt: true, scriptId: true, errorCode: true, errorMessage: true },
+        orderBy: { createdAt: 'desc' },
+        take: n,
+      }),
+    ]);
+    const out: FlowRecentError[] = [
+      ...calls.map((c) => ({ at: c.createdAt, nodeId: `tool:${c.toolId}`, message: c.error ?? 'error' })),
+      ...runs
+        .filter((r) => r.scriptId)
+        .map((r) => ({
+          at: r.createdAt,
+          nodeId: `script:${r.scriptId}`,
+          message: [r.errorCode, r.errorMessage].filter(Boolean).join(': ') || 'error',
+        })),
+    ];
+    return out.sort((a, b) => b.at.getTime() - a.at.getTime()).slice(0, n);
+  }
+
+  /** The named server of the organization (404 otherwise), or all of them. */
+  private async findServers(organizationId: string, serverId: string | null) {
+    const select = { id: true, name: true, connectors: { select: { connectorId: true } } } as const;
+    if (serverId) {
+      const server = await this.prisma.mcpServerConfig.findFirst({
+        where: { id: serverId, organizationId },
+        select,
+      });
+      if (!server) throw new NotFoundException('MCP server not found');
+      return [server];
+    }
+    return this.prisma.mcpServerConfig.findMany({
+      where: { organizationId },
+      select,
+      orderBy: { name: 'asc' },
+      take: FLOW_MAX_SERVERS,
+    });
+  }
+  /**
    * Size of what each tool returned, per tool, in one aggregate query. The log
    * keeps a bounded excerpt of the output and records the original size in
    * `_amcp_truncated.originalBytes` when it cut it, so the sum uses that and
@@ -526,7 +766,7 @@ export class FlowService {
    */
   private async readBytes(
     organizationId: string,
-    serverId: string,
+    serverIds: string[],
     from: Date,
   ): Promise<Map<string, number>> {
     try {
@@ -536,7 +776,7 @@ export class FlowService {
                             octet_length(output::text)))::bigint AS bytes
         FROM tool_invocations
         WHERE organization_id = ${organizationId}
-          AND mcp_server_id = ${serverId}
+          AND mcp_server_id = ANY(${serverIds}::text[])
           AND created_at >= ${from}
           AND status = 'SUCCESS'
           AND output IS NOT NULL

@@ -27,6 +27,10 @@ export interface BuiltinParam {
   default?: unknown;
   min?: number;
   max?: number;
+  /** Strict lower bound: the value must be greater than this. */
+  exclusiveMin?: number;
+  /** A string param must match this (source of a RegExp, anchored). */
+  pattern?: string;
 }
 
 export interface BuiltinContract {
@@ -36,14 +40,30 @@ export interface BuiltinContract {
   input: BuiltinValueType;
   output: BuiltinValueType;
   params: BuiltinParam[];
+  /**
+   * At least one of these sets must be given in full (`currency@1`:
+   * `[['rate'], ['from', 'to']]`). Absent: only `required` applies.
+   */
+  requiresOneOf?: string[][];
 }
 
 /**
  * Raised by a processor for a value it cannot handle. The message completes the
  * sentence the chain runner builds after the field path:
  * `step <id>: $.items[3].status <message>`.
+ *
+ * `key` names the entry of an array or object value that failed (`3`,
+ * `'A-10339'`): the chain runner appends it to the read path, so the sentence
+ * names the inner value (`$.prices['A-10339'] is not a number`).
  */
-export class BuiltinError extends Error {}
+export class BuiltinError extends Error {
+  constructor(
+    message: string,
+    readonly key?: string | number,
+  ) {
+    super(message);
+  }
+}
 
 type Params = Record<string, unknown>;
 
@@ -88,6 +108,9 @@ const num = (name: string, extra: Partial<BuiltinParam> = {}): BuiltinParam => (
   ...extra,
 });
 
+/** ISO 4217 code: three upper-case letters. */
+const CURRENCY_PATTERN = '^[A-Z]{3}$';
+
 const ROUND_PARAM: BuiltinParam = {
   name: 'round',
   type: 'integer',
@@ -117,6 +140,31 @@ function mapKey(value: unknown): string {
 /* ------------------------------------------------------------------ */
 
 const BUILTINS: Record<string, Builtin> = {
+  // Money: always two decimals, so no `round` param (scale@1 is the general one).
+  'currency@1': {
+    contract: {
+      name: 'currency',
+      version: 1,
+      title: 'Currency',
+      input: 'number',
+      output: 'number',
+      // `rate` alone (manual), or `from` + `to` looked up in the rates table
+      // at run time (chain.ts resolves it into `rate` before the run). Both:
+      // `rate` wins, `from`/`to` stay as the editor's context.
+      params: [
+        num('rate', { exclusiveMin: 0 }),
+        // Defaults are what a new step starts with in the editor (USD→EUR);
+        // validation still wants rate, or from and to, given explicitly.
+        { name: 'from', type: 'string', pattern: CURRENCY_PATTERN, default: 'USD' },
+        { name: 'to', type: 'string', pattern: CURRENCY_PATTERN, default: 'EUR' },
+      ],
+      requiresOneOf: [['rate'], ['from', 'to']],
+    },
+    run: (value, p) => {
+      if (typeof p.rate !== 'number') throw new BuiltinError('has no rate to convert with');
+      return roundHalfAwayFromZero(finite((value as number) * p.rate), 2);
+    },
+  },
   'scale@1': {
     contract: {
       name: 'scale',
@@ -267,16 +315,26 @@ function checkParamValue(spec: BuiltinParam, value: unknown): string | null {
       if (spec.type === 'integer' && !Number.isInteger(value)) {
         return `${where} must be an integer${range}`;
       }
+      const kind = spec.type === 'integer' ? 'an integer' : 'a number';
       if (
         (spec.min !== undefined && value < spec.min) ||
         (spec.max !== undefined && value > spec.max)
       ) {
-        return `${where} must be ${spec.type === 'integer' ? 'an integer' : 'a number'}${range}`;
+        return `${where} must be ${kind}${range}`;
+      }
+      if (spec.exclusiveMin !== undefined && value <= spec.exclusiveMin) {
+        return `${where} must be ${kind} greater than ${spec.exclusiveMin}`;
       }
       return null;
     }
     case 'string':
-      return typeof value === 'string' ? null : `${where} must be a string`;
+      if (typeof value !== 'string') return `${where} must be a string`;
+      if (spec.pattern !== undefined && !new RegExp(spec.pattern).test(value)) {
+        return spec.pattern === CURRENCY_PATTERN
+          ? `${where} must be a currency code (3 upper-case letters, e.g. USD)`
+          : `${where} must match ${spec.pattern}`;
+      }
+      return null;
     case 'boolean':
       return typeof value === 'boolean' ? null : `${where} must be true or false`;
     case 'object':
@@ -311,6 +369,10 @@ export function validateBuiltinParams(use: string, params: unknown): string | nu
     const problem = checkParamValue(spec, value);
     if (problem) return problem;
   }
+  const sets = contract.requiresOneOf;
+  if (sets && !sets.some((set) => set.every((name) => given[name] !== undefined))) {
+    return `${sets.map((set) => set.map((n) => `params.${n}`).join(' and ')).join(', or ')} is required`;
+  }
   return null;
 }
 
@@ -334,13 +396,40 @@ export function matchesInput(type: BuiltinValueType, value: unknown): boolean {
 }
 
 /**
+ * A numeric processor over an array or a plain object of numbers: the same
+ * shape back (array to array, object to object with the same keys), one level
+ * deep. A non-number entry, nested collections included, fails naming its key.
+ */
+function mapNumbers(value: unknown[] | Record<string, unknown>, one: (v: number) => unknown): unknown {
+  const at = (v: unknown, key: string | number): unknown => {
+    if (!matchesInput('number', v)) throw new BuiltinError('is not a number', key);
+    try {
+      return one(v as number);
+    } catch (err) {
+      if (err instanceof BuiltinError && err.key === undefined) throw new BuiltinError(err.message, key);
+      throw err;
+    }
+  };
+  if (Array.isArray(value)) return value.map((v, i) => at(v, i));
+  // fromEntries defines own properties, so a `__proto__` key stays a plain key.
+  return Object.fromEntries(Object.keys(value).map((k) => [k, at(value[k], k)]));
+}
+
+/**
  * Run a processor. Parameters must already be validated. Throws BuiltinError
  * for an input of the wrong type or a value the processor cannot handle; the
  * message completes a sentence that starts with the field path.
+ *
+ * Numeric processors (input `number`) also take an array or a plain object of
+ * numbers and map over its values.
  */
 export function runBuiltin(use: string, value: unknown, params?: unknown): unknown {
   if (!isBuiltin(use)) throw new BuiltinError(`unknown processor "${use}"`);
-  const { input } = BUILTINS[use].contract;
-  if (!matchesInput(input, value)) throw new BuiltinError(`is not a ${input}`);
-  return BUILTINS[use].run(value, withDefaults(use, params));
+  const { contract, run } = BUILTINS[use];
+  const p = withDefaults(use, params);
+  if (contract.input === 'number' && (Array.isArray(value) || isPlainObject(value))) {
+    return mapNumbers(value, (v) => run(v, p));
+  }
+  if (!matchesInput(contract.input, value)) throw new BuiltinError(`is not a ${contract.input}`);
+  return run(value, p);
 }

@@ -349,3 +349,227 @@ test.describe('code mode', () => {
     });
   });
 });
+
+test.describe('code mode: example placeholders', () => {
+  test('Tab accepts the example in an empty name, description and arguments field', async ({ page }) => {
+    await session(page, 'ADMIN');
+    await page.goto('/sandbox');
+    await page.getByRole('button', { name: 'New script' }).click();
+
+    const name = page.locator('#script-name');
+    const description = page.locator('#script-desc');
+    const args = page.locator('#script-args');
+    const hint = page.getByTestId('tab-hint');
+
+    // The hint shows only while the field is empty and focused.
+    await expect(hint).toHaveCount(0);
+    await name.focus();
+    await expect(hint).toHaveCount(1);
+    await expect(hint).toHaveText('Tab');
+
+    await page.keyboard.press('Tab');
+    await expect(name).toHaveValue('delayed_orders_last_month');
+    await expect(name).toBeFocused();
+    await expect(hint).toHaveCount(0);
+    // With text in the field, Tab moves on.
+    await page.keyboard.press('Tab');
+    await expect(name).not.toBeFocused();
+
+    // Shift+Tab never fills.
+    await description.focus();
+    await page.keyboard.press('Shift+Tab');
+    await expect(description).toHaveValue('');
+    await expect(description).not.toBeFocused();
+
+    await description.focus();
+    await page.keyboard.press('Tab');
+    await expect(description).toHaveValue('Orders shipped late last month, by customer');
+
+    await args.focus();
+    await expect(hint).toHaveCount(1);
+    const example = await args.getAttribute('placeholder');
+    expect(() => JSON.parse(example ?? '')).not.toThrow();
+    await page.keyboard.press('Tab');
+    await expect(args).toHaveValue(example ?? '');
+    await expect(hint).toHaveCount(0);
+
+    // A field that already has text keeps it.
+    await name.fill('mine');
+    await name.focus();
+    await page.keyboard.press('Tab');
+    await expect(name).toHaveValue('mine');
+  });
+
+  test('the arguments example follows the parameters the script declares', async ({ page }) => {
+    await session(page, 'ADMIN');
+    await page.route(/\/api\/sandbox\/scripts\/scr-4$/, (route) =>
+      route.fulfill({
+        status: 200,
+        contentType: 'application/json',
+        body: JSON.stringify({
+          ...PURE,
+          code: CODE['scr-4'],
+          parameters: { type: 'object', properties: { n: { type: 'integer' } }, required: ['n'] },
+        }),
+      }),
+    );
+    await page.goto('/sandbox');
+    await page.getByTestId('script-row').filter({ hasText: 'double_it' }).click();
+
+    const args = page.locator('#script-args');
+    await expect(args).toHaveAttribute('placeholder', '{"n": 10}');
+    await args.focus();
+    await page.keyboard.press('Tab');
+    await expect(args).toHaveValue('{"n": 10}');
+  });
+});
+
+test.describe('code mode: benchmark examples', () => {
+  // The CODEBOUND mock connectors, as GET /api/connectors returns them.
+  const KIT_CONNECTORS = [
+    {
+      id: 'c-mock-erp',
+      name: 'Mock ERP',
+      tools: [
+        { name: 'mock_erp_list_articles', parameters: { type: 'object', properties: { status: { type: 'string', description: 'Filter: active or inactive.' }, page: { type: 'number' } } } },
+        { name: 'mock_erp_list_orders', parameters: { type: 'object', properties: { status: { type: 'string', description: 'Filter: open or shipped.' } } } },
+        { name: 'mock_erp_ping', parameters: { type: 'object', properties: { nonce: { type: 'string' } } } },
+      ],
+    },
+    {
+      id: 'c-mock-sup',
+      name: 'Mock Supplier',
+      tools: [
+        { name: 'mock_supplier_get_prices', parameters: { type: 'object', properties: { skus: { type: 'array', items: { type: 'string' } } }, required: ['skus'] } },
+        {
+          name: 'mock_supplier_list_catalogue',
+          parameters: { type: 'object', properties: { category: { type: 'string', description: 'fasteners, adhesives or legacy.' }, page: { type: 'number' } }, required: ['category'] },
+        },
+      ],
+    },
+    { id: 'c-mock-car', name: 'Mock Carrier', tools: [{ name: 'mock_carrier_get_tracking', parameters: { type: 'object', properties: { tracking_no: { type: 'string' } }, required: ['tracking_no'] } }] },
+  ];
+  const DRIFT = summary({
+    id: 'scr-7',
+    name: 'price_drift_check',
+    uses: [{ connectorId: 'c-mock-erp', connectorName: 'Mock ERP', connectorExists: true, tools: ['mock_erp_list_articles'] }],
+    parameters: { type: 'object', properties: { threshold: { type: 'number' } }, required: ['threshold'] },
+  });
+  const DRIFT_CODE = 'const r = await tools.mock_erp_list_articles({ page: 1 });\nreturn r.items.length > args.threshold;';
+  const BENCH = {
+    raw: { ok: true, bytes: 41_000, ms: 20, estTokens: 10_250 },
+    script: { ok: true, bytes: 120, ms: 30, estTokens: 30, connectorCalls: 5, bytesFromConnectors: 41_000, result: [{ sku: 'A-1', driftPct: 9.1 }] },
+    reduction: { bytesPct: 99.7, tokensPct: 99.7 },
+  };
+
+  async function bench(page: Page, kit: boolean, onBench?: (body: any) => void) {
+    await session(page, 'ADMIN');
+    const connectors = kit ? KIT_CONNECTORS : CONNECTORS;
+    await page.route(/\/api\//, async (route: Route) => {
+      const path = new URL(route.request().url()).pathname;
+      const json = (body: unknown) => route.fulfill({ status: 200, contentType: 'application/json', body: JSON.stringify(body) });
+      if (path === '/api/mcp-servers/srv-1') return json({ ...SERVER, connectors: [connectors[0], connectors[1], connectors[2]].filter(Boolean).filter((c) => kit || c.id === 'c-erp').map((c) => ({ connectorId: c.id })) });
+      if (path === '/api/connectors') return json(connectors);
+      if (path.endsWith('/benchmark')) {
+        onBench?.(route.request().postDataJSON());
+        return json(BENCH);
+      }
+      if (path === '/api/sandbox/servers/srv-1/scripts' && route.request().method() === 'GET') return json(kit ? [DRIFT] : SCRIPTS);
+      if (path === '/api/sandbox/scripts/scr-7') return json({ ...DRIFT, code: DRIFT_CODE });
+      return route.fallback();
+    });
+    await page.goto('/sandbox');
+    await page.getByRole('tab', { name: 'Benchmark' }).click();
+  }
+
+  const options = (page: Page) => page.getByRole('listbox').getByRole('option');
+
+  test('the examples list the CODEBOUND questions; Run fills and posts the benchmark', async ({ page }) => {
+    const posted: any[] = [];
+    await bench(page, true, (b) => posted.push(b));
+    const examples = page.getByRole('combobox', { name: 'Examples' });
+    await examples.click();
+    await expect(options(page).filter({ hasText: /^Ping/ })).toHaveCount(1);
+    await expect(options(page).filter({ hasText: /^Four rows from 400/ })).toHaveCount(1);
+    await expect(options(page).filter({ hasText: /^Stuck orders/ })).toHaveCount(1);
+    await expect(options(page).filter({ hasText: /^Count a catalogue/ })).toHaveCount(1);
+
+    await options(page).filter({ hasText: /^Ping/ }).click();
+    await expect(examples).toHaveValue('Ping');
+    await expect(page.locator('#bench-code')).toHaveValue(/tools\.mock_erp_ping/);
+    await expect(page.locator('#bench-tool-args')).toHaveValue(/"nonce": "bench"/);
+
+    await page.getByRole('button', { name: 'Run', exact: true }).click();
+    await expect(page.getByTestId('benchmark-result')).toBeVisible();
+    expect(posted).toHaveLength(1);
+    expect(posted[0].toolName).toBe('mock_erp_ping');
+    expect(posted[0].toolArgs).toEqual({ nonce: 'bench' });
+    expect(posted[0].code).toContain('tools.mock_erp_ping');
+  });
+
+  test('typing filters the examples; arrows and Enter pick one', async ({ page }) => {
+    const posted: any[] = [];
+    await bench(page, true, (b) => posted.push(b));
+    const examples = page.getByRole('combobox', { name: 'Examples' });
+    await examples.click();
+    await examples.fill('stuck');
+    await expect(options(page)).toHaveCount(1);
+    await expect(options(page)).toContainText('Stuck orders');
+    await examples.fill('zzz');
+    await expect(options(page)).toHaveText(['—']);
+
+    await examples.fill('four');
+    await page.keyboard.press('ArrowDown');
+    await page.keyboard.press('Enter');
+    await expect(page.getByRole('listbox')).toHaveCount(0);
+    await expect(examples).toHaveValue('Four rows from 400');
+    await expect(page.getByRole('combobox', { name: 'Tool' })).toHaveValue('mock_erp_list_articles');
+    await expect(page.locator('#bench-script-args')).toHaveValue(/"threshold": 5/);
+
+    await page.getByRole('button', { name: 'Run benchmark' }).click();
+    await expect(page.getByTestId('benchmark-result')).toBeVisible();
+    expect(posted[0].args).toEqual({ threshold: 5 });
+    expect(posted[0].code).toContain('tools.mock_supplier_get_prices');
+  });
+
+  test('a server without the mock tools lists only generic entries', async ({ page }) => {
+    await bench(page, false);
+    await page.getByRole('combobox', { name: 'Examples' }).click();
+    await expect(options(page)).toHaveText(['erp_order_items_list', 'erp_orders_export', 'erp_products_list']);
+  });
+
+  test('a saved script fills code, example args and its read-only tool, and is named in the result', async ({ page }) => {
+    const posted: any[] = [];
+    await bench(page, true, (b) => posted.push(b));
+    const script = page.getByRole('combobox', { name: 'Script' });
+    await script.click();
+    await script.fill('drift');
+    await options(page).filter({ hasText: 'price_drift_check' }).click();
+    await expect(page.locator('#bench-code')).toHaveValue(DRIFT_CODE);
+    await expect(page.locator('#bench-script-args')).toHaveValue('{\n  "threshold": 1\n}');
+    await expect(page.getByRole('combobox', { name: 'Tool' })).toHaveValue('mock_erp_list_articles');
+
+    await page.getByRole('button', { name: 'Run benchmark' }).click();
+    await expect(page.getByTestId('benchmark-script-name')).toHaveText('price_drift_check');
+    expect(posted[0]).toMatchObject({ toolName: 'mock_erp_list_articles', code: DRIFT_CODE, args: { threshold: 1 } });
+  });
+
+  test('Tab takes the example arguments of a hand-picked tool', async ({ page }) => {
+    await bench(page, true);
+    const tool = page.getByRole('combobox', { name: 'Tool' });
+    await tool.click();
+    await tool.fill('catalogue');
+    await page.keyboard.press('Enter');
+    await expect(tool).toHaveValue('mock_supplier_list_catalogue');
+
+    const args = page.locator('#bench-tool-args');
+    await expect(args).toHaveValue('');
+    await expect(args).toHaveAttribute('placeholder', '{\n  "category": "fasteners"\n}');
+    await args.focus();
+    await expect(page.getByTestId('tab-hint')).toHaveCount(1);
+    await page.keyboard.press('Tab');
+    await expect(args).toHaveValue('{\n  "category": "fasteners"\n}');
+    await expect(page.getByTestId('tab-hint')).toHaveCount(0);
+    await expect(page.locator('#bench-code')).toHaveValue(/tools\.mock_supplier_list_catalogue\(\{ category: "fasteners" \}\)/);
+  });
+});

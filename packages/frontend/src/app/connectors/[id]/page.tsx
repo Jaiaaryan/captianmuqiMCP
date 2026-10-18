@@ -1925,6 +1925,7 @@ export default function ConnectorDetailPage() {
             <div className="mb-4">
               <ToolEditor
                 connectorType={connector.type}
+                connectorName={connector.name}
                 envVarKeys={new Set(envVarEntries.map((e) => e.key.trim()).filter(Boolean))}
                 onSave={handleCreateTool}
                 onCancel={() => setShowNewTool(false)}
@@ -1944,6 +1945,7 @@ export default function ConnectorDetailPage() {
                   {editingToolId === tool.id ? (
                     <ToolEditor
                       connectorType={connector.type}
+                      connectorName={connector.name}
                       envVarKeys={new Set(envVarEntries.map((e) => e.key.trim()).filter(Boolean))}
                       connectorId={id}
                       toolId={tool.id}

@@ -355,6 +355,39 @@ describe('ToolsController — test endpoint', () => {
     expect(res.mappingError).toMatch(/Unclosed/);
   });
 
+  it('records the raw response as the latest sample only when asked', async () => {
+    const { controller, prisma } = buildController();
+    prisma.toolInvocation.create = jest.fn().mockResolvedValue({ id: 'i1' });
+    prisma.mcpTool.findUnique.mockResolvedValue(tool({ transform: TRANSFORM }));
+
+    const plain: any = await controller.testTool('c1', 't1', req(), { arguments: { q: 'x' } });
+    expect(plain.sampleRecorded).toBeUndefined();
+    expect(prisma.toolInvocation.create).not.toHaveBeenCalled();
+
+    const res: any = await controller.testTool('c1', 't1', req(), { arguments: { q: 'x' }, recordSample: true });
+    expect(res.ok).toBe(true);
+    expect(res.sampleRecorded).toBe(true);
+    const data = prisma.toolInvocation.create.mock.calls[0][0].data;
+    expect(data).toMatchObject({
+      toolId: 't1',
+      connectorId: 'c1',
+      organizationId: 'org1',
+      userId: 'u1',
+      status: 'SUCCESS',
+      input: { q: 'x' },
+      output: RAW, // raw upstream payload, not the mapped one
+    });
+  });
+
+  it('never fails the test when the sample cannot be stored', async () => {
+    const { controller, prisma } = buildController();
+    prisma.toolInvocation.create = jest.fn().mockRejectedValue(new Error('db down'));
+    prisma.mcpTool.findUnique.mockResolvedValue(tool(undefined));
+    const res: any = await controller.testTool('c1', 't1', req(), { recordSample: true });
+    expect(res.ok).toBe(true);
+    expect(res.sampleRecorded).toBe(false);
+  });
+
   it('infers the output schema from the mapped shape when a mapping is active', async () => {
     const { controller, prisma } = buildController();
     prisma.mcpTool.findUnique.mockResolvedValue({ ...tool({ transform: TRANSFORM }), outputSchema: null });

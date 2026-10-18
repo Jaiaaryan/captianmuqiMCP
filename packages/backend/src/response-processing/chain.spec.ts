@@ -5,6 +5,7 @@ import {
   runChain,
   validateChain,
 } from './chain';
+import { SNAPSHOT_TABLE, setRatesProvider } from './rates-table';
 
 const sample = () => ({
   category: 'fasteners',
@@ -462,18 +463,27 @@ describe('validateChain', () => {
     ).toMatch(/^step a: unknown param "bogus"/);
   });
 
-  it('allows `$` only for script@1', () => {
-    expect(validateChain(chainOf([step({ id: 'a', use: 'round@1', reads: '$' })]))).toBe(
-      'step a: reads "$" is only allowed for script@1',
-    );
-    expect(validateChain(chainOf([step({ id: 'a', use: 'round@1', writes: '$', mode: 'replace' })]))).toBe(
-      'step a: writes "$" is only allowed for script@1',
-    );
+  it('allows `$` for every processor', () => {
+    expect(validateChain(chainOf([step({ id: 'a', use: 'round@1', reads: '$' })]))).toBeNull();
+    expect(
+      validateChain(chainOf([step({ id: 'a', use: 'round@1', reads: '$', writes: '$', mode: 'replace' })])),
+    ).toBeNull();
     expect(
       validateChain(
         chainOf([step({ id: 'a', use: 'script@1', reads: '$', writes: '$', mode: 'replace', code: 'return value' })]),
       ),
     ).toBeNull();
+  });
+
+  it('runs a built-in on the values of an object (`$.prices[*]`, `$` -> `$`)', () => {
+    const doc = { prices: { 'A-1': 10, 'B-2': 2.5 } };
+    const c = chainOf([
+      step({ id: 'eur', use: 'scale@1', each: '$.prices[*]', reads: '$', writes: '$', mode: 'replace', params: { factor: 2 } }),
+    ]);
+    expect(ok(doc, c).value).toEqual({ prices: { 'A-1': 20, 'B-2': 5 } });
+    const add = chainOf([{ ...c.steps[0], mode: 'add' }]);
+    expect(validateChain(add)).toBeNull();
+    expect(fail(doc, add).error).toBe(`step eur: $.prices['A-1'] already exists, and the mode is "add"`);
   });
 
   it('checks paths', () => {
@@ -505,5 +515,170 @@ describe('validateChain', () => {
     expect(
       validateChain(chainOf([step({ id: 'a', use: 'script@1', code: 'const a = 1;\nconst b = ;' })])),
     ).toMatch(/^step a: .*\(line 2\)$/);
+  });
+});
+
+describe('pipes: use as a list of built-ins', () => {
+  const pipe = (over: Partial<Step> = {}) =>
+    chainOf([
+      step({
+        id: 'convert_to_eur',
+        use: ['scale@1', 'round@1'],
+        params: [{ factor: 0.92 }, { decimals: 2 }],
+        ...over,
+      }),
+    ]);
+
+  it('applies the processors in order to the same read value', () => {
+    const r = ok(sample(), pipe());
+    expect((r.value as any).items[0].price_eur).toBe(50.3);
+  });
+
+  it('gives the same result as the single step with its own round', () => {
+    const single = ok(sample(), chainOf([P1.steps[0]]));
+    expect((ok(sample(), pipe()).value as any).items[0].price_eur).toBe(
+      (single.value as any).items[0].price_eur,
+    );
+  });
+
+  it('validates every processor against its own params', () => {
+    expect(validateChain(pipe())).toBeNull();
+    expect(validateChain(pipe({ params: [{ factor: 0.92 }, { decimals: 99 }] }))).toMatch(
+      /^step convert_to_eur: round@1: params\.decimals must be an integer/,
+    );
+    expect(validateChain(pipe({ params: { factor: 1 } as any }))).toMatch(/params must be an array/);
+    expect(validateChain(pipe({ params: undefined, use: ['round@1', 'round@1'] }))).toBeNull();
+  });
+
+  it('refuses script@1, unknown names and empty pipes', () => {
+    expect(validateChain(pipe({ use: ['scale@1', 'script@1'] as any }))).toMatch(/script@1 cannot be part of a pipe/);
+    expect(validateChain(pipe({ use: ['scale@1', 'nope@1'] as any }))).toMatch(/unknown processor "nope@1"/);
+    expect(validateChain(pipe({ use: [] as any, params: undefined }))).toMatch(/at least one processor/);
+    expect(validateChain(pipe({ reads: '$', writes: '$', mode: 'replace' }))).toBeNull();
+  });
+
+  it('accepts currency@1 in a pipe', () => {
+    const c = pipe({ use: ['currency@1', 'offset@1'], params: [{ rate: 0.92 }, { amount: 1 }] });
+    expect(validateChain(c)).toBeNull();
+    expect((ok(sample(), c).value as any).items[0].price_eur).toBe(51.3);
+    expect(validateChain(pipe({ use: ['currency@1'], params: [{ rate: 0 }] }))).toMatch(
+      /^step convert_to_eur: currency@1: params\.rate must be a number greater than 0/,
+    );
+    const single = chainOf([step({ id: 'eur', use: 'currency@1', params: { rate: 0.92 } })]);
+    expect(validateChain(single)).toBeNull();
+    expect(fail({ items: [{ price_usd: 'n/a' }] }, single).error).toBe(
+      'step eur: $.items[0].price_usd is not a number',
+    );
+  });
+
+  it('names the processor that refused the value', () => {
+    const r = fail(
+      { items: [{ price_usd: 1, label: 'x' }] },
+      chainOf([step({ id: 'p', use: ['clean_text@1', 'round@1'], reads: 'label', params: [{}, {}] })]),
+    );
+    expect(r.error).toBe('step p: $.items[0].label is not a number (round@1)');
+  });
+});
+
+describe('script@1: builtins', () => {
+  const script = (code: string) =>
+    chainOf([step({ id: 's', use: 'script@1', reads: 'price_usd', writes: 'price_eur', mode: 'add', code })]);
+
+  it('offers the step processors as functions', () => {
+    const r = ok(sample(), script('return builtins.round(builtins.scale(value, { factor: 0.92 }), 2);'));
+    expect((r.value as any).items[0].price_eur).toBe(50.3);
+  });
+});
+
+describe('numeric built-ins on an array or object value', () => {
+  const prices = (over: Record<string, unknown> = {}) => ({
+    prices: { 'A-10338': 10, 'A-10339': 2.5, B1: 100, ...over },
+  });
+  const convert = (over: Partial<Step> = {}) =>
+    chainOf([
+      step({ id: 'convert', use: 'currency@1', each: undefined, reads: 'prices', writes: 'prices_eur', params: { rate: 1.1 }, ...over }),
+    ]);
+
+  it('maps an object of numbers to an object with the same keys', () => {
+    const r = ok(prices(), convert());
+    expect((r.value as any).prices_eur).toEqual({ 'A-10338': 11, 'A-10339': 2.75, B1: 110 });
+    expect((r.value as any).prices).toEqual(prices().prices);
+  });
+
+  it('maps an array of numbers to an array', () => {
+    const r = ok({ prices: [1, 2] }, convert());
+    expect((r.value as any).prices_eur).toEqual([1.1, 2.2]);
+  });
+
+  it('names the inner path of a value that is not a number', () => {
+    expect(fail(prices({ 'A-10339': 'n/a' }), convert()).error).toBe(
+      "step convert: $.prices['A-10339'] is not a number",
+    );
+    const nested = fail(prices({ B1: { net: 1 } }), convert());
+    expect(nested.error).toBe('step convert: $.prices.B1 is not a number');
+    expect(nested.failedPath).toBe('$.prices.B1');
+    expect(fail({ prices: [1, 'x'] }, convert()).error).toBe('step convert: $.prices[1] is not a number');
+  });
+
+  it('works through a pipe, stage by stage', () => {
+    const pipe = convert({ use: ['currency@1', 'offset@1'], params: [{ rate: 1.1 }, { amount: 1 }] });
+    expect((ok({ prices: { a: 10 } }, pipe).value as any).prices_eur).toEqual({ a: 12 });
+    expect(fail({ prices: { a: 10, b: 'x' } }, pipe).error).toBe('step convert: $.prices.b is not a number (currency@1)');
+  });
+});
+
+describe('currency@1 from/to: the rate looked up in the rates table', () => {
+  const rates = { base: 'EUR', asOf: '2026-10-17', source: 'ECB', rates: { USD: 1.25, GBP: 0.8 } };
+  const convert = (params: Record<string, unknown>) =>
+    chainOf([step({ id: 'eur', use: 'currency@1', params })]);
+  afterEach(() => setRatesProvider(() => SNAPSHOT_TABLE));
+
+  it('converts with rates[to] / rates[from], base EUR = 1', () => {
+    const r = runChain({ items: [{ price_usd: 10 }] }, convert({ from: 'USD', to: 'EUR' }), { rates });
+    expect(r.ok && (r.value as any).items[0].price_eur).toBe(8);
+    const cross = runChain({ items: [{ price_usd: 10 }] }, convert({ from: 'USD', to: 'GBP' }), { rates });
+    expect(cross.ok && (cross.value as any).items[0].price_eur).toBe(6.4);
+  });
+
+  it('keeps a stored rate over the table (manual)', () => {
+    const r = runChain({ items: [{ price_usd: 10 }] }, convert({ from: 'USD', to: 'EUR', rate: 0.5 }), { rates });
+    expect(r.ok && (r.value as any).items[0].price_eur).toBe(5);
+  });
+
+  it('fails the step for a pair the table lacks', () => {
+    const r = runChain({ items: [{ price_usd: 10 }] }, convert({ from: 'USD', to: 'XAU' }), { rates });
+    expect(r).toMatchObject({ ok: false, error: 'step eur: no rate for USD→XAU', failedStep: 'eur' });
+  });
+
+  it('reads the registered table once per response, not per element', () => {
+    const provider = jest.fn(() => rates);
+    setRatesProvider(provider);
+    const items = Array.from({ length: 5 }, () => ({ price_usd: 2 }));
+    const two = chainOf([
+      step({ id: 'a', use: 'currency@1', params: { from: 'USD', to: 'EUR' } }),
+      step({ id: 'b', use: ['currency@1', 'round@1'], writes: 'price_gbp', params: [{ from: 'USD', to: 'GBP' }, {}] }),
+    ]);
+    const r = runChain({ items }, two);
+    expect(r.ok).toBe(true);
+    expect((r as any).value.items[4]).toMatchObject({ price_eur: 1.6, price_gbp: 1.28 });
+    expect(provider).toHaveBeenCalledTimes(1);
+  });
+
+  it('does not read the table for a rate-only chain', () => {
+    const provider = jest.fn(() => rates);
+    setRatesProvider(provider);
+    expect(runChain({ items: [{ price_usd: 10 }] }, convert({ rate: 0.92 })).ok).toBe(true);
+    expect(provider).not.toHaveBeenCalled();
+  });
+
+  it('falls back to the shipped snapshot (USD→EUR about 0.92)', () => {
+    const r = runChain({ items: [{ price_usd: 100 }] }, convert({ from: 'USD', to: 'EUR' }));
+    expect(r.ok && (r.value as any).items[0].price_eur).toBe(92);
+  });
+
+  it('validates the codes at save time', () => {
+    expect(validateChain(convert({ from: 'USD', to: 'EUR' }))).toBeNull();
+    expect(validateChain(convert({ from: 'usd', to: 'EUR' }))).toMatch(/^step eur: params\.from must be a currency code/);
+    expect(validateChain(convert({ to: 'EUR' }))).toBe('step eur: params.rate, or params.from and params.to is required');
   });
 });

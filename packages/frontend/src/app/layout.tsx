@@ -20,6 +20,7 @@ import { GoogleTagManager, GoogleTagManagerNoscript } from '@/components/google-
 import { CookieConsentBanner } from '@/components/cookie-consent';
 import { SentryConfig } from '@/components/sentry-config';
 import { BranchSwitcher } from '@/components/branch-switcher';
+import { DemoPill } from '@/components/demo/demo-pill';
 import { TRANSLATION_SAFE_DOM_SCRIPT } from '@/lib/translation-safe-dom';
 
 export const metadata: Metadata = {
@@ -83,6 +84,7 @@ export default function RootLayout({
           <BranchSwitcher indexUrl={process.env.PREVIEW_INDEX_URL} />
           <LicenseWall />
           {children}
+          <DemoPill />
         </Providers>
         {gtmEnabled && <CookieConsentBanner cookieDomain={cookieDomain} />}
       </body>

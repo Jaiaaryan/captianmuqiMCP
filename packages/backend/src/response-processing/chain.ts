@@ -7,9 +7,9 @@
  * processor or a `script@1` function on it, and writes the result to another
  * field of the same element:
  *
- *   { id: 'convert_to_eur', use: 'scale@1', each: '$.items[*]',
+ *   { id: 'convert_to_eur', use: 'currency@1', each: '$.items[*]',
  *     reads: 'price_usd', writes: 'price_eur', mode: 'add',
- *     params: { factor: 0.92, round: 2 } }
+ *     params: { rate: 0.92 } }
  *
  * Design constraints:
  *   1. All or nothing. The chain works on a deep copy; a failing step returns
@@ -33,6 +33,7 @@ import {
   ScriptSession,
   checkScriptSyntax,
 } from './script-runner';
+import { crossRate, currentRatesTable, type RatesTable } from './rates-table';
 
 const logger = new Logger('ResponseProcessing');
 
@@ -41,6 +42,7 @@ const logger = new Logger('ResponseProcessing');
 /* ------------------------------------------------------------------ */
 
 export type StepUse =
+  | 'currency@1'
   | 'scale@1'
   | 'offset@1'
   | 'vat@1'
@@ -52,15 +54,20 @@ export type StepUse =
 
 export type StepMode = 'add' | 'replace' | 'upsert';
 
+/**
+ * `use` is one processor, or a pipe of built-ins applied in order to the same
+ * read value (`['scale@1', 'round@1']`). A pipe's `params` is an array aligned
+ * with `use` by index; `script@1` cannot be part of a pipe.
+ */
 export interface Step {
   id: string;
-  use: StepUse;
+  use: StepUse | StepUse[];
   each?: string;
   reads: string;
   writes: string;
   mode: StepMode;
   onMissing?: 'fail' | 'skip';
-  params?: Record<string, unknown>;
+  params?: Record<string, unknown> | Record<string, unknown>[];
   code?: string;
 }
 
@@ -95,6 +102,8 @@ export type ChainResult =
 
 export const CHAIN_LIMITS = {
   maxSteps: 20,
+  /** Built-ins in one pipe. */
+  maxPipe: 8,
   /** Wall-clock cap on all script runs of one response. */
   scriptBudgetMs: 2000,
 } as const;
@@ -179,24 +188,13 @@ export function readChain(
   return raw as ResponseProcessingChain;
 }
 
-function validateStep(step: unknown, index: number, checkSyntax: boolean): string | null {
-  if (!isPlainObject(step)) return `steps[${index}]: must be an object`;
-  const id = step.id;
-  if (typeof id !== 'string' || !STEP_ID.test(id)) {
-    return `steps[${index}]: id must match ${STEP_ID.source}`;
-  }
-  const at = `step ${id}`;
-
-  for (const key of Object.keys(step)) {
-    if (!STEP_KEYS.has(key)) return `${at}: unknown field "${key}"`;
-  }
-
-  const use = step.use;
-  if (typeof use !== 'string' || (use !== SCRIPT_USE && !isBuiltin(use))) {
-    return `${at}: unknown processor ${JSON.stringify(use)}`;
-  }
-  const isScript = use === SCRIPT_USE;
-
+/**
+ * The paths, mode and onMissing: the same rules for a single processor and a
+ * pipe. `$` (the whole element, or the whole response) is a valid `reads` and
+ * `writes` for every processor; `writes: "$"` with mode `add` is refused at
+ * run time (the element always exists).
+ */
+function validatePlacement(step: Record<string, unknown>, at: string): string | null {
   if (step.each !== undefined) {
     if (typeof step.each !== 'string' || !step.each.trim()) {
       return `${at}: each must be a path string`;
@@ -212,10 +210,7 @@ function validateStep(step: unknown, index: number, checkSyntax: boolean): strin
     if (typeof value !== 'string' || !value.trim()) {
       return `${at}: ${field} is required`;
     }
-    if (value.trim() === '$') {
-      if (!isScript) return `${at}: ${field} "$" is only allowed for ${SCRIPT_USE}`;
-      continue;
-    }
+    if (value.trim() === '$') continue;
     const parsed = safeParse(value);
     if (parsed.problem) return `${at}: ${field}: ${parsed.problem}`;
     for (const t of parsed.tokens!) {
@@ -238,6 +233,82 @@ function validateStep(step: unknown, index: number, checkSyntax: boolean): strin
   ) {
     return `${at}: onMissing must be "fail" or "skip"`;
   }
+  return null;
+}
+
+/** `use: [...]`: built-ins only, `params` an array aligned with `use`. */
+function validatePipe(step: Record<string, unknown>, use: unknown[], at: string): string | null {
+  if (use.length === 0) return `${at}: use must name at least one processor`;
+  if (use.length > CHAIN_LIMITS.maxPipe) {
+    return `${at}: use: at most ${CHAIN_LIMITS.maxPipe} processors in a pipe`;
+  }
+  for (const u of use) {
+    if (u === SCRIPT_USE) return `${at}: ${SCRIPT_USE} cannot be part of a pipe`;
+    if (typeof u !== 'string' || !isBuiltin(u)) {
+      return `${at}: unknown processor ${JSON.stringify(u)}`;
+    }
+  }
+  const placement = validatePlacement(step, at);
+  if (placement) return placement;
+  if (step.code !== undefined) return `${at}: code is only for ${SCRIPT_USE}`;
+  const params = step.params;
+  if (params !== undefined && (!Array.isArray(params) || params.length !== use.length)) {
+    return `${at}: params must be an array with one entry per processor in use`;
+  }
+  for (let k = 0; k < use.length; k++) {
+    const entry = (params as unknown[] | undefined)?.[k];
+    const problem = validateBuiltinParams(use[k] as string, entry ?? undefined);
+    if (problem) return `${at}: ${use[k] as string}: ${problem}`;
+  }
+  return null;
+}
+
+/**
+ * `currency@1` with `from`/`to` and no `rate`: the rate looked up in the table.
+ * Every other params object is returned as is.
+ */
+function resolveRate(
+  use: string,
+  params: Record<string, unknown> | undefined,
+  table: () => RatesTable,
+  stepId: string,
+): Record<string, unknown> | undefined {
+  if (use !== 'currency@1' || !params || params.rate !== undefined) return params;
+  const from = params.from as string;
+  const to = params.to as string;
+  const rate = crossRate(table(), from, to);
+  if (rate === null) throw new StepFailure(`step ${stepId}: no rate for ${from}→${to}`, '');
+  return { ...params, rate };
+}
+
+/** Params of the k-th processor of a step (a pipe's entry, or the step's own). */
+function paramsAt(step: Step, k: number): Record<string, unknown> | undefined {
+  const p = step.params;
+  if (Array.isArray(p)) return (p[k] ?? undefined) as Record<string, unknown> | undefined;
+  return p;
+}
+
+function validateStep(step: unknown, index: number, checkSyntax: boolean): string | null {
+  if (!isPlainObject(step)) return `steps[${index}]: must be an object`;
+  const id = step.id;
+  if (typeof id !== 'string' || !STEP_ID.test(id)) {
+    return `steps[${index}]: id must match ${STEP_ID.source}`;
+  }
+  const at = `step ${id}`;
+
+  for (const key of Object.keys(step)) {
+    if (!STEP_KEYS.has(key)) return `${at}: unknown field "${key}"`;
+  }
+
+  const use = step.use;
+  if (Array.isArray(use)) return validatePipe(step, use, at);
+  if (typeof use !== 'string' || (use !== SCRIPT_USE && !isBuiltin(use))) {
+    return `${at}: unknown processor ${JSON.stringify(use)}`;
+  }
+  const isScript = use === SCRIPT_USE;
+
+  const placement = validatePlacement(step, at);
+  if (placement) return placement;
 
   if (isScript) {
     if (typeof step.code !== 'string' || !step.code.trim()) {
@@ -469,9 +540,12 @@ function writeAt(element: Record<string, unknown>, tokens: Token[], value: unkno
 export function runChain(
   raw: unknown,
   chain: ResponseProcessingChain,
-  options: { trace?: boolean } = {},
+  options: { trace?: boolean; rates?: RatesTable } = {},
 ): ChainResult {
   const trace = options.trace === true;
+  // The rates table, read once per response and only when a step needs it.
+  let rates: RatesTable | undefined;
+  const ratesTable = () => (rates ??= options.rates ?? currentRatesTable());
   const traces: StepTrace[] = [];
 
   const problem = structureProblem(chain);
@@ -504,6 +578,8 @@ export function runChain(
 
   for (const step of chain.steps) {
     let session: ScriptSession | null = null;
+    // Built-in params with a looked-up currency rate, resolved on the first element.
+    let resolved: (Record<string, unknown> | undefined)[] | null = null;
     try {
       const slots = collectSlots(holder, step.each);
       const eachPath = step.each?.trim() || '$';
@@ -569,11 +645,22 @@ export function runChain(
             scriptMs += Date.now() - started;
           }
         } else {
-          try {
-            output = runBuiltin(step.use, input, step.params);
-          } catch (err) {
-            if (err instanceof BuiltinError) throw fail(err.message, readPath);
-            throw err;
+          const uses = Array.isArray(step.use) ? step.use : [step.use];
+          resolved ??= uses.map((u, k) => resolveRate(u, paramsAt(step, k), ratesTable, step.id));
+          output = input;
+          for (let k = 0; k < uses.length; k++) {
+            try {
+              output = runBuiltin(uses[k], output, resolved[k]);
+            } catch (err) {
+              if (!(err instanceof BuiltinError)) throw err;
+              // An entry of an array/object value: name the inner path.
+              const at =
+                err.key === undefined
+                  ? readPath
+                  : readPath + (typeof err.key === 'number' ? `[${err.key}]` : keySegment(err.key));
+              // In a pipe, say which processor refused the value it was handed.
+              throw fail(uses.length > 1 ? `${err.message} (${uses[k]})` : err.message, at);
+            }
           }
         }
 

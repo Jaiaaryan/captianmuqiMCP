@@ -1,7 +1,9 @@
-import { BadRequestException, ForbiddenException, NotFoundException, ValidationPipe } from '@nestjs/common';
+import { BadRequestException, ForbiddenException, Logger, NotFoundException, ValidationPipe } from '@nestjs/common';
 import { ResponseProcessingController } from './response-processing.controller';
 import { DryRunDto, PreviewDto, ValidateChainDto } from './response-processing.dto';
 import { ResponseProcessingService } from './response-processing.service';
+import { RatesService } from './rates.service';
+import { ROLES_KEY } from '../auth/roles.guard';
 
 const chain = {
   version: 1,
@@ -37,7 +39,9 @@ function setup(opts: { tool?: any; invocations?: any[] } = {}) {
     },
   };
   const service = new ResponseProcessingService(prisma as any);
-  return { controller: new ResponseProcessingController(service), prisma };
+  const settings = { getJson: jest.fn(async () => null), setJson: jest.fn(async () => undefined) };
+  const rates = new RatesService(settings as any);
+  return { controller: new ResponseProcessingController(service, rates), prisma, rates, settings };
 }
 
 const pipe = new ValidationPipe({ transform: true, whitelist: true, forbidNonWhitelisted: true });
@@ -48,7 +52,8 @@ describe('ResponseProcessingController', () => {
   describe('GET builtins', () => {
     it('lists processors, modes and limits', () => {
       const out = setup().controller.builtins();
-      expect(out.builtins).toHaveLength(7);
+      expect(out.builtins).toHaveLength(8);
+      expect(out.builtins[0]).toMatchObject({ use: 'currency@1', title: 'Currency' });
       expect(out.modes).toEqual(['add', 'replace', 'upsert']);
       expect(out.limits).toEqual({
         maxSteps: 20,
@@ -131,7 +136,17 @@ describe('ResponseProcessingController', () => {
         sampleCapturedAt: '2026-01-02T03:04:05.000Z',
         sample,
         sampleTruncated: false,
+        sampleLengths: { '$.items': 1 },
       });
+    });
+
+    it('returns the uncut array lengths and the recorded arguments', async () => {
+      const when = new Date('2026-01-02T03:04:05.000Z');
+      const long = { items: [1, 2, 3, 4, 5].map((n) => ({ price_usd: n, tiers: [1, 2] })) };
+      const { controller } = setup({ tool, invocations: [{ output: long, input: { q: 'x' }, createdAt: when }] });
+      const out = (await controller.getForTool(editor, 't1')) as any;
+      expect(out.sampleLengths).toEqual({ '$.items': 5, '$.items[*].tiers': 2 });
+      expect(out.sampleInput).toEqual({ q: 'x' });
     });
 
     it('returns the sample cut to three elements', async () => {
@@ -212,5 +227,44 @@ describe('ResponseProcessingController', () => {
         ForbiddenException,
       );
     });
+  });
+});
+
+describe('ResponseProcessingController rates', () => {
+  const env = { ...process.env };
+  afterEach(() => {
+    process.env = { ...env };
+    jest.restoreAllMocks();
+  });
+
+  it('GET rates answers the snapshot table with its codes, no fetch when auto is off', () => {
+    process.env.RP_RATES_AUTO = 'false';
+    const fetchSpy = jest.spyOn(global, 'fetch');
+    const out = setup().controller.ratesTable();
+    expect(out).toMatchObject({ base: 'EUR', asOf: '2026-10-17', source: 'ECB', status: 'snapshot', auto: false, error: 'disabled' });
+    expect(out.currencies[0]).toBe('EUR');
+    expect(out.currencies).toContain('USD');
+    expect(1 / out.rates.USD).toBeCloseTo(0.92, 2);
+    expect(fetchSpy).not.toHaveBeenCalled();
+  });
+
+  it('POST rates/refresh is ADMIN-only and throttled to 2 per minute', () => {
+    const handler = ResponseProcessingController.prototype.refreshRates;
+    expect(Reflect.getMetadata(ROLES_KEY, handler)).toEqual(['ADMIN']);
+    const keys = Reflect.getMetadataKeys(handler).filter((k: unknown) => String(k).startsWith('THROTTLER:LIMIT'));
+    expect(keys.map((k: unknown) => Reflect.getMetadata(k, handler))).toEqual([2]);
+    expect(Reflect.getMetadata(ROLES_KEY, ResponseProcessingController.prototype.ratesTable)).toBeUndefined();
+  });
+
+  it('POST rates/refresh fetches now and records who asked', async () => {
+    process.env.RP_RATES_AUTO = 'false';
+    const xml = "<gesmes:Envelope><Cube><Cube time='2026-10-16'><Cube currency='USD' rate='1.1'/></Cube></Cube></gesmes:Envelope>";
+    jest.spyOn(global, 'fetch').mockResolvedValue(new Response(xml, { status: 200 }));
+    jest.spyOn(Logger.prototype, 'log').mockImplementation(() => undefined);
+    const { controller, settings } = setup();
+    const out = await controller.refreshRates({ user: { sub: 'admin-1', role: 'ADMIN', organizationId: ORG } } as any);
+    expect(out).toMatchObject({ status: 'live', asOf: '2026-10-16', rates: { USD: 1.1 } });
+    expect(out.error).toBeUndefined();
+    expect(settings.setJson).toHaveBeenCalledWith('rp.rates', expect.objectContaining({ updatedBy: 'admin-1' }));
   });
 });

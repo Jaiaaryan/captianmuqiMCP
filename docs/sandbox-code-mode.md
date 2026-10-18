@@ -134,6 +134,8 @@ once and every server that has the connectors it needs can offer it (see
 Names are lowercase, start with a letter and are 2 to 64 characters of `a-z`,
 `0-9`, `_` or `-`; a name is unique per organization.
 
+In the editor, `Tab` in an empty field (name, description, arguments, code) accepts its example; `Shift+Tab` and a field with text keep the usual `Tab`.
+
 A saved script runs with the authority of **whoever runs it**, not of whoever
 wrote it. To keep a user with fewer permissions from planting code that a more
 privileged user's agent then runs, only a script's author can edit it. Anyone
@@ -260,6 +262,26 @@ uses, with the tools in its tooltip, and a script the chosen server cannot run s
 which connector it lacks. **Filter** opens a pop-up with a checkbox per connector;
 after *Apply* only the scripts that use at least one ticked connector are listed.
 
+On *Benchmark*, three type-to-filter fields fill the form:
+
+- **Examples** lists ready questions for the chosen server. Four are offered only
+  when the server has the CODEBOUND mock tools they call: *Four rows from 400*
+  (price drift above 5 %, `mock_erp_list_articles` + `mock_supplier_get_prices`),
+  *Count a catalogue* (`mock_supplier_list_catalogue`, every page), *Stuck orders*
+  (`mock_erp_list_orders` + `mock_carrier_get_tracking`, 3 days before
+  `2026-10-16T12:00:00Z`) and *Ping* (`mock_erp_ping`). Every tool whose name reads
+  like a read (`list`, `get`, `search`, ...) gets a generic entry: the raw call with
+  its required arguments, against a script that returns the size of the answer.
+  Picking an entry fills the tool, both argument fields and the code; **Run** beside
+  it fills and runs in one click.
+- **Tool** picks the raw call by hand; the code becomes the generic script.
+- **Script** loads a saved script: its code, example values for its declared
+  parameters as script args, and, when it uses a read-only tool of the server, that
+  tool as the raw call. The result names the script.
+
+An empty argument field shows an example built from the tool's or the script's
+schema; **Tab** in the empty field takes it.
+
 The same operations are available over REST with the dashboard's JWT. All routes
 are under `/api/sandbox`, scoped to the caller's active organization; a server of
 another organization answers `404`, never `403`.
@@ -274,7 +296,7 @@ another organization answers `404`, never `403`.
 | `DELETE /scripts/:scriptId` | Delete. Its author or an ADMIN. Answers `204`. |
 | `GET /servers/:serverId/runs?limit=` | Recent runs. An ADMIN sees all of them; anyone else sees their own, because a run keeps a preview of what the connectors returned. |
 | `POST /servers/:serverId/isolation-tests` | Runs the fixed negative-test suite against the live sandbox with synthetic tools. Touches no connector. Needs ADMIN or EDITOR. |
-| `POST /servers/:serverId/benchmark` | Calls one read-only tool once, as a model would see it, and runs a script that answers the same question. Returns bytes, estimated tokens (bytes ÷ 4) and latency of both. Needs ADMIN or EDITOR. |
+| `POST /servers/:serverId/benchmark` | Calls one read-only tool (`toolName`, `toolArgs`) once, as a model would see it, and runs a script (`code`, optional `args`) that answers the same question. Returns bytes, estimated tokens (bytes ÷ 4) and latency of both. Needs ADMIN or EDITOR. |
 
 Closing the connection while a run is in flight cancels it: the isolate is
 disposed and the run ends as `CANCELLED`.

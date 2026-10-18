@@ -22,6 +22,7 @@ import { McpServersModule } from './mcp-servers/mcp-servers.module';
 import { SandboxApiModule } from './sandbox/sandbox-api.module';
 import { FlowModule } from './flow/flow.module';
 import { ResponseProcessingModule } from './response-processing/response-processing.module';
+import { DemoModule } from './demo/demo.module';
 import { LicenseModule } from './license/license.module';
 import { PrismaModule } from './common/prisma.module';
 import { RedisModule } from './common/redis.module';
@@ -176,6 +177,7 @@ if (useOAuth) {
     SandboxApiModule,
     FlowModule,
     ResponseProcessingModule,
+    DemoModule,
     LicenseModule,
     LicensingModule,
 

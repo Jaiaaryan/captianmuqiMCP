@@ -1,4 +1,4 @@
-import { chatJson, resolveLlmConfig } from './llm-client';
+import { chatJson, chatText, resolveLlmConfig } from './llm-client';
 
 const ENV_KEYS = [
   'KG_LLM_BASE_URL',
@@ -133,5 +133,43 @@ describe('chatJson', () => {
     await expect(
       chatJson({ provider: 'openai', model: 'gpt-4o-mini', apiKey: 'sk-x' }, 'sys', 'user'),
     ).rejects.toThrow();
+  });
+});
+
+describe('chatText', () => {
+  const realFetch = global.fetch;
+  afterEach(() => {
+    global.fetch = realFetch;
+  });
+
+  it('posts a plain chat completion to a custom base URL without JSON mode and returns the trimmed text', async () => {
+    const fetchMock = jest.fn().mockResolvedValue(
+      okJson({ choices: [{ message: { content: '  Fixed sentence.  ' } }], usage: { prompt_tokens: 5, completion_tokens: 2 } }),
+    );
+    global.fetch = fetchMock as any;
+    const out = await chatText({ provider: 'custom', model: 'stub', apiKey: '', baseUrl: 'http://127.0.0.1:9' }, 'sys', 'user', 300);
+    expect(out).toEqual({ text: 'Fixed sentence.', usage: { inputTokens: 5, outputTokens: 2 } });
+    const [url, init] = fetchMock.mock.calls[0];
+    expect(url).toBe('http://127.0.0.1:9/chat/completions');
+    const body = JSON.parse(init.body);
+    expect(body.response_format).toBeUndefined();
+    expect(body.max_tokens).toBe(300);
+    expect(body.messages[0]).toEqual({ role: 'system', content: 'sys' });
+    expect(init.headers.Authorization).toBeUndefined();
+  });
+
+  it('reads the text blocks of an Anthropic reply', async () => {
+    global.fetch = jest.fn().mockResolvedValue(
+      okJson({ content: [{ type: 'text', text: 'Hallo.' }], usage: { input_tokens: 3, output_tokens: 1 } }),
+    ) as any;
+    const out = await chatText({ provider: 'anthropic', model: 'claude-haiku-4-5', apiKey: 'k' }, 'sys', 'user');
+    expect(out.text).toBe('Hallo.');
+  });
+
+  it('throws the status only on a transport error, and on an empty reply', async () => {
+    global.fetch = jest.fn().mockResolvedValue({ ok: false, status: 401, text: async () => 'echo of the prompt' }) as any;
+    await expect(chatText({ provider: 'openai', model: 'm', apiKey: 'k' }, 's', 'u')).rejects.toThrow(/^LLM 401$/);
+    global.fetch = jest.fn().mockResolvedValue(okJson({ choices: [{ message: { content: ' ' } }] })) as any;
+    await expect(chatText({ provider: 'openai', model: 'm', apiKey: 'k' }, 's', 'u')).rejects.toThrow('LLM empty reply');
   });
 });

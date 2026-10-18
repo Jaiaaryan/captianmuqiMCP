@@ -1,9 +1,10 @@
 'use client';
 
 import { Suspense, useState, useEffect, useCallback, useRef } from 'react';
+import { flushSync } from 'react-dom';
 import Link from 'next/link';
 import { useRouter, useSearchParams } from 'next/navigation';
-import { ApiError, auth, license, server, sso, type SsoProviderButton, recoveryCodes as recoveryApi } from '@/lib/api';
+import { ApiError, auth, license, publicDemo, server, sso, type PublicDemo, type PublicDemoAccount, type SsoProviderButton, recoveryCodes as recoveryApi } from '@/lib/api';
 import { useAuth } from '@/lib/auth-context';
 import { useToast } from '@/components/toast';
 import { buildPricingUrl } from '@/lib/marketing';
@@ -27,6 +28,7 @@ import {
   savePromoCode,
   writeCardTrialPrompt,
 } from '@/lib/card-trial';
+import { DemoAccounts } from './demo-accounts';
 
 type SetupStep = 'auth' | 'verify-email' | 'check-inbox' | 'license-choice' | 'license-email-sent' | 'license-key' | 'trial-activated';
 
@@ -141,6 +143,14 @@ function LoginForm() {
       }
     }).catch(() => {}).finally(() => setInfoLoaded(true));
   }, [modeParam]);
+
+  // Demo instances list ready-made accounts under the form. Any failure (the
+  // endpoint missing on older backends included) leaves the page as it is.
+  const [demo, setDemo] = useState<PublicDemo | null>(null);
+  useEffect(() => {
+    publicDemo.get().then(setDemo).catch(() => {});
+  }, []);
+  const formRef = useRef<HTMLFormElement>(null);
 
   // Live trust numbers for the panel and the line under the card. Hidden
   // when the endpoint is unavailable.
@@ -352,6 +362,20 @@ function LoginForm() {
     } finally {
       setLoading(false);
     }
+  };
+
+  // A demo account's "Use": fill the form, then submit it through the same
+  // onSubmit (handleSubmit) a click on Sign In would. flushSync commits the
+  // fields first, so handleSubmit reads the demo credentials, not stale state.
+  const signInWithDemo = (account: PublicDemoAccount) => {
+    flushSync(() => {
+      setIsRegister(false);
+      setRecoveryMode(false);
+      setError('');
+      setEmail(account.email);
+      setPassword(account.password);
+    });
+    formRef.current?.requestSubmit();
   };
 
   const handleVerifyCode = async () => {
@@ -916,6 +940,7 @@ function LoginForm() {
       )}
 
       <form
+        ref={formRef}
         className={`space-y-4${ssoExchanging ? ' hidden' : ''}`}
         onSubmit={handleSubmit}
       >
@@ -1114,6 +1139,10 @@ function LoginForm() {
             {isRegister ? 'Sign In' : 'Register'}
           </button>
         </p>
+      )}
+
+      {demo?.enabled && Array.isArray(demo.accounts) && infoLoaded && !isCloudMode && !ssoExchanging && (
+        <DemoAccounts accounts={demo.accounts} mcp={demo.mcp ?? { A: '', B: '' }} disabled={loading} onUse={signInWithDemo} />
       )}
     </Card>
   );

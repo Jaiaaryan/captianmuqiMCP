@@ -12,6 +12,7 @@ import {
   ForbiddenException,
   BadRequestException,
   ConflictException,
+  Logger,
 } from '@nestjs/common';
 import { ApiTags, ApiOperation, ApiBearerAuth, ApiProperty, ApiPropertyOptional } from '@nestjs/swagger';
 import { AuthGuard } from '@nestjs/passport';
@@ -40,6 +41,7 @@ import {
 import { validateDecode } from './mime-decode.util';
 import { validateImages } from './response-images.util';
 import { validateChain } from '../response-processing/chain';
+import { boundPayload } from '../audit/bound-payload';
 import {
   ToolAnnotations,
   deriveToolAnnotations,
@@ -255,7 +257,21 @@ class TestToolDto {
   @IsOptional()
   @IsObject()
   transform?: Record<string, unknown>;
+
+  @ApiPropertyOptional({
+    description:
+      'Store the raw response of a successful run as the tool\'s most recent ' +
+      'sample (a successful invocation row), the one the Response Processing ' +
+      'editor and the mapping preview read. Off by default: a plain test leaves ' +
+      'no trace.',
+  })
+  @IsOptional()
+  @IsBoolean()
+  recordSample?: boolean;
 }
+
+/** Same bound as the sample the Response Processing editor is given (64 KB). */
+const RECORDED_SAMPLE_BYTES = 64 * 1024;
 
 class SetResponseMappingDto {
   @ApiPropertyOptional({
@@ -299,6 +315,8 @@ class PreviewMappingDto {
 @UseGuards(AuthGuard('jwt'))
 @Controller('api/connectors/:connectorId/tools')
 export class ToolsController {
+  private readonly logger = new Logger(ToolsController.name);
+
   constructor(
     private readonly prisma: PrismaService,
     private readonly mcpServer: McpServerService,
@@ -925,6 +943,35 @@ export class ToolsController {
     return this.prisma.mcpTool.findUnique({ where: { id: toolId } });
   }
 
+  /** A successful editor run, kept as the tool's latest recorded response. */
+  private async recordSample(
+    tool: { id: string; connectorId: string },
+    req: any,
+    inputs: Record<string, unknown>,
+    result: unknown,
+    durationMs: number,
+  ): Promise<boolean> {
+    try {
+      await this.prisma.toolInvocation.create({
+        data: {
+          toolId: tool.id,
+          userId: req.user?.sub ?? null,
+          organizationId: req.user?.organizationId ?? null,
+          connectorId: tool.connectorId,
+          input: boundPayload(inputs, { maxBytes: 8 * 1024 }) as any,
+          output: boundPayload(result ?? null, { maxBytes: RECORDED_SAMPLE_BYTES }) as any,
+          status: 'SUCCESS',
+          durationMs,
+          clientInfo: JSON.stringify({ authMethod: 'editor', source: 'response-processing-sample' }),
+        },
+      });
+      return true;
+    } catch (err: any) {
+      this.logger.warn(`recordSample for tool ${tool.id} failed: ${err?.message ?? err}`);
+      return false;
+    }
+  }
+
   @Post(':toolId/test')
   @ApiOperation({
     summary: 'Test an MCP tool with sample parameters',
@@ -1005,12 +1052,21 @@ export class ToolsController {
           /* schema inference is best-effort */
         }
       }
+      // Stored exactly where real calls leave their response (a SUCCESS
+      // ToolInvocation with the raw upstream `output`), so the sample lookups
+      // (findLatestSample here and in ResponseProcessingService) pick it up.
+      // Best-effort: a failed write never fails the test.
+      let sampleRecorded: boolean | undefined;
+      if (body.recordSample === true) {
+        sampleRecorded = await this.recordSample(tool, req, inputs, result, durationMs);
+      }
       return {
         ok: true,
         durationMs,
         result,
         ...summary,
         ...withNote,
+        ...(sampleRecorded !== undefined ? { sampleRecorded } : {}),
       };
     } catch (err: any) {
       const durationMs = Date.now() - startTime;

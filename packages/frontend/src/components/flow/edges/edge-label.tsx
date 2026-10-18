@@ -22,7 +22,7 @@ function EdgeLabelBase({ x, y, stats }: Props) {
     <EdgeLabelRenderer>
       <span
         style={{ transform: `translate(-50%, -50%) translate(${x}px, ${y}px)` }}
-        className="nodrag nopan pointer-events-none absolute inline-flex items-center gap-1.5 whitespace-nowrap bg-[var(--surface)] px-1.5 font-mono text-[11px] leading-[16px] tabular-nums text-[var(--text-2)]"
+        className="nodrag nopan pointer-events-none absolute inline-flex items-center gap-1.5 whitespace-nowrap bg-[var(--surface)] px-1.5 rounded-md font-mono text-[14px] leading-[18px] tabular-nums text-[var(--text-2)]"
       >
         <span>
           {formatCount(stats.calls)}

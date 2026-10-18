@@ -23,6 +23,55 @@ describe('roundHalfAwayFromZero', () => {
   });
 });
 
+describe('currency@1', () => {
+  it('multiplies by the rate and always rounds to 2 decimals', () => {
+    expect(runBuiltin('currency@1', 54.67, { rate: 0.92 })).toBe(50.3);
+    expect(runBuiltin('currency@1', 3, { rate: 0.1 })).toBe(0.3);
+    expect(runBuiltin('currency@1', 1.005, { rate: 1 })).toBe(1.01);
+    expect(runBuiltin('currency@1', -0.005, { rate: 1 })).toBe(-0.01);
+  });
+  it('refuses a non-number', () => {
+    expect(() => runBuiltin('currency@1', '54', { rate: 2 })).toThrow('is not a number');
+    expect(() => runBuiltin('currency@1', null, { rate: 2 })).toThrow(BuiltinError);
+  });
+  it('takes a rate greater than 0, or from and to', () => {
+    expect(validateBuiltinParams('currency@1', { rate: 0.92 })).toBeNull();
+    expect(validateBuiltinParams('currency@1', { from: 'USD', to: 'EUR' })).toBeNull();
+    expect(validateBuiltinParams('currency@1', { from: 'USD', to: 'EUR', rate: 0.9 })).toBeNull();
+    const either = 'params.rate, or params.from and params.to is required';
+    expect(validateBuiltinParams('currency@1', {})).toBe(either);
+    expect(validateBuiltinParams('currency@1', undefined)).toBe(either);
+    expect(validateBuiltinParams('currency@1', { from: 'USD' })).toBe(either);
+    expect(validateBuiltinParams('currency@1', { rate: '0.92' })).toMatch(/must be a number/);
+    expect(validateBuiltinParams('currency@1', { rate: 0 })).toBe('params.rate must be a number greater than 0');
+    expect(validateBuiltinParams('currency@1', { rate: -1 })).toBe('params.rate must be a number greater than 0');
+    expect(validateBuiltinParams('currency@1', { rate: 1, round: 2 })).toMatch(
+      /unknown param "round" \(currency@1 accepts: rate, from, to\)/,
+    );
+  });
+  it('wants upper-case 3-letter currency codes', () => {
+    for (const bad of ['usd', 'US', 'USDT', 'U$D', 1]) {
+      expect(validateBuiltinParams('currency@1', { from: bad, to: 'EUR' })).toMatch(/^params\.from must be/);
+    }
+    expect(validateBuiltinParams('currency@1', { from: 'USD', to: 'eur' })).toBe(
+      'params.to must be a currency code (3 upper-case letters, e.g. USD)',
+    );
+  });
+  it('refuses to run without a rate (the chain resolves from/to first)', () => {
+    expect(() => runBuiltin('currency@1', 10, { from: 'USD', to: 'EUR' })).toThrow('has no rate');
+  });
+  it('is listed as Currency with rate, from and to', () => {
+    const c = describeBuiltins().find((b) => b.use === 'currency@1');
+    expect(c?.title).toBe('Currency');
+    expect(c?.params).toEqual([
+      { name: 'rate', type: 'number', exclusiveMin: 0 },
+      { name: 'from', type: 'string', pattern: '^[A-Z]{3}$', default: 'USD' },
+      { name: 'to', type: 'string', pattern: '^[A-Z]{3}$', default: 'EUR' },
+    ]);
+    expect(c?.requiresOneOf).toEqual([['rate'], ['from', 'to']]);
+  });
+});
+
 describe('scale@1', () => {
   it('multiplies, optionally rounding', () => {
     expect(runBuiltin('scale@1', 54.67, { factor: 0.92, round: 2 })).toBe(50.3);
@@ -160,9 +209,10 @@ describe('map@1', () => {
 });
 
 describe('registry', () => {
-  it('describes the seven built-ins with contracts', () => {
+  it('describes the eight built-ins with contracts', () => {
     const all = describeBuiltins();
     expect(all.map((b) => b.use)).toEqual([
+      'currency@1',
       'scale@1',
       'offset@1',
       'vat@1',
@@ -180,5 +230,43 @@ describe('registry', () => {
   it('rejects an unknown processor', () => {
     expect(validateBuiltinParams('nope@1', {})).toMatch(/unknown processor/);
     expect(() => runBuiltin('nope@1', 1)).toThrow(BuiltinError);
+  });
+});
+
+describe('numeric built-ins over an array or object of numbers', () => {
+  it('map the values one level deep and keep the shape', () => {
+    expect(runBuiltin('currency@1', [10, 54.67], { rate: 0.92 })).toEqual([9.2, 50.3]);
+    expect(runBuiltin('currency@1', { 'A-1': 10, B: 2.5 }, { rate: 1.1 })).toEqual({ 'A-1': 11, B: 2.75 });
+    expect(runBuiltin('scale@1', [1, 2], { factor: 3 })).toEqual([3, 6]);
+    expect(runBuiltin('offset@1', { a: 1 }, { amount: 0.5 })).toEqual({ a: 1.5 });
+    expect(runBuiltin('vat@1', [100], { rate: 0.19, round: 2 })).toEqual([119]);
+    expect(runBuiltin('round@1', { a: 1.005, b: -2.5 }, { decimals: 0 })).toEqual({ a: 1, b: -3 });
+    expect(runBuiltin('scale@1', [], { factor: 2 })).toEqual([]);
+    expect(runBuiltin('scale@1', {}, { factor: 2 })).toEqual({});
+  });
+  it('keeps a __proto__ key as a plain key', () => {
+    const out = runBuiltin('scale@1', JSON.parse('{"__proto__": 2}'), { factor: 2 }) as object;
+    expect(Object.getOwnPropertyNames(out)).toEqual(['__proto__']);
+    expect(Object.getPrototypeOf(out)).toBe(Object.prototype);
+  });
+  it('fails on a non-number entry, nested collections included, naming its key', () => {
+    const refusal = (value: unknown, use = 'currency@1', params: unknown = { rate: 1 }) => {
+      try {
+        runBuiltin(use, value, params);
+      } catch (err) {
+        return { message: (err as BuiltinError).message, key: (err as BuiltinError).key };
+      }
+      throw new Error('expected a refusal');
+    };
+    expect(refusal({ ok: 1, 'A-10339': 'n/a' })).toEqual({ message: 'is not a number', key: 'A-10339' });
+    expect(refusal([1, 2, 3, [4]])).toEqual({ message: 'is not a number', key: 3 });
+    expect(refusal({ a: { b: 1 } })).toEqual({ message: 'is not a number', key: 'a' });
+    expect(refusal([1e308], 'scale@1', { factor: 1e308 })).toEqual({ message: 'produced a number that is not finite', key: 0 });
+    expect(refusal('54')).toEqual({ message: 'is not a number', key: undefined });
+  });
+  it('leaves the string and map built-ins as they are', () => {
+    expect(() => runBuiltin('clean_text@1', ['a'])).toThrow('is not a string');
+    expect(() => runBuiltin('truncate@1', { a: 'x' }, { maxLength: 3 })).toThrow('is not a string');
+    expect(runBuiltin('map@1', [1], { map: { '[1]': 'one' } })).toBe('one');
   });
 });

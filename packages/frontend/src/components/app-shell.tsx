@@ -30,6 +30,11 @@ interface AppShellProps {
   maxWidth?: number | string;
   /** Hide the footer (e.g. for full-bleed graph pages). */
   hideFooter?: boolean;
+  /**
+   * Edge to edge: no content padding and no footer spacing, the content fills
+   * the area under the header (canvas pages such as /flow).
+   */
+  flush?: boolean;
   children: React.ReactNode;
 }
 
@@ -74,6 +79,7 @@ export function AppShell({
   actions,
   maxWidth = 1180,
   hideFooter = false,
+  flush = false,
   children,
 }: AppShellProps) {
   const [mobileOpen, setMobileOpen] = useState(false);
@@ -153,11 +159,14 @@ export function AppShell({
             they don't anchor to the document and inflate its scroll height,
             which would let the whole page scroll behind the fixed sidebar. */}
         <main className="relative flex flex-1 flex-col overflow-y-auto">
-          <div className={cn('mx-auto w-full flex-1 p-4 sm:p-6')} style={{ maxWidth }}>
+          <div
+            className={cn('mx-auto w-full flex-1', flush ? 'flex min-h-0 flex-col' : 'p-4 sm:p-6')}
+            style={{ maxWidth }}
+          >
             {children}
           </div>
           {!hideFooter && (
-            <div className="mx-auto mt-10 w-full px-4 pb-4 sm:px-6" style={{ maxWidth }}>
+            <div className={cn('mx-auto w-full', !flush && 'mt-10 px-4 pb-4 sm:px-6')} style={{ maxWidth }}>
               <Footer />
             </div>
           )}

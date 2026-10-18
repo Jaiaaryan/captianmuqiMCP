@@ -718,6 +718,8 @@ export interface ToolTestResult extends MappingSummary {
   note?: string;
   hint?: string;
   kind?: string;
+  /** With `recordSample`: whether the response was stored as the tool's latest sample. */
+  sampleRecorded?: boolean;
 }
 
 export const tools = {
@@ -791,13 +793,181 @@ export const tools = {
     params: Record<string, unknown>,
     token: string,
     transform?: ResponseTransform | null,
+    options: { recordSample?: boolean } = {},
   ) =>
     request<ToolTestResult>(`/api/connectors/${connectorId}/tools/${toolId}/test`, {
       method: 'POST',
       // MCP-standard field name; `params` is still sent for older backends.
-      body: { arguments: params, params, ...(transform ? { transform } : {}) },
+      body: {
+        arguments: params,
+        params,
+        ...(transform ? { transform } : {}),
+        ...(options.recordSample ? { recordSample: true } : {}),
+      },
       token,
     }),
+};
+
+/* ------------------------------------------------------------------ */
+/*  Response processing (per-tool step chain)                          */
+/* ------------------------------------------------------------------ */
+
+export type ResponseProcessingUse =
+  | 'currency@1'
+  | 'scale@1'
+  | 'offset@1'
+  | 'vat@1'
+  | 'round@1'
+  | 'clean_text@1'
+  | 'truncate@1'
+  | 'map@1'
+  | 'script@1';
+
+export type ResponseProcessingMode = 'add' | 'replace' | 'upsert';
+
+/** Built-ins only: `script@1` cannot be part of a pipe. */
+export type ResponseProcessingBuiltinUse = Exclude<ResponseProcessingUse, 'script@1'>;
+
+export interface ResponseProcessingStep {
+  id: string;
+  /** One processor, or a pipe of built-ins applied in order (`params` then aligned by index). */
+  use: ResponseProcessingUse | ResponseProcessingBuiltinUse[];
+  /** Path of the array whose elements the step runs on; empty = the response itself. */
+  each?: string;
+  reads: string;
+  writes: string;
+  mode: ResponseProcessingMode;
+  onMissing?: 'fail' | 'skip';
+  params?: Record<string, unknown> | Record<string, unknown>[];
+  /** script@1 only. */
+  code?: string;
+}
+
+export interface ResponseProcessingChain {
+  version: 1;
+  enabled: boolean;
+  onError: 'fail' | 'passthrough';
+  steps: ResponseProcessingStep[];
+}
+
+export interface ResponseProcessingParam {
+  name: string;
+  type: 'number' | 'integer' | 'string' | 'boolean' | 'object' | 'any';
+  required?: boolean;
+  default?: unknown;
+  min?: number;
+  max?: number;
+  /** Strict lower bound (`rate` of currency@1: greater than 0). */
+  exclusiveMin?: number;
+  /** A string param must match this RegExp source (`from`/`to` of currency@1: `^[A-Z]{3}$`). */
+  pattern?: string;
+}
+
+export interface ResponseProcessingBuiltin {
+  name: string;
+  version?: number | string;
+  title: string;
+  input?: string;
+  output?: string;
+  params: ResponseProcessingParam[];
+  /** At least one of these param sets in full (currency@1: `[['rate'], ['from', 'to']]`). */
+  requiresOneOf?: string[][];
+}
+
+/** The exchange-rate table currency@1 looks up `from → to` in (base EUR, units per 1 EUR). */
+export interface ResponseProcessingRates {
+  base: string;
+  asOf: string;
+  source: string;
+  /** Base first, then alphabetical. */
+  currencies: string[];
+  rates: Record<string, number>;
+  /** `live`: fetched by the backend; `cached`: the last stored fetch; `snapshot`: shipped with the code. */
+  status: 'live' | 'cached' | 'snapshot';
+  /** The backend refreshes the table by itself (`RP_RATES_AUTO`). */
+  auto: boolean;
+  fetchedAt?: string;
+  nextRefreshAt?: string;
+  /** Last fetch failure: `timeout`, `http_503`, `parse`, `network`, `too_large`, `redirect`, `url`, `disabled`. */
+  error?: string;
+}
+
+export interface ResponseProcessingBuiltins {
+  builtins: ResponseProcessingBuiltin[];
+  modes: string[];
+  limits: {
+    maxSteps: number;
+    script: { timeoutMs: number; memoryMb: number; maxCodeBytes: number; maxResultBytes: number };
+  };
+}
+
+export type ResponseProcessingValidation = { valid: true } | { valid: false; problem: string };
+
+export interface ResponseProcessingStepReport {
+  id: string;
+  wrote: number;
+  skipped: number;
+  bytes: number;
+  sample?: unknown;
+}
+
+export interface ResponseProcessingDryRun {
+  ok: boolean;
+  result?: unknown;
+  steps?: ResponseProcessingStepReport[];
+  error?: string;
+  failedStep?: string;
+  failedPath?: string;
+}
+
+export interface ResponseProcessingPreview extends ResponseProcessingDryRun {
+  sampleSource?: 'request' | 'recorded';
+}
+
+export const responseProcessing = {
+  builtins: (token: string) =>
+    request<ResponseProcessingBuiltins>('/api/response-processing/builtins', { token }),
+  validate: (chain: ResponseProcessingChain, token: string) =>
+    request<ResponseProcessingValidation>('/api/response-processing/validate', {
+      method: 'POST',
+      body: { chain },
+      token,
+    }),
+  dryRun: (chain: ResponseProcessingChain, sample: unknown, token: string) =>
+    request<ResponseProcessingDryRun>('/api/response-processing/dry-run', {
+      method: 'POST',
+      body: { chain, sample },
+      token,
+    }),
+  forTool: (toolId: string, token: string) =>
+    request<{
+      chain: ResponseProcessingChain | null;
+      sampleAvailable: boolean;
+      sampleCapturedAt?: string | null;
+      /** The recorded response, cut to ≤ 64 KB, depth ≤ 8, arrays to 3 elements. */
+      sample?: unknown;
+      sampleTruncated?: boolean;
+      /** Uncut array lengths by path (`$.items` -> 30). */
+      sampleLengths?: Record<string, number>;
+      /** Arguments of the recorded call. */
+      sampleInput?: Record<string, unknown>;
+    }>(`/api/response-processing/tools/${toolId}`, { token }),
+  preview: (
+    toolId: string,
+    body: { chain?: ResponseProcessingChain; sample?: unknown },
+    token: string,
+  ) =>
+    request<ResponseProcessingPreview>(`/api/response-processing/tools/${toolId}/preview`, {
+      method: 'POST',
+      body,
+      token,
+    }),
+  rates: {
+    get: (token: string) => request<ResponseProcessingRates>('/api/response-processing/rates', { token }),
+    /** ADMIN, 2 per minute. A failed fetch answers 200 with `error`. */
+    refresh: (token: string) =>
+      request<ResponseProcessingRates>('/api/response-processing/rates/refresh', { method: 'POST', token }),
+  },
 };
 
 // Audit
@@ -1056,6 +1226,72 @@ export interface PublicStats {
 
 export const publicStats = {
   get: () => request<PublicStats>('/api/public/stats'),
+};
+
+// Demo instance: the sign-in page lists ready-made accounts when enabled.
+export interface PublicDemoAccount {
+  email: string;
+  password: string;
+  name: string;
+  role: 'ADMIN' | 'VIEWER';
+  /** MCP roles in the workspace (e.g. `Staff`); empty for none. */
+  mcpRoles: string[];
+  workspace: 'A' | 'B';
+  workspaceName: string;
+}
+
+export type PublicDemo =
+  | { enabled: false }
+  | { enabled: true; accounts: PublicDemoAccount[]; mcp: { A: string; B: string } };
+
+export const publicDemo = {
+  get: () => request<PublicDemo>('/api/public/demo'),
+};
+
+// Demo instance, signed in: the demo control's status and the one-click reset.
+export interface DemoStatus {
+  enabled: true;
+  lastResetAt: string | null;
+  mock: { port: number | null; requests: number };
+  workspaces: Array<{ id: string; name: string; letter: 'A' | 'B'; serverId: string | null }>;
+  accounts: Array<PublicDemoAccount & { mcpRoles?: string[]; workspaceName?: string }>;
+  currentWorkspace: 'A' | 'B' | null;
+}
+
+export interface DemoResetResult {
+  ok: true;
+  reset: {
+    runs: number;
+    invocations: number;
+    refusals: number;
+    securityEvents?: number;
+    scriptsRemoved: number;
+    scriptsRestored: number;
+    chainsRestored: number;
+    membershipsRemoved?: number;
+    mockRequests?: number;
+  };
+  at: string;
+}
+
+/** The demo control (pill): the runtime demo-mode switch, for any signed-in user. */
+export interface DemoControl {
+  /** False on Cloud: no demo mode, nothing to render. */
+  available: boolean;
+  enabled: boolean;
+  /** ADMIN of any workspace. */
+  canToggle: boolean;
+  /** ADMIN of a demo workspace, while demo mode is on. */
+  canReset: boolean;
+  status?: DemoStatus;
+}
+
+export const demo = {
+  control: (token: string) => request<DemoControl>('/api/demo/control', { token }),
+  setEnabled: (token: string, enabled: boolean) =>
+    request<DemoControl>('/api/demo/control', { method: 'PUT', token, body: { enabled } }),
+  status: (token: string) => request<DemoStatus>('/api/demo/status', { token }),
+  reset: (token: string) => request<DemoResetResult>('/api/demo/reset', { method: 'POST', token }),
 };
 
 // Site Settings
@@ -1559,23 +1795,6 @@ export interface SandboxRunResponse {
 }
 
 /** One connector a saved script uses, and the tools of it the script calls. */
-/** One argument a saved script reads (`args.<name>`), as the script's tool declares it. */
-export interface SandboxParameter {
-  type: 'string' | 'number' | 'integer' | 'boolean' | 'array' | 'object';
-  description?: string;
-  enum?: (string | number | boolean)[];
-  items?: { type: 'string' | 'number' | 'integer' | 'boolean' };
-  /** Keep this parameter although the code no longer reads it. */
-  'x-keep'?: boolean;
-}
-
-/** The arguments of a saved script as a JSON Schema object. A script that has them is also an MCP tool. */
-export interface SandboxParametersSchema {
-  type: 'object';
-  properties: Record<string, SandboxParameter>;
-  required: string[];
-}
-
 export interface SandboxScriptUse {
   connectorId: string;
   /** The connector's current name, or the name it had when the script was saved. */
@@ -1583,6 +1802,29 @@ export interface SandboxScriptUse {
   /** False once the connector has been deleted: the script still needs it. */
   connectorExists: boolean;
   tools: string[];
+}
+
+/** One argument a saved script reads (`args.<name>`), as an MCP tool parameter. */
+export interface SandboxParameter {
+  type: 'string' | 'number' | 'integer' | 'boolean' | 'array' | 'object';
+  description?: string;
+  enum?: (string | number | boolean)[];
+  items?: { type: 'string' | 'number' | 'integer' | 'boolean' };
+  /** Keep the parameter although the code no longer reads it. */
+  'x-keep'?: boolean;
+}
+
+/** The arguments a saved script reads, as a JSON Schema object. A script that has one is also an MCP tool. */
+export interface SandboxParametersSchema {
+  type: 'object';
+  properties: Record<string, SandboxParameter>;
+  required: string[];
+}
+
+/** Level 3 capabilities of a saved script. See docs/sandbox-code-mode.md "Level 3". */
+export interface SandboxCapabilities {
+  env?: boolean;
+  http?: boolean;
 }
 
 export interface SandboxScriptSummary {
@@ -1600,6 +1842,14 @@ export interface SandboxScriptSummary {
    */
   availableOnServer?: boolean;
   missingConnectors?: { id: string; name: string }[];
+  /** The arguments the script reads, or null: no tool of its own. */
+  parameters: SandboxParametersSchema | null;
+  /** Level 3 capabilities (author-only): connector variables, outbound HTTP. */
+  capabilities?: SandboxCapabilities | null;
+  /** The argument names the code reads right now. */
+  inferredParameters: string[];
+  /** Whether the server the list was asked about offers the script as a tool of its own name. Only the list has it. */
+  exposedAsTool?: boolean;
   lastRunAt: string | null;
   lastRunOk: boolean | null;
   lastRunMeta: { ms?: number; connectorCalls?: number; bytesFromConnectors?: number; bytesReturned?: number } | null;
@@ -1681,13 +1931,25 @@ export const sandbox = {
     request<SandboxScript>(`/api/sandbox/scripts/${id}`, { token }),
   createScript: (
     serverId: string,
-    data: { name: string; code: string; description?: string; uses?: SandboxScriptUseInput[] },
+    data: {
+      name: string;
+      code: string;
+      description?: string;
+      uses?: SandboxScriptUseInput[];
+      parameters?: SandboxParametersSchema | null;
+    },
     token: string,
   ) =>
     request<SandboxScript & { syntax: SandboxSyntax } & SandboxSaveNotes>(`/api/sandbox/servers/${serverId}/scripts`, { method: 'POST', body: data, token }),
   updateScript: (
     id: string,
-    data: { code?: string; description?: string; uses?: SandboxScriptUseInput[] },
+    data: {
+      code?: string;
+      description?: string;
+      uses?: SandboxScriptUseInput[];
+      parameters?: SandboxParametersSchema | null;
+      capabilities?: SandboxCapabilities | null;
+    },
     token: string,
   ) =>
     request<SandboxScript & { syntax: SandboxSyntax } & SandboxSaveNotes>(`/api/sandbox/scripts/${id}`, { method: 'PATCH', body: data, token }),
@@ -1707,4 +1969,30 @@ export const sandbox = {
     data: { toolName: string; toolArgs?: Record<string, unknown>; code: string; args?: Record<string, unknown> },
     token: string,
   ) => request<SandboxBenchmark>(`/api/sandbox/servers/${serverId}/benchmark`, { method: 'POST', body: data, token }),
+};
+
+// ── Flow (/flow) ────────────────────────────────────────────────────────────
+// The graph itself is fetched by components/flow/use-flow-graph.ts.
+
+export interface FlowAskAnswer {
+  answer: string;
+  model: string;
+  usage?: { inputTokens?: number; outputTokens?: number };
+}
+
+export const flowApi = {
+  /** Replay events of a window; `serverId` left out = every server. */
+  events: (token: string, params: { serverId?: string; since: string; until?: string; limit?: number }) => {
+    const qs = new URLSearchParams({ since: params.since });
+    if (params.serverId) qs.set('serverId', params.serverId);
+    if (params.until) qs.set('until', params.until);
+    if (params.limit) qs.set('limit', String(params.limit));
+    return request<import('@/components/flow/types').FlowEvents>(`/api/flow/events?${qs.toString()}`, { token });
+  },
+  askStatus: (token: string) => request<{ enabled: boolean; model?: string }>('/api/flow/ask', { token }),
+  /** 409 `{ code: 'LLM_OFF' }` when the workspace has no LLM. */
+  ask: (
+    token: string,
+    body: { serverId: string | null; window: '1h' | '24h' | '7d'; nodeId?: string; question: string },
+  ) => request<FlowAskAnswer>('/api/flow/ask', { method: 'POST', body, token }),
 };

@@ -1,9 +1,8 @@
-import type { ReactNode } from 'react';
+import { cn } from '@/lib/utils';
 
-/** A keyboard key, as in a shortcut hint. */
-export function Kbd({ children }: { children: ReactNode }) {
+export function Kbd({ children, className }: { children: React.ReactNode; className?: string }) {
   return (
-    <kbd className="inline-flex h-4 min-w-4 items-center justify-center rounded-[4px] border border-[var(--border)] bg-[var(--surface-2)] px-1 font-mono text-[10.5px] leading-none text-[var(--text-3)]">
+    <kbd className={cn('inline-flex items-center font-mono text-[11px] leading-none text-[var(--text-3)]', className)}>
       {children}
     </kbd>
   );

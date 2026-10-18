@@ -8,12 +8,12 @@ import type { FlowNode, FlowNodeKind } from '../types';
 import { formatBytes, formatCount } from '../flow-format';
 
 export const NODE_SIZE: Record<FlowNodeKind, { width: number; height: number }> = {
-  agent: { width: 140, height: 44 },
-  server: { width: 180, height: 52 },
+  agent: { width: 140, height: 48 },
+  server: { width: 200, height: 56 },
   connector: { width: 240, height: 56 },
   tool: { width: 240, height: 56 },
-  processing: { width: 240, height: 52 },
-  mapping: { width: 240, height: 52 },
+  processing: { width: 240, height: 56 },
+  mapping: { width: 240, height: 56 },
   script: { width: 240, height: 56 },
 };
 
@@ -95,7 +95,7 @@ export function BaseNode({ node, icon: KindIcon, selected, codes = [], stats }: 
       data-selected={selected ? 'true' : undefined}
       onKeyDown={onKeyDown}
       style={{ width, height }}
-      className={`flex cursor-pointer flex-col justify-center gap-0.5 bg-[var(--surface)] px-2.5 text-[var(--text)] outline-none hover:bg-[var(--surface-2)] focus-visible:bg-[var(--surface-2)] focus-visible:outline-1! focus-visible:outline-offset-0! focus-visible:outline-[var(--text)]! ${
+      className={`flex cursor-pointer flex-col justify-center gap-0.5 rounded-md bg-[var(--surface)] px-2.5 text-[var(--text)] outline-none hover:bg-[var(--surface-2)] focus-visible:bg-[var(--surface-2)] focus-visible:outline-1! focus-visible:outline-offset-0! focus-visible:outline-[var(--text)]! ${
         selected ? 'outline outline-1 outline-offset-0 outline-[var(--text)]' : ''
       }`}
     >
@@ -103,7 +103,7 @@ export function BaseNode({ node, icon: KindIcon, selected, codes = [], stats }: 
       <div className="flex min-w-0 items-start gap-1.5">
         <Icon as={KindIcon} className="mt-px text-[var(--text-2)]" />
         <span
-          className="line-clamp-2 min-w-0 flex-1 text-[12.5px] font-medium leading-4 break-words"
+          className="line-clamp-2 min-w-0 flex-1 text-[14px] font-medium leading-[17px] break-words"
           title={node.label}
         >
           {node.label}
@@ -120,7 +120,7 @@ export function BaseNode({ node, icon: KindIcon, selected, codes = [], stats }: 
 
 function Chips({ chips }: { chips: NodeChip[] }): ReactNode {
   return (
-    <span className="flex shrink-0 items-center gap-1.5 whitespace-nowrap font-mono text-[11.5px] leading-4 tabular-nums">
+    <span className="flex shrink-0 items-center gap-1.5 whitespace-nowrap font-mono text-[14px] leading-[17px] tabular-nums">
       {chips.map((chip, i) => (
         <span
           key={`${i}-${chip.text}`}

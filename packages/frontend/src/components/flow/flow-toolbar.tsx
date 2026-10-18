@@ -1,24 +1,25 @@
 'use client';
 
-import { ChevronDown, Clock, Maximize2, Server } from 'lucide-react';
+import { ChevronDown, Clock, Layers, Maximize2, Server } from 'lucide-react';
 import { AppSelect } from '@/components/ui/select';
-import { StatusChip } from '@/components/tool-editor/status-chip';
 import { Kbd } from '@/components/tool-editor/kbd';
 import { Icon } from '@/components/tool-editor/icon';
 import type { FlowWindow } from './types';
+import { ALL_SERVERS } from './use-flow-graph';
 
 const WINDOWS: FlowWindow[] = ['1h', '24h', '7d'];
 
 const TRIGGER =
-  'inline-flex h-8 items-center gap-1.5 border-0 bg-transparent px-2 text-[12.5px] text-[var(--text)] outline-none hover:bg-[var(--surface-2)] focus-visible:bg-[var(--surface-2)] data-[state=open]:bg-[var(--surface-2)] disabled:text-[var(--text-3)] focus-visible:outline-none!';
+  'inline-flex h-8 items-center gap-1.5 rounded-md border-0 bg-transparent px-2 text-[14px] text-[var(--text)] outline-none hover:bg-[var(--surface-2)] focus-visible:bg-[var(--surface-2)] data-[state=open]:bg-[var(--surface-2)] disabled:text-[var(--text-3)] focus-visible:outline-none!';
 const CONTENT =
   'z-50 min-w-[var(--radix-select-trigger-width)] max-h-72 overflow-auto bg-[var(--surface)] py-1 shadow-[var(--shadow)] focus-visible:outline-none! [&_*:focus-visible]:outline-none!';
 const ITEM =
-  'flex cursor-pointer select-none items-center px-2.5 py-1.5 text-[12.5px] text-[var(--text)] outline-none data-[highlighted]:bg-[var(--surface-2)] data-[state=checked]:font-medium';
+  'flex cursor-pointer select-none items-center px-2.5 py-1.5 text-[14px] text-[var(--text)] outline-none data-[highlighted]:bg-[var(--surface-2)] data-[state=checked]:font-medium';
 const CHEVRON = <Icon as={ChevronDown} className="text-[var(--text-3)]" />;
 
 interface Props {
   servers: { id: string; name: string }[];
+  /** A server id, or `all`. */
   serverId: string;
   onServerChange: (id: string) => void;
   window: FlowWindow;
@@ -36,12 +37,14 @@ export function FlowToolbar({ servers, serverId, onServerChange, window: win, on
           aria-label="Server"
           value={serverId}
           onValueChange={onServerChange}
-          disabled={servers.length === 0}
           className={`${TRIGGER} min-w-[140px] max-w-[240px] justify-between`}
           chevron={CHEVRON}
           contentClassName={CONTENT}
           itemClassName={ITEM}
-          options={servers.map((s) => ({ value: s.id, label: s.name, icon: <Icon as={Server} /> }))}
+          options={[
+            { value: ALL_SERVERS, label: `All servers · ${servers.length}`, icon: <Icon as={Layers} />, testId: 'flow-server-all' },
+            ...servers.map((s) => ({ value: s.id, label: s.name, icon: <Icon as={Server} />, testId: `flow-server-${s.id}` })),
+          ]}
         />
       </div>
       <AppSelect
@@ -59,15 +62,19 @@ export function FlowToolbar({ servers, serverId, onServerChange, window: win, on
         type="button"
         data-testid="flow-fit"
         onClick={onFit}
-        className="inline-flex h-8 items-center gap-1.5 px-2 text-[12.5px] text-[var(--text)] outline-none hover:bg-[var(--surface-2)] focus-visible:bg-[var(--surface-2)] focus-visible:outline-none!"
+        className="inline-flex h-8 items-center gap-1.5 rounded-md px-2 text-[14px] text-[var(--text)] outline-none hover:bg-[var(--surface-2)] focus-visible:bg-[var(--surface-2)] focus-visible:outline-none!"
       >
         <Icon as={Maximize2} />
         Fit
-        <Kbd>f</Kbd>
+        <Kbd className="text-[14px]">f</Kbd>
       </button>
-      <StatusChip tone="neutral" testId="flow-status">
+      <span
+        role="status"
+        data-testid="flow-status"
+        className="inline-flex items-center whitespace-nowrap font-mono text-[14px] tabular-nums text-[var(--text-3)]"
+      >
         {counts ? `${counts.nodes} nodes · ${counts.edges} edges · ${win}` : '—'}
-      </StatusChip>
+      </span>
     </>
   );
 }

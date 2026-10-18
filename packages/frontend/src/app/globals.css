@@ -32,6 +32,10 @@
   --t-success-bg: #e6f6ed;  --t-success-fg: #157a3a;  /* 4.84:1 on its tint; #15803d measured 4.48 */
   --t-warn-bg: #fcf1e1;     --t-warn-fg: #b45309;
   --t-danger-bg: #fdecec;   --t-danger-fg: #c2282d;
+  /* filled "on" surfaces (switch track): the bright fg tones are for text only */
+  --ok-fill: #15803d;
+  /* the outline of an invalid card (Response Processing step) */
+  --sky: #0ea5e9;
   --t-neutral-bg: #eef0f4;  --t-neutral-fg: #5b6275;
   --t-pink-bg: #fce9f2;     --t-pink-fg: #be1d68;
   --t-purple-bg: #f0ecfe;   --t-purple-fg: #6d28d9;
@@ -118,6 +122,8 @@
   --t-success-bg: #10271d;  --t-success-fg: #5fd6a0;
   --t-warn-bg: #2a2010;     --t-warn-fg: #f5c067;
   --t-danger-bg: #2c1518;   --t-danger-fg: #f4a3a3;
+  --ok-fill: #2f7a55;
+  --sky: #38bdf8;
   --t-neutral-bg: #1d222c;  --t-neutral-fg: #9aa1b2;
   --t-pink-bg: #2c1622;     --t-pink-fg: #f0a3cb;
   --t-purple-bg: #1f1838;   --t-purple-fg: #bca3f7;

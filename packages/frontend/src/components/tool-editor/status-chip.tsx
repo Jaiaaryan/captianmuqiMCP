@@ -1,31 +1,38 @@
-import type { ReactNode } from 'react';
-import { cn } from '@/lib/utils';
+import { Check, TriangleAlert, X } from 'lucide-react';
+import { Icon } from './icon';
 
-export type StatusTone = 'neutral' | 'ok' | 'warn' | 'danger';
+export type ChipTone = 'ok' | 'error' | 'warn' | 'neutral';
 
-const TONES: Record<StatusTone, string> = {
-  neutral: 'bg-[var(--surface-2)] text-[var(--text-2)]',
-  ok: 'bg-[var(--t-success-bg)] text-[var(--t-success-fg)]',
-  warn: 'bg-[var(--t-warn-bg)] text-[var(--t-warn-fg)]',
-  danger: 'bg-[var(--t-danger-bg)] text-[var(--t-danger-fg)]',
-};
-
-/** A small read-only label for a state or a count. */
-export function StatusChip({
-  tone = 'neutral',
-  testId,
-  children,
-}: {
-  tone?: StatusTone;
+interface Props {
+  tone: ChipTone;
+  children: React.ReactNode;
+  /** Error sentence from the server; surfaced on hover and to assistive tech. */
+  detail?: string;
   testId?: string;
-  children: ReactNode;
-}) {
+}
+
+/** Icon + text, no fill: valid in success, invalid in danger, a warning in warn, nothing known in text-3. */
+export function StatusChip({ tone, children, detail, testId }: Props) {
   return (
     <span
+      role="status"
       data-testid={testId}
-      className={cn('inline-flex h-6 items-center rounded-full px-2.5 text-[11.5px] font-medium', TONES[tone])}
+      data-tone={tone}
+      title={detail}
+      className={`inline-flex max-w-[280px] items-center gap-1.5 whitespace-nowrap font-mono text-[12px] ${
+        tone === 'error'
+          ? 'font-medium text-[var(--t-danger-fg)]'
+          : tone === 'warn'
+            ? 'text-[var(--t-warn-fg)]'
+            : tone === 'ok'
+              ? 'text-[var(--t-success-fg)]'
+              : 'text-[var(--text-3)]'
+      }`}
     >
-      {children}
+      {tone === 'ok' && <Icon as={Check} />}
+      {tone === 'error' && <Icon as={X} />}
+      {tone === 'warn' && <Icon as={TriangleAlert} />}
+      <span className="truncate">{children}</span>
     </span>
   );
 }

@@ -1,12 +1,12 @@
 'use client';
 
-import { useCallback, useEffect, useMemo, useState } from 'react';
+import { useMemo, useState } from 'react';
 import {
   sandbox,
+  type SandboxParametersSchema,
   type SandboxRunResponse,
   type SandboxSaveNotes,
   type SandboxScript,
-  type SandboxScriptSummary,
   type SandboxScriptUseInput,
   type SandboxSyntax,
 } from '@/lib/api';
@@ -19,8 +19,22 @@ import { BlockTitle, Pre, RunResultPanel } from './result-panel';
 import { ConnectorFilter, type ConnectorOption } from './connector-filter';
 import { ConnectorPin, ScriptUsesSection } from './script-uses';
 import { UsesPicker } from './uses-picker';
+import { ScriptParameters } from './script-parameters';
+import type { SandboxData } from './use-sandbox-data';
+import { MonacoField } from '@/components/code/monaco-field';
+import { useMonacoPreload } from '@/components/code/monaco-preload';
+import { declarationsFromTools } from '@/components/code/dts-from-tools';
+import { useTabPlaceholder } from '@/lib/use-tab-placeholder';
+import { TabHint } from '@/components/ui/tab-hint';
+import { argsExample, codeExample } from './example-args';
+
+/** Top-level `await` (TS 1375, 1378): the body runs inside an async function. */
+const IGNORE_TOP_LEVEL_AWAIT = [1375, 1378];
 
 type Mode = 'idle' | 'view' | 'edit' | 'new';
+
+const NAME_EXAMPLE = 'delayed_orders_last_month';
+const DESCRIPTION_EXAMPLE = 'Orders shipped late last month, by customer';
 
 const NEW_SCRIPT_TEMPLATE = `// The tools you may call are listed in the run tool's description:
 //   const rows = await tools.some_tool({ limit: 100 });
@@ -56,14 +70,16 @@ export function ScriptsTab({
   token,
   canWrite,
   isAdmin,
+  data,
 }: {
   serverId: string;
   token: string;
   canWrite: boolean;
   isAdmin: boolean;
+  data: SandboxData;
 }) {
-  const [scripts, setScripts] = useState<SandboxScriptSummary[] | null>(null);
-  const [loadError, setLoadError] = useState<string | null>(null);
+  const { scripts, scriptsError: loadError, refreshScripts: load, refreshRuns, catalogTools } = data;
+  useMonacoPreload();
   const [selectedId, setSelectedId] = useState<string | null>(null);
   const [detail, setDetail] = useState<SandboxScript | null>(null);
   const [mode, setMode] = useState<Mode>('idle');
@@ -72,7 +88,8 @@ export function ScriptsTab({
     description: string;
     code: string;
     uses: SandboxScriptUseInput[];
-  }>({ name: '', description: '', code: '', uses: [] });
+    parameters: SandboxParametersSchema | null;
+  }>({ name: '', description: '', code: '', uses: [], parameters: null });
   const [filter, setFilter] = useState<string[]>([]);
   const [argsText, setArgsText] = useState('');
   const [running, setRunning] = useState(false);
@@ -81,26 +98,6 @@ export function ScriptsTab({
   const [saving, setSaving] = useState(false);
   const [notice, setNotice] = useState<{ tone: 'ok' | 'warn' | 'error'; text: string } | null>(null);
   const [confirmDelete, setConfirmDelete] = useState(false);
-
-  const load = useCallback(async () => {
-    try {
-      setScripts(await sandbox.scripts(serverId, token));
-      setLoadError(null);
-    } catch (err) {
-      setLoadError(errorText(err));
-    }
-  }, [serverId, token]);
-
-  // The first load sets state when the request settles, not synchronously in the effect.
-  useEffect(() => {
-    sandbox
-      .scripts(serverId, token)
-      .then((rows) => {
-        setScripts(rows);
-        setLoadError(null);
-      })
-      .catch((err) => setLoadError(errorText(err)));
-  }, [serverId, token]);
 
   const resetOutput = () => {
     setRun(null);
@@ -125,7 +122,7 @@ export function ScriptsTab({
     resetOutput();
     setSelectedId(null);
     setDetail(null);
-    setDraft({ name: '', description: '', code: NEW_SCRIPT_TEMPLATE, uses: [] });
+    setDraft({ name: '', description: '', code: NEW_SCRIPT_TEMPLATE, uses: [], parameters: null });
     setMode('new');
   };
 
@@ -137,6 +134,7 @@ export function ScriptsTab({
       description: detail.description ?? '',
       code: detail.code,
       uses: detail.uses.map((u) => ({ connectorId: u.connectorId, tools: [...u.tools] })),
+      parameters: detail.parameters,
     });
     setMode('edit');
   };
@@ -159,12 +157,13 @@ export function ScriptsTab({
                 code: draft.code,
                 description: draft.description.trim() || undefined,
                 uses: draft.uses,
+                parameters: draft.parameters,
               },
               token,
             )
           : await sandbox.updateScript(
               detail!.id,
-              { code: draft.code, description: draft.description, uses: draft.uses },
+              { code: draft.code, description: draft.description, uses: draft.uses, parameters: draft.parameters },
               token,
             );
       await load();
@@ -211,6 +210,7 @@ export function ScriptsTab({
           : { code: draft.code, args: args.value };
       setRun(await sandbox.run(serverId, body, token));
       if (mode === 'view') void load(); // the list shows the last run
+      void refreshRuns();
     } catch (err) {
       setRunError(errorText(err));
     } finally {
@@ -219,6 +219,35 @@ export function ScriptsTab({
   };
 
   const editing = mode === 'edit' || mode === 'new';
+
+  // The script may call the tools it declares; with none picked yet, offer every tool.
+  const codeTools = useMemo(() => {
+    const picked = new Set(draft.uses.flatMap((u) => u.tools));
+    return (catalogTools ?? []).filter((t) => picked.size === 0 || picked.has(t.name));
+  }, [catalogTools, draft.uses]);
+  const codeLibs = useMemo(
+    () => [{ path: 'file:///amcp/code-mode.d.ts', content: declarationsFromTools(codeTools) }],
+    [codeTools],
+  );
+
+  // Example placeholders: Tab in the empty field accepts them.
+  const argsPlaceholder = argsExample(editing ? draft.parameters : detail?.parameters);
+  const codePlaceholder = draft.code === '' ? codeExample(codeTools) : undefined;
+  const nameTab = useTabPlaceholder<HTMLInputElement>({
+    value: draft.name,
+    placeholder: NAME_EXAMPLE,
+    onAccept: (name) => setDraft((d) => ({ ...d, name })),
+  });
+  const descriptionTab = useTabPlaceholder<HTMLInputElement>({
+    value: draft.description,
+    placeholder: DESCRIPTION_EXAMPLE,
+    onAccept: (description) => setDraft((d) => ({ ...d, description })),
+  });
+  const argsTab = useTabPlaceholder<HTMLTextAreaElement>({
+    value: argsText,
+    placeholder: argsPlaceholder,
+    onAccept: setArgsText,
+  });
   const canEdit = canWrite && !!detail?.ownedByYou;
   const canDelete = canWrite && !!detail && (detail.ownedByYou || isAdmin);
 
@@ -388,14 +417,20 @@ export function ScriptsTab({
                 <label className="mb-1.5 block text-[11.5px] font-semibold text-[var(--text-2)]" htmlFor="script-name">
                   Name
                 </label>
-                <input
-                  id="script-name"
-                  className={cn(INPUT, 'h-9 font-mono')}
-                  value={draft.name}
-                  onChange={(e) => setDraft({ ...draft, name: e.target.value })}
-                  placeholder="delayed_orders_last_month"
-                  autoComplete="off"
-                />
+                <div className="relative">
+                  <input
+                    id="script-name"
+                    className={cn(INPUT, 'h-9 font-mono', nameTab.hint && 'pr-14')}
+                    value={draft.name}
+                    onChange={(e) => setDraft({ ...draft, name: e.target.value })}
+                    placeholder={NAME_EXAMPLE}
+                    autoComplete="off"
+                    onKeyDown={nameTab.onKeyDown}
+                    onFocus={nameTab.onFocus}
+                    onBlur={nameTab.onBlur}
+                  />
+                  <TabHint show={nameTab.hint} />
+                </div>
                 <div className="mt-1 text-[11px] text-[var(--text-3)]">
                   Lowercase letters, digits, “_” and “-”; starts with a letter.
                 </div>
@@ -418,13 +453,19 @@ export function ScriptsTab({
                 <label className="mb-1.5 block text-[11.5px] font-semibold text-[var(--text-2)]" htmlFor="script-desc">
                   Description
                 </label>
-                <input
-                  id="script-desc"
-                  className={cn(INPUT, 'h-9')}
-                  value={draft.description}
-                  onChange={(e) => setDraft({ ...draft, description: e.target.value })}
-                  placeholder="What it answers"
-                />
+                <div className="relative">
+                  <input
+                    id="script-desc"
+                    className={cn(INPUT, 'h-9', descriptionTab.hint && 'pr-14')}
+                    value={draft.description}
+                    onChange={(e) => setDraft({ ...draft, description: e.target.value })}
+                    placeholder={DESCRIPTION_EXAMPLE}
+                    onKeyDown={descriptionTab.onKeyDown}
+                    onFocus={descriptionTab.onFocus}
+                    onBlur={descriptionTab.onBlur}
+                  />
+                  <TabHint show={descriptionTab.hint} />
+                </div>
               </div>
             ) : (
               detail?.description && <p className="text-[13px] text-[var(--text-2)]">{detail.description}</p>
@@ -449,15 +490,31 @@ export function ScriptsTab({
             <div>
               <BlockTitle>Code</BlockTitle>
               {editing ? (
-                <textarea
-                  aria-label="Script code"
-                  spellCheck={false}
-                  className={cn(INPUT, 'min-h-[260px] py-2.5 font-mono text-xs leading-relaxed')}
+                <MonacoField
+                  ariaLabel="Script code"
+                  language="javascript"
                   value={draft.code}
-                  onChange={(e) => setDraft({ ...draft, code: e.target.value })}
+                  onChange={(code) => setDraft((d) => ({ ...d, code }))}
+                  extraLibs={codeLibs}
+                  ignoreDiagnostics={IGNORE_TOP_LEVEL_AWAIT}
+                  minLines={12}
+                  maxLines={40}
+                  placeholder={codePlaceholder}
+                  className="border border-[var(--border)] bg-[var(--surface)]"
                 />
               ) : (
                 <Pre maxH="max-h-80">{detail ? detail.code : 'Loading…'}</Pre>
+              )}
+              {editing && (
+                <ScriptParameters
+                  code={draft.code}
+                  value={draft.parameters}
+                  onChange={(parameters) => setDraft((d) => ({ ...d, parameters }))}
+                  disabled={saving}
+                />
+              )}
+              {mode === 'view' && detail && (
+                <ScriptParameters code={detail.code} value={detail.parameters} onChange={() => {}} readOnly />
               )}
               {mode === 'view' && !detail?.ownedByYou && detail && (
                 <div className="mt-1.5 text-[11.5px] text-[var(--text-3)]">
@@ -481,15 +538,21 @@ export function ScriptsTab({
               <label className="mb-1.5 block text-[11.5px] font-semibold text-[var(--text-2)]" htmlFor="script-args">
                 Arguments for the run (JSON, optional)
               </label>
-              <textarea
-                id="script-args"
-                spellCheck={false}
-                rows={2}
-                className={cn(INPUT, 'py-2 font-mono text-xs')}
-                value={argsText}
-                onChange={(e) => setArgsText(e.target.value)}
-                placeholder='{"asOf": "2026-10-15"}'
-              />
+              <div className="relative">
+                <textarea
+                  id="script-args"
+                  spellCheck={false}
+                  rows={2}
+                  className={cn(INPUT, 'block py-2 font-mono text-xs', argsTab.hint && 'pr-14')}
+                  value={argsText}
+                  onChange={(e) => setArgsText(e.target.value)}
+                  placeholder={argsPlaceholder}
+                  onKeyDown={argsTab.onKeyDown}
+                  onFocus={argsTab.onFocus}
+                  onBlur={argsTab.onBlur}
+                />
+                <TabHint show={argsTab.hint} className="top-2 translate-y-0" />
+              </div>
             </div>
 
             <div className="flex flex-wrap items-center gap-2">
