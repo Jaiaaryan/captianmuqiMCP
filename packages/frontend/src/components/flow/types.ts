@@ -57,7 +57,8 @@ export interface FlowEdge {
 }
 
 export interface FlowGraph {
-  serverId: string;
+  /** The server drawn, or null for every server of the organization. */
+  serverId: string | null;
   /** Start of the stats window (ISO). */
   since: string;
   generatedAt: string;
@@ -66,3 +67,30 @@ export interface FlowGraph {
 }
 
 export type FlowWindow = '1h' | '24h' | '7d';
+
+/** One call of the window, as `GET /api/flow/events` returns it (oldest first). */
+export interface FlowEvent {
+  ts: string;
+  kind: 'tool' | 'script' | 'processing';
+  serverId: string;
+  connectorId?: string;
+  toolId?: string;
+  scriptId?: string;
+  status: 'ok' | 'error' | 'refused';
+  durationMs: number | null;
+  /** Identical failures stored once, when more than one. */
+  count?: number;
+  /** Script runs: the tool names the run called. */
+  tools?: string[];
+}
+
+export interface FlowEvents {
+  from: string;
+  until: string;
+  truncated: boolean;
+  events: FlowEvent[];
+}
+
+/** Calls and errors of a node or an edge as of a replay position. */
+export type ReplayCounts = Map<string, { calls: number; errors: number }>;
+

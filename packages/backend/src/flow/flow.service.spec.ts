@@ -1,4 +1,5 @@
 import { NotFoundException } from '@nestjs/common';
+import { BadRequestException } from '@nestjs/common';
 import { FlowService, FLOW_MAX_TOOLS, type FlowGraph } from './flow.service';
 
 const ORG = 'org-a';
@@ -76,6 +77,12 @@ const SCRIPTS = [
   },
 ];
 
+// Every server of the organization: Main has both connectors, Ship only Shipping.
+const SERVERS = [
+  { id: SERVER, name: 'Main', connectors: CONNECTORS.map((c) => ({ connectorId: c.id })) },
+  { id: 'srv-2', name: 'Ship', connectors: [{ connectorId: 'c-ship' }] },
+];
+
 const T0 = new Date('2026-10-17T10:00:00Z');
 const T1 = new Date('2026-10-17T11:00:00Z');
 
@@ -87,6 +94,7 @@ function makePrisma(over: { tools?: any[]; groups?: any[] } = {}) {
           ? { id: SERVER, name: 'Main', connectors: CONNECTORS.map((c) => ({ connectorId: c.id })) }
           : null,
       ),
+      findMany: jest.fn(async ({ where }: any) => (where.organizationId === ORG ? SERVERS : [])),
     },
     connector: { findMany: jest.fn().mockResolvedValue(CONNECTORS) },
     mcpTool: { findMany: jest.fn().mockResolvedValue(over.tools ?? TOOLS) },
@@ -265,7 +273,7 @@ describe('FlowService.buildGraph', () => {
     // The raw byte query is parameterised with the organization, as the first value.
     const [, ...values] = prisma.$queryRaw.mock.calls[0];
     expect(values[0]).toBe(ORG);
-    expect(values[1]).toBe(SERVER);
+    expect(values[1]).toEqual([SERVER]);
     const sql = (prisma.$queryRaw.mock.calls[0][0] as string[]).join('?');
     expect(sql).toContain('organization_id = ?');
   });
@@ -331,3 +339,189 @@ describe('FlowService.buildGraph', () => {
     expect(node(graph, `server:${SERVER}`)!.meta).not.toHaveProperty('truncated');
   });
 });
+
+describe('FlowService.buildGraph for every server', () => {
+  const groups = [
+    { mcpServerId: SERVER, toolId: 't-track', status: 'SUCCESS', _count: { _all: 2 }, _sum: { repeatCount: 2 }, _avg: { durationMs: 20 }, _max: { createdAt: T0 } },
+    { mcpServerId: 'srv-2', toolId: 't-track', status: 'ERROR', _count: { _all: 1 }, _sum: { repeatCount: 3 }, _avg: { durationMs: 40 }, _max: { createdAt: T1 } },
+    { mcpServerId: SERVER, toolId: 't-list', status: 'SUCCESS', _count: { _all: 1 }, _sum: { repeatCount: 1 }, _avg: { durationMs: 10 }, _max: { createdAt: T0 } },
+  ];
+
+  it('draws one agent, every server, and each tool once with an edge per server that offers it', async () => {
+    const prisma = makePrisma({ groups });
+    const g = await new FlowService(prisma as any).buildGraph(ORG, null, '24h');
+    expect(g.serverId).toBeNull();
+    expect(g.nodes.filter((n) => n.kind === 'agent')).toHaveLength(1);
+    expect(g.nodes.filter((n) => n.kind === 'server').map((n) => n.id).sort()).toEqual([`server:${SERVER}`, 'server:srv-2']);
+    expect(g.nodes.filter((n) => n.id === 'tool:t-track')).toHaveLength(1);
+    const toolEdges = g.edges.filter((e) => e.kind === 'tool' && e.target === 'tool:t-track').map((e) => e.source).sort();
+    expect(toolEdges).toEqual([`server:${SERVER}`, 'server:srv-2']);
+    // Ship has no ERP: no edge from it to an ERP tool.
+    expect(edge(g, 'tool:server:srv-2>tool:t-list')).toBeUndefined();
+    expect(new Set(g.edges.map((e) => e.id)).size).toBe(g.edges.length);
+  });
+
+  it('counts per server on its edges and in total on the tool, connector and agent', async () => {
+    const prisma = makePrisma({ groups });
+    const g = await new FlowService(prisma as any).buildGraph(ORG, null, '24h');
+    expect(edge(g, `tool:server:${SERVER}>tool:t-track`)!.stats).toMatchObject({ calls: 2, errors: 0 });
+    expect(edge(g, 'tool:server:srv-2>tool:t-track')!.stats).toMatchObject({ calls: 3, errors: 3 });
+    expect(node(g, 'tool:t-track')!.stats).toMatchObject({ calls: 5, errors: 3 });
+    expect(node(g, 'connector:c-ship')!.stats).toMatchObject({ calls: 5, errors: 3 });
+    expect(node(g, `server:${SERVER}`)!.stats).toMatchObject({ calls: 3, errors: 0 });
+    expect(node(g, 'server:srv-2')!.stats).toMatchObject({ calls: 3, errors: 3 });
+    expect(node(g, 'server:srv-2')!.meta).toEqual({ connectors: 1 });
+    expect(node(g, 'agent')!.stats).toMatchObject({ calls: 6, errors: 3 });
+    expect(edge(g, 'mcp:agent>server:srv-2')!.stats).toMatchObject({ calls: 3 });
+  });
+
+  it('reads every server of the organization only, and aggregates over all of them', async () => {
+    const prisma = makePrisma({ groups });
+    await new FlowService(prisma as any).buildGraph(ORG, null, '24h');
+    expect(prisma.mcpServerConfig.findMany.mock.calls[0][0].where).toEqual({ organizationId: ORG });
+    expect(prisma.mcpServerConfig.findFirst).not.toHaveBeenCalled();
+    const where = prisma.toolInvocation.groupBy.mock.calls[0][0].where;
+    expect(where.organizationId).toBe(ORG);
+    expect(where.mcpServerId).toEqual({ in: [SERVER, 'srv-2'] });
+    expect(prisma.toolInvocation.groupBy.mock.calls[0][0].by).toEqual(['mcpServerId', 'toolId', 'status']);
+    const [, ...values] = prisma.$queryRaw.mock.calls[0];
+    expect(values[1]).toEqual([SERVER, 'srv-2']);
+  });
+
+  it('answers an organization without servers with the agent alone', async () => {
+    const prisma = makePrisma();
+    const g = await new FlowService(prisma as any).buildGraph(OTHER_ORG, null, '24h');
+    expect(g.nodes.map((n) => n.id)).toEqual(['agent']);
+    expect(prisma.toolInvocation.groupBy).not.toHaveBeenCalled();
+  });
+
+  it('gives processing and mapping nodes the connector of their tool', async () => {
+    const g = await new FlowService(makePrisma() as any).buildGraph(ORG, SERVER, '24h');
+    expect(node(g, 'processing:t-list')!.ref).toEqual({ toolId: 't-list', connectorId: 'c-erp' });
+    expect(node(g, 'mapping:t-track')!.ref).toEqual({ toolId: 't-track', connectorId: 'c-ship' });
+  });
+});
+
+describe('FlowService.listEvents', () => {
+  const NOW = new Date('2026-10-17T12:00:00Z');
+  const inv = (over: Record<string, unknown>) => ({
+    createdAt: T0,
+    mcpServerId: SERVER,
+    toolId: 't-list',
+    connectorId: 'c-erp',
+    status: 'SUCCESS',
+    durationMs: 12,
+    repeatCount: 1,
+    error: null,
+    tool: { connectorId: 'c-erp' },
+    ...over,
+  });
+  const INVOCATIONS = [
+    inv({ createdAt: new Date('2026-10-17T11:30:00Z'), status: 'ERROR', error: 'REFUSED TOOL_NOT_ALLOWED: nope', durationMs: 0 }),
+    inv({ createdAt: new Date('2026-10-17T11:20:00Z'), status: 'ERROR', error: 'Response processing failed: step a: $.x is not a number', repeatCount: 3 }),
+    inv({ createdAt: new Date('2026-10-17T11:10:00Z'), status: 'TIMEOUT', error: 'timeout', connectorId: null }),
+    inv({ createdAt: new Date('2026-10-17T10:00:00Z') }),
+  ];
+  const RUNS = [
+    { createdAt: new Date('2026-10-17T11:25:00Z'), mcpServerId: SERVER, scriptId: 'sc-erp', ok: true, errorCode: null, meta: { ms: 80.4, toolsCalled: ['erp_list_orders', 7] } },
+    { createdAt: new Date('2026-10-17T10:30:00Z'), mcpServerId: SERVER, scriptId: 'sc-both', ok: false, errorCode: 'TOOL_NOT_ALLOWED', meta: {} },
+  ];
+
+  function prismaWith() {
+    const p: any = makePrisma();
+    p.toolInvocation.findMany = jest.fn().mockResolvedValue(INVOCATIONS);
+    p.sandboxRun.findMany = jest.fn().mockResolvedValue(RUNS);
+    return p;
+  }
+
+  beforeAll(() => jest.useFakeTimers({ now: NOW, doNotFake: ['nextTick', 'setImmediate'] }));
+  afterAll(() => jest.useRealTimers());
+
+  it('returns tool calls and script runs oldest first, with status, kind and no messages', async () => {
+    const p = prismaWith();
+    const out = await new FlowService(p).listEvents(ORG, SERVER, '24h');
+    expect(out.truncated).toBe(false);
+    expect(out.until).toBe(NOW.toISOString());
+    expect(out.from).toBe(new Date(NOW.getTime() - 24 * 3600_000).toISOString());
+    expect(out.events.map((e) => [e.ts.slice(11, 16), e.kind, e.status])).toEqual([
+      ['10:00', 'tool', 'ok'],
+      ['10:30', 'script', 'refused'],
+      ['11:10', 'tool', 'error'],
+      ['11:20', 'processing', 'error'],
+      ['11:25', 'script', 'ok'],
+      ['11:30', 'tool', 'refused'],
+    ]);
+    expect(out.events[0]).toEqual({
+      ts: '2026-10-17T10:00:00.000Z',
+      kind: 'tool',
+      serverId: SERVER,
+      connectorId: 'c-erp',
+      toolId: 't-list',
+      status: 'ok',
+      durationMs: 12,
+    });
+    // The connector falls back to the tool's; a repeated failure carries its count.
+    expect(out.events[2].connectorId).toBe('c-erp');
+    expect(out.events[3].count).toBe(3);
+    expect(out.events[4]).toMatchObject({ scriptId: 'sc-erp', durationMs: 80, tools: ['erp_list_orders'] });
+    expect(JSON.stringify(out)).not.toMatch(/REFUSED|not a number|timeout/);
+  });
+
+  it('binds both queries to the organization, the server and the window', async () => {
+    const p = prismaWith();
+    await new FlowService(p).listEvents(ORG, SERVER, '1h', undefined, 50);
+    for (const call of [p.toolInvocation.findMany.mock.calls[0][0], p.sandboxRun.findMany.mock.calls[0][0]]) {
+      expect(call.where.organizationId).toBe(ORG);
+      expect(call.where.mcpServerId).toBe(SERVER);
+      expect(call.where.createdAt.gte).toEqual(new Date(NOW.getTime() - 3600_000));
+      expect(call.where.createdAt.lte).toEqual(NOW);
+      expect(call.take).toBe(51);
+      expect(call.select).not.toHaveProperty('input');
+      expect(call.select).not.toHaveProperty('output');
+    }
+  });
+
+  it('keeps the most recent events and marks the answer truncated over the limit', async () => {
+    const p = prismaWith();
+    const out = await new FlowService(p).listEvents(ORG, null, '24h', undefined, 2);
+    expect(out.truncated).toBe(true);
+    expect(out.events.map((e) => e.ts.slice(11, 16))).toEqual(['11:25', '11:30']);
+    expect(p.toolInvocation.findMany.mock.calls[0][0].where.mcpServerId).toEqual({ in: [SERVER, 'srv-2'] });
+  });
+
+  it('takes an ISO since and until, caps the window at 7 days and rejects since after until', async () => {
+    const p = prismaWith();
+    const out = await new FlowService(p).listEvents(ORG, SERVER, '2026-01-01T00:00:00Z', '2026-10-17T11:00:00Z');
+    expect(out.until).toBe('2026-10-17T11:00:00.000Z');
+    expect(out.from).toBe('2026-10-10T11:00:00.000Z');
+    await expect(
+      new FlowService(p).listEvents(ORG, SERVER, '2026-10-17T11:00:00Z', '2026-10-17T10:00:00Z'),
+    ).rejects.toBeInstanceOf(BadRequestException);
+  });
+
+  it('answers 404 for a server of another organization', async () => {
+    const p = prismaWith();
+    await expect(new FlowService(p).listEvents(OTHER_ORG, SERVER, '24h')).rejects.toBeInstanceOf(NotFoundException);
+    expect(p.toolInvocation.findMany).not.toHaveBeenCalled();
+  });
+});
+
+describe('FlowService.recentErrors', () => {
+  it('merges failed calls and runs, newest first, bound to the organization', async () => {
+    const p: any = makePrisma();
+    p.toolInvocation.findMany = jest.fn().mockResolvedValue([
+      { createdAt: T0, toolId: 't-list', error: 'HTTP 500' },
+    ]);
+    p.sandboxRun.findMany = jest.fn().mockResolvedValue([
+      { createdAt: T1, scriptId: 'sc-erp', errorCode: 'RUNTIME_ERROR', errorMessage: 'boom' },
+    ]);
+    const out = await new FlowService(p).recentErrors(ORG, SERVER, '24h', 10);
+    expect(out).toEqual([
+      { at: T1, nodeId: 'script:sc-erp', message: 'RUNTIME_ERROR: boom' },
+      { at: T0, nodeId: 'tool:t-list', message: 'HTTP 500' },
+    ]);
+    expect(p.toolInvocation.findMany.mock.calls[0][0].where).toMatchObject({ organizationId: ORG, status: { not: 'SUCCESS' } });
+    expect(p.sandboxRun.findMany.mock.calls[0][0].where).toMatchObject({ organizationId: ORG, ok: false });
+  });
+});
+

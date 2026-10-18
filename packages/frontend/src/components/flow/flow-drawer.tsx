@@ -5,6 +5,7 @@ import { ArrowRight, X } from 'lucide-react';
 import { Icon } from '@/components/tool-editor/icon';
 import type { FlowNode } from './types';
 import { formatBytes, formatCount, formatMs, formatRelativeTime } from './flow-format';
+import { ConnectorEditor, ProcessingEditor, ScriptEditor, ServerEditor } from './drawer-editors';
 
 function ownerHref(node: FlowNode): string | null {
   const ref = node.ref ?? {};
@@ -27,9 +28,9 @@ function ownerHref(node: FlowNode): string | null {
 
 function Row({ k, v }: { k: string; v: string }) {
   return (
-    <div className="flex items-baseline justify-between gap-3 py-1">
-      <dt className="text-[12.5px] text-[var(--text-3)]">{k}</dt>
-      <dd className="min-w-0 truncate text-right font-mono text-[12px] text-[var(--text)]" title={v}>
+    <div className="flex min-h-7 items-center justify-between gap-3 leading-none">
+      <dt className="text-[14px] text-[var(--text-3)]">{k}</dt>
+      <dd className="min-w-0 truncate text-right font-mono text-[14px] tabular-nums text-[var(--text)]" title={v}>
         {v}
       </dd>
     </div>
@@ -39,9 +40,13 @@ function Row({ k, v }: { k: string; v: string }) {
 interface Props {
   node: FlowNode;
   onClose: () => void;
+  token: string | null;
+  role: string | undefined;
+  /** After a save: reload the graph. */
+  onSaved: () => void;
 }
 
-export function FlowDrawer({ node, onClose }: Props) {
+export function FlowDrawer({ node, onClose, token, role, onSaved }: Props) {
   const stats = node.stats;
   const rows: [string, string][] = [];
   if (stats) {
@@ -57,23 +62,35 @@ export function FlowDrawer({ node, onClose }: Props) {
   }
   const meta = Object.entries(node.meta ?? {}).map(([k, v]) => [k, v === null ? '—' : String(v)] as [string, string]);
   const href = ownerHref(node);
+  const ref = node.ref ?? {};
+  const editor = token
+    ? { token, canWrite: !!role && role !== 'VIEWER', isAdmin: role === 'ADMIN', onSaved }
+    : null;
 
   return (
     <aside
       data-testid="flow-drawer"
       aria-label={node.label}
-      className="flex h-full w-[300px] flex-shrink-0 flex-col overflow-y-auto bg-[var(--surface)] p-4"
+      onKeyDown={(e) => {
+        // Esc closes the drawer unless a field used it (a name being restored).
+        if (e.key === 'Escape' && !e.defaultPrevented) {
+          e.preventDefault();
+          onClose();
+        }
+      }}
+      className="flex h-full w-[320px] flex-shrink-0 flex-col overflow-y-auto bg-[var(--surface)] p-4 max-sm:absolute max-sm:inset-0 max-sm:z-20 max-sm:w-full"
     >
       <div className="flex items-start justify-between gap-2">
         <div className="min-w-0">
-          <div className="font-mono text-[11px] uppercase tracking-[0.04em] text-[var(--text-3)]">{node.kind}</div>
-          <div className="mt-0.5 break-words text-[14px] font-semibold tracking-[-0.01em]">{node.label}</div>
+          <div className="font-mono text-[14px] text-[var(--text-3)]">{node.kind}</div>
+          <div className="mt-1 break-words text-[15px] font-semibold leading-5 tracking-[-0.01em]">{node.label}</div>
         </div>
         <button
           type="button"
           onClick={onClose}
           aria-label="Close"
-          className="flex h-7 w-7 flex-shrink-0 items-center justify-center text-[var(--text-2)] outline-none hover:bg-[var(--surface-2)] hover:text-[var(--text)] focus-visible:bg-[var(--surface-2)] focus-visible:outline-none!"
+          aria-keyshortcuts="Escape"
+          className="flex h-8 w-8 flex-shrink-0 items-center justify-center rounded-md text-[var(--text-2)] outline-none hover:bg-[var(--surface-2)] hover:text-[var(--text)] focus-visible:bg-[var(--surface-2)] focus-visible:outline-none!"
         >
           <Icon as={X} />
         </button>
@@ -86,6 +103,17 @@ export function FlowDrawer({ node, onClose }: Props) {
           ))}
         </dl>
       )}
+
+      {editor && node.kind === 'connector' && ref.connectorId && (
+        <ConnectorEditor key={node.id} connectorId={ref.connectorId} {...editor} />
+      )}
+      {editor && node.kind === 'server' && ref.serverId && <ServerEditor key={node.id} serverId={ref.serverId} {...editor} />}
+      {editor &&
+        (node.kind === 'tool' || node.kind === 'processing' || node.kind === 'mapping') &&
+        ref.connectorId &&
+        ref.toolId && <ProcessingEditor key={node.id} connectorId={ref.connectorId} toolId={ref.toolId} {...editor} />}
+      {editor && node.kind === 'script' && ref.scriptId && <ScriptEditor key={node.id} scriptId={ref.scriptId} {...editor} />}
+
       {meta.length > 0 && (
         <dl className="mt-4">
           {meta.map(([k, v]) => (
@@ -97,7 +125,7 @@ export function FlowDrawer({ node, onClose }: Props) {
       {href && (
         <Link
           href={href}
-          className="mt-4 inline-flex h-8 items-center gap-1.5 self-start px-2 text-[12.5px] font-medium text-[var(--text)] outline-none hover:bg-[var(--surface-2)] focus-visible:bg-[var(--surface-2)] focus-visible:outline-none!"
+          className="mt-4 inline-flex h-8 items-center gap-1.5 self-start rounded-md px-2 text-[14px] font-medium text-[var(--text)] outline-none hover:bg-[var(--surface-2)] focus-visible:bg-[var(--surface-2)] focus-visible:outline-none!"
         >
           Open
           <Icon as={ArrowRight} />

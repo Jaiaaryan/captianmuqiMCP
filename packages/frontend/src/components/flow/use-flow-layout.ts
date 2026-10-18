@@ -56,9 +56,26 @@ function requestLayout(graph: FlowGraph, sizes: NodeSizes): { id: number; answer
   return { id, answer };
 }
 
-/** The graph a layout belongs to: the same server, window and snapshot. */
+/**
+ * The structure a layout belongs to: the scope and the node and edge ids. A new
+ * snapshot with the same structure (new counts, a renamed node, a reload after
+ * an edit) keeps the positions: nothing moves unless the graph itself changed.
+ */
 export function graphKey(graph: FlowGraph | null): string {
-  return graph ? `${graph.serverId}:${graph.since}:${graph.generatedAt}` : '';
+  if (!graph) return '';
+  const ids = graph.nodes.map((n) => `${n.kind}|${n.id}`).sort().join(',');
+  const links = graph.edges.map((e) => `${e.source}>${e.target}`).sort().join(',');
+  return `${graph.serverId ?? 'all'}#${hash(ids)}#${hash(links)}`;
+}
+
+/** FNV-1a, enough to tell structures apart in a cache key. */
+function hash(text: string): string {
+  let h = 0x811c9dc5;
+  for (let i = 0; i < text.length; i += 1) {
+    h ^= text.charCodeAt(i);
+    h = Math.imul(h, 0x01000193);
+  }
+  return `${text.length}.${(h >>> 0).toString(36)}`;
 }
 
 /**
@@ -68,7 +85,7 @@ export function graphKey(graph: FlowGraph | null): string {
  */
 export interface PlacedLayout {
   key: string;
-  serverId: string;
+  serverId: string | null;
   positions: Positions;
 }
 

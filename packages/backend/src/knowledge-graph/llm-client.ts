@@ -161,6 +161,79 @@ export async function chatJson(
   }
 }
 
+export interface LlmTextResult {
+  text: string;
+  usage?: { inputTokens?: number; outputTokens?: number };
+}
+
+/**
+ * Plain-text variant of chatJson for short answers (the Flow page's Ask bar):
+ * same providers and headers, no JSON mode, no parsing. Throws `LLM <status>`
+ * on a transport error. The reply is trimmed; an empty reply is an error.
+ */
+export async function chatText(
+  cfg: LlmConfig,
+  system: string,
+  user: string,
+  maxTokens = 400,
+): Promise<LlmTextResult> {
+  if (cfg.provider === 'anthropic') {
+    const r = await fetch('https://api.anthropic.com/v1/messages', {
+      method: 'POST',
+      headers: {
+        'x-api-key': cfg.apiKey,
+        'anthropic-version': '2023-06-01',
+        'content-type': 'application/json',
+      },
+      body: JSON.stringify({
+        model: cfg.model,
+        max_tokens: maxTokens,
+        temperature: 0,
+        system,
+        messages: [{ role: 'user', content: user }],
+      }),
+    });
+    if (!r.ok) throw new Error(`LLM ${r.status}`);
+    const j = await r.json();
+    const text = (Array.isArray(j.content) ? j.content : [])
+      .filter((c: any) => c?.type === 'text' && typeof c.text === 'string')
+      .map((c: any) => c.text)
+      .join('')
+      .trim();
+    if (!text) throw new Error('LLM empty reply');
+    return { text, usage: { inputTokens: j.usage?.input_tokens, outputTokens: j.usage?.output_tokens } };
+  }
+
+  const base =
+    cfg.provider === 'openrouter'
+      ? 'https://openrouter.ai/api/v1'
+      : cfg.provider === 'custom'
+        ? (cfg.baseUrl ?? '').replace(/\/+$/, '')
+        : 'https://api.openai.com/v1';
+  const headers: Record<string, string> =
+    cfg.provider === 'custom' && !cfg.apiKey
+      ? { 'Content-Type': 'application/json' }
+      : { Authorization: `Bearer ${cfg.apiKey}`, 'Content-Type': 'application/json' };
+  const r = await fetch(`${base}/chat/completions`, {
+    method: 'POST',
+    headers,
+    body: JSON.stringify({
+      model: cfg.model,
+      temperature: 0,
+      max_tokens: maxTokens,
+      messages: [
+        { role: 'system', content: system },
+        { role: 'user', content: user },
+      ],
+    }),
+  });
+  if (!r.ok) throw new Error(`LLM ${r.status}`);
+  const j = await r.json();
+  const text = String(j.choices?.[0]?.message?.content ?? '').trim();
+  if (!text) throw new Error('LLM empty reply');
+  return { text, usage: { inputTokens: j.usage?.prompt_tokens, outputTokens: j.usage?.completion_tokens } };
+}
+
 /** Origin only (scheme + host + port) so credentials, paths and query data
  *  in a custom base URL can never leak into the logs. Falls back to a fixed
  *  marker when the base is not a parseable URL. */

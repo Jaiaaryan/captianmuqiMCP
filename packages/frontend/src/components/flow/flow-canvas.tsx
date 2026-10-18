@@ -1,6 +1,6 @@
 'use client';
 
-import { useCallback, useEffect, useMemo } from 'react';
+import { useCallback, useEffect, useMemo, useRef, type ReactNode } from 'react';
 import {
   Background,
   BackgroundVariant,
@@ -19,7 +19,8 @@ import { useTheme } from '@/lib/theme-context';
 import { edgeTypes, nodeTypes, NODE_SIZE } from './node-registry';
 import { useFlowLayout } from './use-flow-layout';
 import { EDGE_CSS, type FlowEdgeData } from './edges/flow-edge';
-import type { FlowGraph, FlowNode } from './types';
+import { FlowMotionContext, type PulseStore } from './flow-motion';
+import type { FlowGraph, FlowNode, FlowStats, ReplayCounts } from './types';
 
 const EMPTY: { nodes: Node[]; edges: Edge[] } = { nodes: [], edges: [] };
 
@@ -60,8 +61,33 @@ interface Props {
   onSelect: (node: FlowNode | null) => void;
   /** Bumped by the toolbar's Fit button. */
   fitSignal: number;
-  /** Changes with server or window; fits the view again. */
+  /** Changes with the server; fits the view again. Nothing else moves the view. */
   fitKey: string;
+  /** Counts as of the replay position, or null for the window's totals. */
+  replay?: ReplayCounts | null;
+  pulses?: PulseStore | null;
+  reduced?: boolean;
+  /** Docked over the bottom of the canvas (timeline, Ask bar). */
+  children?: ReactNode;
+}
+
+const ZERO = { calls: 0, errors: 0 };
+
+/**
+ * Objects for the replay, reused while a node's or edge's counts stay the same,
+ * so a replay step re-renders only what it touched.
+ */
+function useReplayCache<T extends { id: string; data?: Record<string, unknown> }>() {
+  const cache = useRef(new Map<string, { base: T; calls: number; errors: number; out: T }>());
+  return useCallback((item: T, c: { calls: number; errors: number }): T => {
+    const hit = cache.current.get(item.id);
+    if (hit && hit.base === item && hit.calls === c.calls && hit.errors === c.errors) return hit.out;
+    // Calls and errors as of the replay position; sizes and times are window totals and go.
+    const stats: FlowStats = { calls: c.calls, errors: c.errors };
+    const out = { ...item, data: { ...item.data, stats } } as T;
+    cache.current.set(item.id, { base: item, calls: c.calls, errors: c.errors, out });
+    return out;
+  }, []);
 }
 
 // Edge-label placement: where several edges leave one node (the server's fan-out)
@@ -94,7 +120,7 @@ function buildEdges(graph: FlowGraph, ids: Set<string>): Edge[] {
   });
 }
 
-function Canvas({ graph, selectedId, onSelect, fitSignal, fitKey }: Props) {
+function Canvas({ graph, selectedId, onSelect, fitSignal, fitKey, replay = null }: Props) {
   const { fitView } = useReactFlow();
   const { resolvedTheme } = useTheme();
   const initialized = useNodesInitialized();
@@ -115,21 +141,35 @@ function Canvas({ graph, selectedId, onSelect, fitSignal, fitKey }: Props) {
     return { nodes, edges: buildEdges(graph, new Set(nodes.map((n) => n.id))) };
   }, [graph, placed]);
 
-  // Only the selected node gets a new object; every other node keeps its identity.
+  // Only the selected node, and during a replay the nodes whose counts moved, get
+  // new objects; every other node keeps its identity.
+  const replayNode = useReplayCache<Node>();
+  const replayEdge = useReplayCache<Edge>();
   const nodes = useMemo(
-    () => current.nodes.map((n) => (n.id === selectedId ? { ...n, selected: true } : n)),
-    [current.nodes, selectedId],
+    () =>
+      current.nodes.map((n) => {
+        const base = replay ? replayNode(n, replay.get(n.id) ?? ZERO) : n;
+        return n.id === selectedId ? { ...base, selected: true } : base;
+      }),
+    [current.nodes, selectedId, replay, replayNode],
+  );
+  const edges = useMemo(
+    () => (replay ? current.edges.map((e) => replayEdge(e, replay.get(e.id) ?? ZERO)) : current.edges),
+    [current.edges, replay, replayEdge],
   );
   const layoutNodes = current.nodes;
 
   const onNodeClick = useCallback<NodeMouseHandler>((_, node) => onSelect(node.data as unknown as FlowNode), [onSelect]);
   const onPaneClick = useCallback(() => onSelect(null), [onSelect]);
 
-  // Fit on load, on server/window change, and from the toolbar. Selection
-  // changes do not touch the view.
+  // Fit on the first layout of a server and from the toolbar, nothing else: a
+  // reload, a window change or a selection never moves a view the user panned.
+  const fitted = useRef('');
   useEffect(() => {
-    if (layoutNodes.length === 0) return;
-    if (!initialized) return;
+    if (layoutNodes.length === 0 || !initialized) return;
+    const token = `${fitKey}#${fitSignal}`;
+    if (fitted.current === token) return;
+    fitted.current = token;
     void fitView(FIT);
   }, [initialized, layoutNodes, fitKey, fitSignal, fitView]);
 
@@ -152,7 +192,7 @@ function Canvas({ graph, selectedId, onSelect, fitSignal, fitKey }: Props) {
   return (
     <ReactFlow
       nodes={nodes}
-      edges={current.edges}
+      edges={edges}
       nodeTypes={nodeTypes}
       edgeTypes={edgeTypes}
       colorMode={resolvedTheme}
@@ -171,11 +211,11 @@ function Canvas({ graph, selectedId, onSelect, fitSignal, fitKey }: Props) {
     >
       <style>{EDGE_CSS}</style>
       <Background variant={BackgroundVariant.Dots} gap={18} size={1.2} />
-      <Controls showInteractive={false} position="bottom-left" />
+      <Controls showInteractive={false} position="top-left" />
       <MiniMap
         pannable
         zoomable
-        position="bottom-right"
+        position="top-right"
         style={{ width: 140, height: 90 }}
         nodeColor={miniMapColor}
         nodeBorderRadius={0}
@@ -185,14 +225,26 @@ function Canvas({ graph, selectedId, onSelect, fitSignal, fitKey }: Props) {
 }
 
 export function FlowCanvas(props: Props) {
+  const { pulses = null, reduced = false, graph, children } = props;
+  const empty = !!graph && graph.nodes.every((n) => (n.stats?.calls ?? 0) === 0);
+  const motion = useMemo(() => ({ pulses, reduced, empty }), [pulses, reduced, empty]);
   return (
     <div
       data-testid="flow-canvas"
-      className="h-full min-h-[420px] w-full overflow-hidden"
+      data-motion={reduced ? 'reduced' : 'full'}
+      className="relative h-full min-h-[420px] w-full overflow-hidden"
     >
-      <ReactFlowProvider>
-        <Canvas {...props} />
-      </ReactFlowProvider>
+      <FlowMotionContext.Provider value={motion}>
+        <ReactFlowProvider>
+          <Canvas {...props} />
+        </ReactFlowProvider>
+      </FlowMotionContext.Provider>
+      {children && (
+        // Above the React Flow attribution; only the controls take the pointer.
+        <div className="pointer-events-none absolute inset-x-2 bottom-5 z-10 flex flex-wrap items-end gap-2">
+          {children}
+        </div>
+      )}
     </div>
   );
 }
